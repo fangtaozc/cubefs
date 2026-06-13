@@ -206,6 +206,15 @@ int cfs_socket_recv_iovec(struct cfs_socket *csk, struct iovec *iov,
 	ret = kernel_recvmsg(csk->sock, &msghdr, (struct kvec *)iov, nr_segs,
 			     len, msghdr.msg_flags);
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
+	/*
+	 * MSG_WAITALL 配合 SO_RCVTIMEO:超时或对端关闭时 kernel_recvmsg 返回已读的
+	 * 部分字节数(短读)而非错误。上层 cfs_socket_recv_packet 仅判 ret<0,会把短读
+	 * 当成功 → 解析到脏 packet 头(arglen 巨大触发 kvmalloc WARN,或长度碰巧合法
+	 * 导致按错位长度读到错位数据并静默返回,fio crc32c verify fail)。此处把短读
+	 * 判为 -EIO,使上层废弃连接并 retry 其他副本,从源头杜绝脏 header / 错位数据。
+	 */
+	if (ret >= 0 && (size_t)ret != len)
+		ret = -EIO;
 	return ret;
 }
 
