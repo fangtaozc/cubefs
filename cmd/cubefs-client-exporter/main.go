@@ -65,17 +65,17 @@ func hostnameOrEnv() string {
 // ---- Collector:scrape 时读 procfs/sysfs 的瞬时值 ----
 
 type collector struct {
-	up         *prometheus.Desc
-	refcnt     *prometheus.Desc
-	koInfo     *prometheus.Desc
-	uptime     *prometheus.Desc
-	slabBytes  *prometheus.Desc
-	dirty      *prometheus.Desc
-	writeback  *prometheus.Desc
-	sockCount  *prometheus.Desc
-	oops       *prometheus.Desc
-	bug        *prometheus.Desc
-	cfsErr     *prometheus.Desc
+	up        *prometheus.Desc
+	refcnt    *prometheus.Desc
+	koInfo    *prometheus.Desc
+	uptime    *prometheus.Desc
+	slabBytes *prometheus.Desc
+	dirty     *prometheus.Desc
+	writeback *prometheus.Desc
+	sockCount *prometheus.Desc
+	oops      *prometheus.Desc
+	bug       *prometheus.Desc
+	cfsErr    *prometheus.Desc
 	// 阶段 3:读内核 /proc/fs/cubefs/<vol>/stats(数值化,脱离 DEBUG log)
 	opTotal   *prometheus.Desc
 	opLatency *prometheus.Desc
@@ -202,6 +202,30 @@ func mountHealthy() bool {
 		}
 	}
 	return false
+}
+
+// detectVol: 从 /proc/mounts 解析挂在 *mountpoint 的 cubefs 挂载,其 device 形如
+// //master1:port,master2:port,.../<vol>,取最后一个 '/' 后的段为卷名。换卷/换环境
+// 无需再手配 -vol——硬编码默认值一旦与实际卷名不符,readStats 读不到
+// /proc/fs/cubefs/<vol>/stats 就会静默跳过所有 op/io metric。返回空表示未挂载或
+// 解析失败,调用方回退到 -vol flag 值(向后兼容)。
+func detectVol() string {
+	f, err := os.Open(filepath.Join(*procRoot, "mounts"))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) >= 3 && fields[1] == *mountpoint && fields[2] == "cubefs" {
+			dev := fields[0]
+			if idx := strings.LastIndex(dev, "/"); idx >= 0 && idx+1 < len(dev) {
+				return dev[idx+1:]
+			}
+		}
+	}
+	return ""
 }
 
 func nodeUptime() float64 {
@@ -438,6 +462,11 @@ func (c *collector) collectStats(ch chan<- prometheus.Metric, n string) {
 
 func main() {
 	flag.Parse()
+	// 卷名优先从挂载点自动推断(见 detectVol):换卷/换环境无需改 -vol。
+	// 推断失败(未挂载等)才沿用 -vol flag 值,保持向后兼容。
+	if v := detectVol(); v != "" {
+		*vol = v
+	}
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(newCollector())
 
