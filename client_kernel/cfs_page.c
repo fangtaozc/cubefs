@@ -11,7 +11,24 @@ u32 cfs_page_frags_crc32(const struct cfs_page_frag *frags, size_t nr)
 	u32 crc = 0;
 	size_t i;
 
+	if (unlikely(!frags))
+		return crc;
 	for (i = 0; i < nr; i++) {
+		/*
+		 * 止血:datanode 故障触发 socket send 失败 → EXTENT_WRITER_F_RECOVER,
+		 * recover 路径下 packet 的 frag page 可能已被提前释放,而
+		 * extent_writer_tx_work_cb 仍对其算 crc → 空指针解引用 → 内核 panic
+		 * 整节点重启(实测 cfs_page_frags_crc32+0x3c [cubefs])。此处遇空 frag
+		 * 跳过并告警,保证不 panic(crc 会偏差,由 datanode crc 校验失败触发重传,
+		 * 远优于整节点宕)。根治需 extent_writer recover 路径保证算 crc 前 frags
+		 * 仍持有有效 page(见 cfs_extent_writer.c extent_writer_tx_work_cb)。
+		 */
+		if (unlikely(!frags[i].page || !frags[i].page->page)) {
+			WARN_ONCE(1,
+				  "cubefs: null page frag %zu/%zu in crc32, skip\n",
+				  i, nr);
+			continue;
+		}
 		crc ^= 0xffffffffUL;
 		crc = crc32_le(crc, kmap(frags[i].page->page) + frags[i].offset,
 			       frags[i].size);
