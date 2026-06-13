@@ -207,14 +207,10 @@ int cfs_socket_recv_iovec(struct cfs_socket *csk, struct iovec *iov,
 			     len, msghdr.msg_flags);
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
 	/*
-	 * MSG_WAITALL 配合 SO_RCVTIMEO:超时或对端关闭时 kernel_recvmsg 返回已读的
-	 * 部分字节数(短读)而非错误。上层 cfs_socket_recv_packet 仅判 ret<0,会把短读
-	 * 当成功 → 解析到脏 packet 头(arglen 巨大触发 kvmalloc WARN,或长度碰巧合法
-	 * 导致按错位长度读到错位数据并静默返回,fio crc32c verify fail)。此处把短读
-	 * 判为 -EIO,使上层废弃连接并 retry 其他副本,从源头杜绝脏 header / 错位数据。
+	 * 注意:此处不能判短读(ret!=len)。本函数是通用 recv,master HTTP 通信(变长响应)
+	 * 依赖部分读返回。短读判错只能在 packet 协议路径(cfs_socket_recv_packet /
+	 * cfs_socket_recv_pages,固定长度)单独做,否则会误杀 HTTP 导致 mount 失败。
 	 */
-	if (ret >= 0 && (size_t)ret != len)
-		ret = -EIO;
 	return ret;
 }
 
@@ -262,6 +258,9 @@ static int cfs_socket_recv_pages(struct cfs_socket *csk,
 		ret = kernel_recvmsg(csk->sock, &msghdr, &vec, 1, vec.iov_len,
 				     msghdr.msg_flags);
 		kunmap(frags[i].page->page);
+		/* 短读(RCVTIMEO 超时部分读):数据页必须收满,否则返回错位/不完整数据 */
+		if (ret >= 0 && ret != (int)vec.iov_len)
+			ret = -EIO;
 		if (ret < 0)
 			break;
 	}
@@ -396,6 +395,9 @@ int cfs_socket_recv_packet(struct cfs_socket *csk, struct cfs_packet *packet)
 	 */
 	ret = cfs_socket_recv(csk, &packet->reply.hdr,
 			      sizeof(packet->reply.hdr));
+	/* 短读:packet 头必须完整,否则 arglen/datalen 解析为脏值 */
+	if (ret >= 0 && ret != (int)sizeof(packet->reply.hdr))
+		ret = -EIO;
 	if (ret < 0) {
 		cfs_log_error(csk->log,
 			      "so(%p) id=%llu, op=0x%x, recv header error %d\n",
@@ -409,6 +411,8 @@ int cfs_socket_recv_packet(struct cfs_socket *csk, struct cfs_packet *packet)
 	if (packet->request.hdr.ext_type & 0x10) {
 		u8 _pv[12];
 		ret = cfs_socket_recv(csk, _pv, sizeof(_pv));
+		if (ret >= 0 && ret != (int)sizeof(_pv))
+			ret = -EIO;
 		if (ret < 0)
 			return ret;
 	}
@@ -437,6 +441,9 @@ int cfs_socket_recv_packet(struct cfs_socket *csk, struct cfs_packet *packet)
 		}
 		ret = cfs_socket_recv(csk, cfs_buffer_data(packet->reply.arg),
 				      arglen);
+		/* 短读:arg 必须收满 arglen,否则数据不完整 */
+		if (ret >= 0 && ret != (int)arglen)
+			ret = -EIO;
 		if (ret < 0) {
 			cfs_log_error(
 				csk->log,
@@ -500,6 +507,9 @@ int cfs_socket_recv_packet(struct cfs_socket *csk, struct cfs_packet *packet)
 
 		ret = cfs_socket_recv(csk, cfs_buffer_data(csk->rx_buffer),
 				      datalen);
+		/* 短读:data 必须收满 datalen,否则数据不完整 */
+		if (ret >= 0 && ret != (int)datalen)
+			ret = -EIO;
 		if (ret < 0) {
 			cfs_log_error(
 				csk->log,
