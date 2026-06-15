@@ -1684,7 +1684,10 @@ const struct file_operations cfs_dir_fops = {
 #else
 	.readdir = cfs_readdir,
 #endif
-	.llseek = NULL,
+	/* NFS re-export:ganesha/nfsd readdir 用 seekdir 在目录 fd 上 lseek 定位 cookie,
+	 * llseek=NULL 返回 ESPIPE 致 readdir 失败(Remote I/O error)。generic_file_llseek
+	 * 让目录 fd 支持 seek(seekdir(0) rewind + telldir),修复 NFS 下 ls/readdir。 */
+	.llseek = generic_file_llseek,
 	.fsync = noop_fsync,
 };
 
