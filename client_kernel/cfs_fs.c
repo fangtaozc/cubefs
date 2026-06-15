@@ -1,6 +1,7 @@
 /*
  * Copyright 2023 The CubeFS Authors.
  */
+#include <linux/exportfs.h>
 #include <linux/proc_fs.h>
 #include "cfs_fs.h"
 
@@ -1581,6 +1582,7 @@ static int cfs_fs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_op = &cfs_super_ops;
 	sb->s_xattr = cfs_xattr_handlers;
 	sb->s_d_op = &cfs_dentry_ops;
+	sb->s_export_op = &cfs_export_ops;
 	sb->s_time_gran = 1;
 	/* no acl */
 	sb->s_flags |= SB_POSIXACL;
@@ -1727,6 +1729,69 @@ const struct super_operations cfs_super_ops = {
 	.put_super = cfs_put_super,
 	.statfs = cfs_statfs,
 	.show_options = cfs_show_options,
+};
+
+/* ---- NFS export support ----
+ * 让 cubefs.ko 可被 nfsd / nfs-ganesha(VFS FSAL)re-export。
+ * 整卷 export + no_subtree_check 场景:non-connectable file handle,
+ * get_parent/fh_to_parent 不需要(cubefs meta 无反向 parent RPC)。
+ * fh 安全性:cubefs ino 单调不重用(metanode cursor)+ generation 双保险。
+ */
+static int cfs_encode_fh(struct inode *inode, __u32 *fh, int *max_len,
+			 struct inode *parent)
+{
+	if (*max_len < CFS_FH_LEN_U32) {
+		*max_len = CFS_FH_LEN_U32;
+		return FILEID_INVALID;
+	}
+	fh[0] = (u32)(inode->i_ino & 0xffffffff);
+	fh[1] = (u32)(inode->i_ino >> 32);
+	fh[2] = inode->i_generation;
+	*max_len = CFS_FH_LEN_U32;
+	return CFS_FILEID_INO64_GEN;
+}
+
+static struct dentry *cfs_fh_to_dentry(struct super_block *sb,
+				       struct fid *fid, int fh_len, int fh_type)
+{
+	struct cfs_mount_info *cmi = sb->s_fs_info;
+	struct cfs_packet_inode *iinfo = NULL;
+	struct inode *inode;
+	u64 ino;
+	u32 gen;
+	int ret;
+
+	if (fh_type != CFS_FILEID_INO64_GEN || fh_len < CFS_FH_LEN_U32)
+		return NULL;
+
+	ino = (u64)fid->raw[0] | ((u64)fid->raw[1] << 32);
+	gen = fid->raw[2];
+
+	/* cache miss 时仅凭 ino 向 metanode 拉 InodeInfo(OpMetaInodeGet) */
+	ret = cfs_meta_get(cmi->meta, ino, &iinfo);
+	if (ret == -ENOENT)
+		return ERR_PTR(-ESTALE); /* inode 已删 */
+	if (ret < 0)
+		return ERR_PTR(ret); /* 网络等错误透传 */
+
+	inode = cfs_inode_new(sb, iinfo, 0);
+	cfs_packet_inode_release(iinfo); /* 无条件释放,字段已被 cfs_inode_new 取走 */
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	/* generation 校验必须在 d_obtain_alias 之前(之后 inode 已被 dentry 持有) */
+	if (inode->i_generation != gen) {
+		iput(inode); /* 仅此早退路径需手动 iput;d_obtain_alias 会消费引用 */
+		return ERR_PTR(-ESTALE);
+	}
+
+	return d_obtain_alias(inode);
+}
+
+const struct export_operations cfs_export_ops = {
+	.encode_fh = cfs_encode_fh,
+	.fh_to_dentry = cfs_fh_to_dentry,
+	/* fh_to_parent/get_parent = NULL:整卷 export + no_subtree_check 不需要 */
 };
 
 struct file_system_type cfs_fs_type = {
