@@ -79,7 +79,9 @@ cubefs `cfs_statfs` 的 `f_fsid={0,0}`(未设),所以 server 端**必须显式�
 
 **根因(非 NFS/非死锁,是 sync 串行)**:`cfs_extent_read_pages` 原对 `direct_io` 走 `extent_read_pages_sync`——逐 `EXTENT_BLOCK` **串行发包、同步等 datanode 返回**;冷读(datanode 从盘读)时每个 RPC 的磁盘延迟串行累加,带宽崩溃。buffered 读走 `extent_read_pages_async`——经 work queue **并发提交多个读包**、reply_cb 异步解锁,流水线掩盖单 RPC 延迟。实测同一冷读 3G:**sync direct <80MB/s vs async buffered 1.5GB/s**(同量级网络/盘,纯路径差异)。该 `if(direct_io) sync` 是 v3.6 内核客户端移植时的原始设计(commit e5c5847db),**非为修 bug 引入,也非分支缺主线修复**。
 
-**修复**:`cfs_extent_read_pages` 统一走 async(删除 `direct_io` 分支与死代码 `extent_read_pages_sync`)。direct 的临时页同样经 reply_cb 解锁、由外层 `cfs_extent_dio_read_write` 的 `wait_on_page_locked` 等待完成 + `TestClearPageError` 判错,语义与 buffered 一致、安全。数据正确性另靠 packet 层短读判错(见 netem 读修复)。
+**修复**:`cfs_extent_read_pages` 统一走 async(删除 `direct_io` 分支与死代码 `extent_read_pages_sync`)。direct 的临时页同样经 reply_cb 解锁、由外层 `cfs_extent_dio_read_write` 的 `wait_on_page_locked` 等待完成 + `TestClearPageError` 判错,语义与 buffered 一致、安全。数据正确性另靠 packet 层短读判错(见 netem 读修复)。commit 06bfedd2b,ko srcversion **92EF7B91**。
+
+**验证通过(2026-06-16,ko 92EF7B91,109 节点)**:dev_bd 挂 109 NFS 跑当初卡死场景 `fio --direct=1 --rw=read --bs=1M --iodepth=16`:**卡死 → 1829 MiB/s(1.9GB/s)**,写 886 MB/s;`fio --verify=md5`(O_DIRECT 写带校验和+O_DIRECT 读回逐块校验)`err=0`,数据正确。注:**async 优化的是「多 in-flight 并发」**,`dd bs=1M` 单流(depth=1,无 readahead)仍受冷读单 RPC 延迟限制、提升有限,这非本次修复目标——目标是 fio/NFS 高并发场景,已达成。
 
 **边界(修复前)**:O_DIRECT 小文件/热读正常(datanode 缓存命中),仅「大文件/冷读」串行延迟累加才暴露;buffered 读写、O_DIRECT 写一直正常。
 
