@@ -835,78 +835,6 @@ out:
 	return ret;
 }
 
-static int extent_read_pages_sync(struct cfs_extent_stream *es,
-				  struct cfs_extent_io_info *io_info,
-				  struct cfs_page_iter *iter)
-{
-	struct cfs_data_partition *dp;
-	struct cfs_packet *packet;
-	size_t len;
-	size_t read_bytes = 0, total_bytes = io_info->size;
-	size_t read_offset = io_info->offset - io_info->ext.file_offset +
-			     io_info->ext.ext_offset;
-	int ret = 0;
-	int i;
-
-#ifdef DEBUG
-	cfs_pr_debug("ino(%llu) offset=%lld, size=%zu, pid=%llu, "
-		     "ext_id=%llu, ext_offset=%llu, ext_size=%u\n",
-		     es->ino, io_info->offset, io_info->size, io_info->ext.pid,
-		     io_info->ext.ext_id, io_info->ext.ext_offset,
-		     io_info->ext.size);
-#endif
-	dp = cfs_extent_get_partition(es->ec, io_info->ext.pid);
-	if (!dp) {
-		cfs_log_error(es->ec->log,
-			      "ino(%llu) not found data partition(%llu)\n",
-			      es->ino, io_info->ext.pid);
-		return -ENOENT;
-	}
-	while (read_bytes < total_bytes) {
-		len = min(total_bytes - read_bytes, EXTENT_BLOCK_SIZE);
-		packet = cfs_extent_packet_new(CFS_OP_STREAM_READ,
-					       CFS_EXTENT_TYPE_NORMAL, 0,
-					       dp->id, io_info->ext.ext_id,
-					       read_offset + read_bytes,
-					       io_info->offset);
-		if (!packet) {
-			ret = -ENOMEM;
-			goto out;
-		}
-		cfs_packet_set_read_data(packet, iter, &len);
-
-		ret = do_extent_request_retry(es, dp, packet, dp->leader_idx);
-		if (ret < 0) {
-			cfs_log_error(
-				es->ec->log,
-				"ino(%llu) send packet(%llu) to dp(%llu) error %d\n",
-				es->ino,
-				be64_to_cpu(packet->request.hdr.req_id), dp->id,
-				ret);
-			cfs_packet_release(packet);
-			goto out;
-		}
-		cfs_data_partition_set_leader(dp, ret);
-
-		for (i = 0; i < packet->reply.data.read.nr; i++) {
-			struct cfs_page_frag *frag =
-				&packet->reply.data.read.frags[i];
-			if (cfs_page_io_account(frag->page, frag->size)) {
-				SetPageUptodate(frag->page->page);
-				unlock_page(frag->page->page);
-				cfs_page_release(frag->page);
-			}
-		}
-		cfs_packet_release(packet);
-		cfs_page_iter_advance(iter, len);
-		read_bytes += len;
-	}
-
-out:
-	cfs_data_partition_release(dp);
-	return ret;
-}
-
 int cfs_extent_read_pages(struct cfs_extent_stream *es, bool direct_io,
 			  struct page **pages, size_t nr_pages,
 			  loff_t file_offset, size_t first_page_offset,
@@ -1007,10 +935,14 @@ int cfs_extent_read_pages(struct cfs_extent_stream *es, bool direct_io,
 			}
 			goto next;
 		}
-		if (direct_io)
-			ret = extent_read_pages_sync(es, io_info, &iter);
-		else
-			ret = extent_read_pages_async(es, io_info, &iter);
+		/* 统一走 async 并发路径。v3.6 移植代码原对 direct_io 用 sync:逐
+		 * EXTENT_BLOCK 串行发包、同步等 datanode 返回,大文件冷读(datanode
+		 * 从盘读)时每个 RPC 串行累加延迟,带宽崩溃(实测冷读 <80MB/s,对比
+		 * buffered async 1.5GB/s)。async 经 work queue 并发提交多个读包、
+		 * reply_cb 异步解锁页;direct 的临时页同样由外层
+		 * cfs_extent_dio_read_write 的 wait_on_page_locked 等待完成,语义与
+		 * buffered 读路径一致、安全。direct_io 参数保留以标识调用来源。 */
+		ret = extent_read_pages_async(es, io_info, &iter);
 		if (ret < 0) {
 			up_read(&es->lock_io);
 			cfs_log_error(es->ec->log,
