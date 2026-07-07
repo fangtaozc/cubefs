@@ -1,8 +1,91 @@
 /*
  * Copyright 2023 The CubeFS Authors.
  */
+#include <linux/exportfs.h>
 #include <linux/proc_fs.h>
+#include <linux/version.h>
 #include "cfs_fs.h"
+
+/*
+ * VFS idmap 兼容层：
+ *   - 5.12–6.2：inode_operations 回调首参为 struct user_namespace *（idmapped mount）。
+ *   - 6.3+   ：改为 struct mnt_idmap *，helper 用 nop_mnt_idmap 表示无 idmap 映射。
+ *   - 6.6+   ：generic_fillattr 增加 request_mask 参数。
+ * 本客户端不做 idmap 映射，统一透传空 idmap，保持 <=5.15 与 6.8 均可编译。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#if defined(__has_include) && __has_include(<linux/mnt_idmap.h>)
+#include <linux/mnt_idmap.h>
+#else
+#include <linux/mnt_idmapping.h>
+#endif
+#define CFS_IDMAP struct mnt_idmap
+#define CFS_INIT_IDMAP (&nop_mnt_idmap)
+#else
+#define CFS_IDMAP struct user_namespace
+#define CFS_INIT_IDMAP (&init_user_ns)
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define cfs_generic_fillattr(idmap, mask, inode, stat) \
+	generic_fillattr((idmap), (mask), (inode), (stat))
+#else
+#define cfs_generic_fillattr(idmap, mask, inode, stat) \
+	generic_fillattr((idmap), (inode), (stat))
+#endif
+
+/*
+ * 页缓存 folio 化兼容层（≤5.15 与 6.8 双支持）：
+ *   - 5.18~6.0：address_space_operations 由 page 版迁移到 folio 版
+ *     (read_folio/readahead/dirty_folio 取代 readpage/readpages/set_page_dirty)。
+ *   - 5.19：grab_cache_page_write_begin 去掉 flags 参数；write_begin 去掉 flags。
+ *   - 6.6：page_endio 移除；inode i_ctime 改访问器。
+ *   - 6.7：inode i_atime/i_mtime 改访问器。
+ *   - 5.17：PDE_DATA 改名 pde_data。
+ * 目标内核只有 ≤5.15 与 6.8，统一以 6.0 为界切换新旧 aops。
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#define CFS_HAS_FOLIO_AOPS 1
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+#define cfs_grab_cache_page_write_begin(m, i, f) \
+	grab_cache_page_write_begin((m), (i))
+#else
+#define cfs_grab_cache_page_write_begin(m, i, f) \
+	grab_cache_page_write_begin((m), (i), (f))
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+static inline void cfs_page_endio(struct page *page, bool is_write, int err)
+{
+	if (!is_write) {
+		if (!err)
+			SetPageUptodate(page);
+		unlock_page(page);
+	} else {
+		if (err)
+			mapping_set_error(page->mapping, err);
+		end_page_writeback(page);
+	}
+}
+#else
+#define cfs_page_endio(page, is_write, err) \
+	page_endio((page), (is_write), (err))
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#define inode_get_ctime(inode) ((inode)->i_ctime)
+#define inode_set_ctime_to_ts(inode, ts) ((inode)->i_ctime = (ts))
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 7, 0)
+#define inode_get_atime(inode) ((inode)->i_atime)
+#define inode_get_mtime(inode) ((inode)->i_mtime)
+#define inode_set_atime_to_ts(inode, ts) ((inode)->i_atime = (ts))
+#define inode_set_mtime_to_ts(inode, ts) ((inode)->i_mtime = (ts))
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#define pde_data(inode) PDE_DATA(inode)
+#endif
 
 #define CFS_FS_MAGIC 0x20230705
 #define CFS_BLOCK_SIZE_SHIFT 12
@@ -137,9 +220,9 @@ static inline void cfs_inode_refresh_unlock(struct cfs_inode *ci,
 	struct inode *inode = &ci->vfs_inode;
 
 	inode->i_mode = iinfo->mode;
-	inode->i_ctime = iinfo->create_time;
-	inode->i_atime = iinfo->access_time;
-	inode->i_mtime = iinfo->modify_time;
+	inode_set_ctime_to_ts(inode, iinfo->create_time);
+	inode_set_atime_to_ts(inode, iinfo->access_time);
+	inode_set_mtime_to_ts(inode, iinfo->modify_time);
 	i_uid_write(inode, iinfo->uid);
 	i_gid_write(inode, iinfo->gid);
 	set_nlink(inode, iinfo->nlink);
@@ -170,10 +253,14 @@ static int cfs_inode_refresh(struct cfs_inode *ci)
 	 * 缓存的干净 data page,否则读命中旧 page、永不重拉 backend。标志在锁内用
 	 * 旧 inode 值计算(refresh_unlock 之前),invalidate 可能睡眠故置于 unlock 后。
 	 * invalidate_mapping_pages 只清非 dirty page,本地未回写 dirty 不丢。 */
-	data_changed = S_ISREG(inode->i_mode) &&
-		       (timespec64_compare(&inode->i_mtime,
-					    &iinfo->modify_time) != 0 ||
-			i_size_read(inode) != (loff_t)iinfo->size);
+	{
+		struct timespec64 cur_mtime = inode_get_mtime(inode);
+
+		data_changed = S_ISREG(inode->i_mode) &&
+			       (timespec64_compare(&cur_mtime,
+						   &iinfo->modify_time) != 0 ||
+				i_size_read(inode) != (loff_t)iinfo->size);
+	}
 	cfs_inode_refresh_unlock(ci, iinfo);
 	update_iattr_cache(ci);
 	update_quota_cache(ci);
@@ -266,6 +353,7 @@ static int cfs_readpage(struct file *file, struct page *page)
 	return ret;
 }
 
+#ifndef CFS_HAS_FOLIO_AOPS
 static int cfs_readpages_cb(void *data, struct page *page)
 {
 	struct cfs_page_vec *vec = data;
@@ -287,7 +375,7 @@ static int cfs_readpages_cb(void *data, struct page *page)
 	return 0;
 
 failed:
-	page_endio(page, READ, ret);
+	cfs_page_endio(page, false, ret);
 	return ret;
 }
 
@@ -319,6 +407,59 @@ out:
 	cfs_page_vec_release(vec);
 	return ret;
 }
+#else /* CFS_HAS_FOLIO_AOPS: 6.0+ 用 folio 版 read_folio/readahead */
+static int cfs_read_folio(struct file *file, struct folio *folio)
+{
+	return cfs_readpage(file, folio_page(folio, 0));
+}
+
+/* 把已收集的一批连续页发给 extent reader（成功即解锁+置 uptodate），
+ * 失败则 endio 解锁避免 hang；随后释放 readahead 持有的页引用。 */
+static void cfs_readahead_flush(struct cfs_inode *ci, struct cfs_page_vec *vec)
+{
+	size_t i;
+	int ret;
+
+	if (cfs_page_vec_empty(vec))
+		return;
+	ret = cfs_extent_read_pages(ci->es, false, vec->pages, vec->nr,
+				    page_offset(vec->pages[0]), 0, PAGE_SIZE);
+	for (i = 0; i < vec->nr; i++) {
+		if (ret < 0)
+			cfs_page_endio(vec->pages[i], false, ret);
+		put_page(vec->pages[i]);
+	}
+	cfs_page_vec_clear(vec);
+}
+
+static void cfs_readahead(struct readahead_control *rac)
+{
+	struct inode *inode = rac->mapping->host;
+	struct cfs_inode *ci = (struct cfs_inode *)inode;
+	struct cfs_page_vec *vec;
+	struct page *page;
+
+	vec = cfs_page_vec_new();
+	if (!vec) {
+		/* 退化为逐页读（extent reader 完成后解锁），再放引用。 */
+		while ((page = readahead_page(rac)) != NULL) {
+			cfs_readpage(rac->file, page);
+			put_page(page);
+		}
+		return;
+	}
+	/* readahead_page 返回加锁且持引用的页；按连续性批量攒够再一次性下发，
+	 * 恢复原 readpages 的批量吞吐（否则逐页一个网络往返，冷读极慢）。 */
+	while ((page = readahead_page(rac)) != NULL) {
+		if (cfs_page_vec_append(vec, page))
+			continue;
+		cfs_readahead_flush(ci, vec);
+		cfs_page_vec_append(vec, page);
+	}
+	cfs_readahead_flush(ci, vec);
+	cfs_page_vec_release(vec);
+}
+#endif /* CFS_HAS_FOLIO_AOPS */
 
 static inline loff_t cfs_inode_page_size(struct cfs_inode *ci,
 					 struct page *page)
@@ -345,9 +486,16 @@ static int cfs_writepage(struct page *page, struct writeback_control *wbc)
 	return ret;
 }
 
+#ifdef CFS_HAS_FOLIO_AOPS
+static int cfs_writepages_cb(struct folio *folio, struct writeback_control *wbc,
+			     void *data)
+{
+	struct page *page = folio_page(folio, 0);
+#else
 static int cfs_writepages_cb(struct page *page, struct writeback_control *wbc,
 			     void *data)
 {
+#endif
 	struct inode *inode = page->mapping->host;
 	struct cfs_inode *ci = (struct cfs_inode *)inode;
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
@@ -404,7 +552,10 @@ static int cfs_writepages(struct address_space *mapping,
  * Called by generic_file_aio_write(), caller holds the i_mutex.
  */
 static int cfs_write_begin(struct file *file, struct address_space *mapping,
-			   loff_t pos, unsigned len, unsigned flags,
+			   loff_t pos, unsigned len,
+#ifndef CFS_HAS_FOLIO_AOPS
+			   unsigned flags,
+#endif
 			   struct page **pagep, void **fsdata)
 {
 	struct inode *inode = file_inode(file);
@@ -420,7 +571,11 @@ static int cfs_write_begin(struct file *file, struct address_space *mapping,
 	/**
 	 * find or create a locked page.
 	 */
-	page = grab_cache_page_write_begin(mapping, index, flags);
+#ifdef CFS_HAS_FOLIO_AOPS
+	page = cfs_grab_cache_page_write_begin(mapping, index, 0);
+#else
+	page = cfs_grab_cache_page_write_begin(mapping, index, flags);
+#endif
 	if (!page)
 		return -ENOMEM;
 
@@ -879,14 +1034,14 @@ static int cfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 /**
  * File Inode
  */
-static int cfs_permission(struct user_namespace *mnt_userns, struct inode *inode, int mask)
+static int cfs_permission(CFS_IDMAP *mnt_userns, struct inode *inode, int mask)
 {
 	if (mask & MAY_NOT_BLOCK)
 		return -ECHILD;
-	return generic_permission(&init_user_ns, inode, mask);
+	return generic_permission(CFS_INIT_IDMAP, inode, mask);
 }
 
-static int cfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry, struct iattr *iattr)
+static int cfs_setattr(CFS_IDMAP *mnt_userns, struct dentry *dentry, struct iattr *iattr)
 {
 	struct super_block *sb = dentry->d_sb;
 	struct cfs_mount_info *cmi = sb->s_fs_info;
@@ -896,7 +1051,7 @@ static int cfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
 	int err;
 
 	time = ktime_get();
-err = setattr_prepare(&init_user_ns, dentry, iattr);
+err = setattr_prepare(CFS_INIT_IDMAP, dentry, iattr);
 	if (err)
 		goto out;
 
@@ -920,7 +1075,7 @@ err = setattr_prepare(&init_user_ns, dentry, iattr);
 			goto out;
 	}
 
-	setattr_copy(&init_user_ns, inode, iattr);
+	setattr_copy(CFS_INIT_IDMAP, inode, iattr);
 	mark_inode_dirty(inode);
 
 out:
@@ -934,7 +1089,7 @@ out:
 	return err;
 }
 
-static int cfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
+static int cfs_getattr(CFS_IDMAP *mnt_userns, const struct path *path,
 		       struct kstat *stat, u32 request_mask, unsigned int query_flags)
 {
 	struct inode *inode = d_inode(path->dentry);
@@ -944,7 +1099,7 @@ static int cfs_getattr(struct user_namespace *mnt_userns, const struct path *pat
 
 	if (!is_iattr_cache_valid(ci))
 		cfs_inode_refresh(ci);
-	generic_fillattr(&init_user_ns, inode, stat);
+	cfs_generic_fillattr(CFS_INIT_IDMAP, request_mask, inode, stat);
 	cfs_stat_record(cmi->stats, CFS_VOP_GETATTR,
 			ktime_us_delta(ktime_get(), time), 0);
 	return 0;
@@ -970,7 +1125,7 @@ static int cfs_xattr_get(const struct xattr_handler *handler,
 }
 
 static int cfs_xattr_set(const struct xattr_handler *handler,
-			 struct user_namespace *mnt_userns,
+			 CFS_IDMAP *mnt_userns,
 			 struct dentry *dentry, struct inode *inode,
 			 const char *name, const void *value, size_t size,
 			 int flags)
@@ -1063,7 +1218,7 @@ out:
 	return new_dentry;
 }
 
-static int cfs_create(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode,
+static int cfs_create(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode,
 		      bool excl)
 {
 	struct super_block *sb = dir->i_sb;
@@ -1158,7 +1313,7 @@ out:
 	return ret;
 }
 
-static int cfs_symlink(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry,
+static int cfs_symlink(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *dentry,
 		       const char *target)
 {
 	struct super_block *sb = dir->i_sb;
@@ -1215,7 +1370,7 @@ out:
 	return ret;
 }
 
-static int cfs_mkdir(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode)
+static int cfs_mkdir(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode)
 {
 	struct super_block *sb = dir->i_sb;
 	struct cfs_mount_info *cmi = sb->s_fs_info;
@@ -1288,7 +1443,7 @@ static int cfs_rmdir(struct inode *dir, struct dentry *dentry)
 	return ret;
 }
 
-static int cfs_mknod(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode,
+static int cfs_mknod(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *dentry, umode_t mode,
 		     dev_t rdev)
 {
 	struct super_block *sb = dir->i_sb;
@@ -1342,7 +1497,7 @@ out:
 	return ret;
 }
 
-static int cfs_rename(struct user_namespace *mnt_userns, struct inode *old_dir,
+static int cfs_rename(CFS_IDMAP *mnt_userns, struct inode *old_dir,
 		      struct dentry *old_dentry, struct inode *new_dir,
 		      struct dentry *new_dentry, unsigned int flags)
 {
@@ -1581,6 +1736,7 @@ static int cfs_fs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_op = &cfs_super_ops;
 	sb->s_xattr = cfs_xattr_handlers;
 	sb->s_d_op = &cfs_dentry_ops;
+	sb->s_export_op = &cfs_export_ops;
 	sb->s_time_gran = 1;
 	/* no acl */
 	sb->s_flags |= SB_POSIXACL;
@@ -1636,6 +1792,16 @@ static void cfs_kill_sb(struct super_block *sb)
 }
 
 const struct address_space_operations cfs_address_ops = {
+#ifdef CFS_HAS_FOLIO_AOPS
+	.read_folio = cfs_read_folio,
+	.readahead = cfs_readahead,
+	.writepage = cfs_writepage,
+	.writepages = cfs_writepages,
+	.write_begin = cfs_write_begin,
+	.write_end = cfs_write_end,
+	.dirty_folio = filemap_dirty_folio,
+	.direct_IO = cfs_direct_io,
+#else
 	.readpage = cfs_readpage,
 	.readpages = cfs_readpages,
 	.writepage = cfs_writepage,
@@ -1646,6 +1812,7 @@ const struct address_space_operations cfs_address_ops = {
 	.invalidatepage = NULL,
 	.releasepage = NULL,
 	.direct_IO = cfs_direct_io,
+#endif
 };
 
 const struct file_operations cfs_file_fops = {
@@ -1682,7 +1849,10 @@ const struct file_operations cfs_dir_fops = {
 #else
 	.readdir = cfs_readdir,
 #endif
-	.llseek = NULL,
+	/* NFS re-export:ganesha/nfsd readdir 用 seekdir 在目录 fd 上 lseek 定位 cookie,
+	 * llseek=NULL 返回 ESPIPE 致 readdir 失败(Remote I/O error)。generic_file_llseek
+	 * 让目录 fd 支持 seek(seekdir(0) rewind + telldir),修复 NFS 下 ls/readdir。 */
+	.llseek = generic_file_llseek,
 	.fsync = noop_fsync,
 };
 
@@ -1729,6 +1899,69 @@ const struct super_operations cfs_super_ops = {
 	.show_options = cfs_show_options,
 };
 
+/* ---- NFS export support ----
+ * 让 cubefs.ko 可被 nfsd / nfs-ganesha(VFS FSAL)re-export。
+ * 整卷 export + no_subtree_check 场景:non-connectable file handle,
+ * get_parent/fh_to_parent 不需要(cubefs meta 无反向 parent RPC)。
+ * fh 安全性:cubefs ino 单调不重用(metanode cursor)+ generation 双保险。
+ */
+static int cfs_encode_fh(struct inode *inode, __u32 *fh, int *max_len,
+			 struct inode *parent)
+{
+	if (*max_len < CFS_FH_LEN_U32) {
+		*max_len = CFS_FH_LEN_U32;
+		return FILEID_INVALID;
+	}
+	fh[0] = (u32)(inode->i_ino & 0xffffffff);
+	fh[1] = (u32)(inode->i_ino >> 32);
+	fh[2] = inode->i_generation;
+	*max_len = CFS_FH_LEN_U32;
+	return CFS_FILEID_INO64_GEN;
+}
+
+static struct dentry *cfs_fh_to_dentry(struct super_block *sb,
+				       struct fid *fid, int fh_len, int fh_type)
+{
+	struct cfs_mount_info *cmi = sb->s_fs_info;
+	struct cfs_packet_inode *iinfo = NULL;
+	struct inode *inode;
+	u64 ino;
+	u32 gen;
+	int ret;
+
+	if (fh_type != CFS_FILEID_INO64_GEN || fh_len < CFS_FH_LEN_U32)
+		return NULL;
+
+	ino = (u64)fid->raw[0] | ((u64)fid->raw[1] << 32);
+	gen = fid->raw[2];
+
+	/* cache miss 时仅凭 ino 向 metanode 拉 InodeInfo(OpMetaInodeGet) */
+	ret = cfs_meta_get(cmi->meta, ino, &iinfo);
+	if (ret == -ENOENT)
+		return ERR_PTR(-ESTALE); /* inode 已删 */
+	if (ret < 0)
+		return ERR_PTR(ret); /* 网络等错误透传 */
+
+	inode = cfs_inode_new(sb, iinfo, 0);
+	cfs_packet_inode_release(iinfo); /* 无条件释放,字段已被 cfs_inode_new 取走 */
+	if (!inode)
+		return ERR_PTR(-ENOMEM);
+
+	/* generation 校验必须在 d_obtain_alias 之前(之后 inode 已被 dentry 持有) */
+	if (inode->i_generation != gen) {
+		iput(inode); /* 仅此早退路径需手动 iput;d_obtain_alias 会消费引用 */
+		return ERR_PTR(-ESTALE);
+	}
+
+	return d_obtain_alias(inode);
+}
+
+const struct export_operations cfs_export_ops = {
+	.encode_fh = cfs_encode_fh,
+	.fh_to_dentry = cfs_fh_to_dentry,
+	/* fh_to_parent/get_parent = NULL:整卷 export + no_subtree_check 不需要 */
+};
+
 struct file_system_type cfs_fs_type = {
 	.name = "cubefs",
 	.owner = THIS_MODULE,
@@ -1738,7 +1971,7 @@ struct file_system_type cfs_fs_type = {
 
 static int proc_log_open(struct inode *inode, struct file *file)
 {
-	file->private_data = PDE_DATA(inode);
+	file->private_data = pde_data(inode);
 	return 0;
 }
 

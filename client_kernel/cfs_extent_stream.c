@@ -2,6 +2,12 @@
  * Copyright 2023 The CubeFS Authors.
  */
 #include "cfs_extent.h"
+#include <linux/version.h>
+
+/* 6.4 起 struct iov_iter 的 iov 成员改名 __iov，并提供 iter_iov() 访问器。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#define iter_iov(iter) ((iter)->iov)
+#endif
 
 #define EXTENT_RECV_TIMEOUT_MS 5000u
 
@@ -690,39 +696,67 @@ err_page:
 	return ret;
 }
 
+/* reader 处于故障/恢复态的判定：READER_* 与 WRITER_* 两套标志位值不同
+ * (rx 线程置 READER_F_RECOVER/ERROR，tx 线程置 WRITER_F_ERROR/RECOVER)，
+ * 取并集才能完整识别坏 reader（原实现只查 WRITER 掩码会漏 READER_RECOVER）。 */
+#define CFS_READER_BAD                                                   \
+	(EXTENT_READER_F_RECOVER | EXTENT_READER_F_ERROR |              \
+	 EXTENT_WRITER_F_RECOVER | EXTENT_WRITER_F_ERROR)
+
+/*
+ * 多条 LRU reader 缓存（Fix 3）。
+ * 旧实现只看链表头一个 reader，extent 不匹配就 flush+release——随机小 IO
+ * 每次命中不同 extent → 每次 IO 都拆一个建一个（疯狂 churn），且并发下
+ * 「一个线程正用该 reader、另一线程把它 release」→ 包被孤立、页永不解锁 →
+ * wait_on_page_locked D 死锁 / reader kthread 爆炸打崩节点。
+ * 现改为：遍历缓存找匹配 (pid,ext_id) 的可用 reader 复用（命中移到尾=MRU）；
+ * 仅当无匹配且超 max_readers 时淘汰表头(LRU)；顺带清理故障 reader。
+ * 工作集 <= max_readers 的随机 IO 从此零 churn，也把 release-during-use
+ * 竞争窗口降到极小（命中的 reader 在尾、淘汰只取头）。
+ */
 static struct cfs_extent_reader *
 extent_stream_get_reader(struct cfs_extent_stream *es,
 			 struct cfs_packet_extent *ext)
 {
-	struct cfs_extent_reader *reader = NULL;
+	struct cfs_extent_reader *reader, *tmp, *found = NULL, *evict = NULL;
 	struct cfs_data_partition *dp;
+	LIST_HEAD(dead);
 
-	while (true) {
-		mutex_lock(&es->lock_readers);
-		reader = list_first_entry_or_null(
+	mutex_lock(&es->lock_readers);
+	list_for_each_entry_safe(reader, tmp, &es->readers, list) {
+		if (reader->flags & CFS_READER_BAD) {
+			list_move_tail(&reader->list, &dead);
+			es->nr_readers--;
+			continue;
+		}
+		if (!found && reader->dp->id == ext->pid &&
+		    reader->ext_id == ext->ext_id)
+			found = reader;
+	}
+	if (found)
+		list_move_tail(&found->list, &es->readers); /* LRU 命中→MRU */
+	else if (es->nr_readers >= es->max_readers)
+		evict = list_first_entry_or_null(
 			&es->readers, struct cfs_extent_reader, list);
-		if (!reader) {
-			mutex_unlock(&es->lock_readers);
-			break;
-		}
+	if (evict) {
+		list_del(&evict->list);
+		es->nr_readers--;
+	}
+	mutex_unlock(&es->lock_readers);
 
-		if (reader->flags &
-		    (EXTENT_WRITER_F_RECOVER | EXTENT_WRITER_F_ERROR)) {
-			list_del(&reader->list);
-			es->nr_readers--;
-			mutex_unlock(&es->lock_readers);
-		} else if (reader->dp->id != ext->pid ||
-			   reader->ext_id != ext->ext_id) {
-			list_del(&reader->list);
-			es->nr_readers--;
-			mutex_unlock(&es->lock_readers);
-		} else {
-			mutex_unlock(&es->lock_readers);
-			return reader;
-		}
+	/* 锁外释放故障/淘汰的 reader（flush 等其在途完成，release 兜底解锁页） */
+	while ((reader = list_first_entry_or_null(&dead, struct cfs_extent_reader,
+						  list))) {
+		list_del(&reader->list);
 		cfs_extent_reader_flush(reader);
 		cfs_extent_reader_release(reader);
 	}
+	if (evict) {
+		cfs_extent_reader_flush(evict);
+		cfs_extent_reader_release(evict);
+	}
+	if (found)
+		return found;
 
 	dp = cfs_extent_get_partition(es->ec, ext->pid);
 	if (!dp) {
@@ -835,78 +869,6 @@ out:
 	return ret;
 }
 
-static int extent_read_pages_sync(struct cfs_extent_stream *es,
-				  struct cfs_extent_io_info *io_info,
-				  struct cfs_page_iter *iter)
-{
-	struct cfs_data_partition *dp;
-	struct cfs_packet *packet;
-	size_t len;
-	size_t read_bytes = 0, total_bytes = io_info->size;
-	size_t read_offset = io_info->offset - io_info->ext.file_offset +
-			     io_info->ext.ext_offset;
-	int ret = 0;
-	int i;
-
-#ifdef DEBUG
-	cfs_pr_debug("ino(%llu) offset=%lld, size=%zu, pid=%llu, "
-		     "ext_id=%llu, ext_offset=%llu, ext_size=%u\n",
-		     es->ino, io_info->offset, io_info->size, io_info->ext.pid,
-		     io_info->ext.ext_id, io_info->ext.ext_offset,
-		     io_info->ext.size);
-#endif
-	dp = cfs_extent_get_partition(es->ec, io_info->ext.pid);
-	if (!dp) {
-		cfs_log_error(es->ec->log,
-			      "ino(%llu) not found data partition(%llu)\n",
-			      es->ino, io_info->ext.pid);
-		return -ENOENT;
-	}
-	while (read_bytes < total_bytes) {
-		len = min(total_bytes - read_bytes, EXTENT_BLOCK_SIZE);
-		packet = cfs_extent_packet_new(CFS_OP_STREAM_READ,
-					       CFS_EXTENT_TYPE_NORMAL, 0,
-					       dp->id, io_info->ext.ext_id,
-					       read_offset + read_bytes,
-					       io_info->offset);
-		if (!packet) {
-			ret = -ENOMEM;
-			goto out;
-		}
-		cfs_packet_set_read_data(packet, iter, &len);
-
-		ret = do_extent_request_retry(es, dp, packet, dp->leader_idx);
-		if (ret < 0) {
-			cfs_log_error(
-				es->ec->log,
-				"ino(%llu) send packet(%llu) to dp(%llu) error %d\n",
-				es->ino,
-				be64_to_cpu(packet->request.hdr.req_id), dp->id,
-				ret);
-			cfs_packet_release(packet);
-			goto out;
-		}
-		cfs_data_partition_set_leader(dp, ret);
-
-		for (i = 0; i < packet->reply.data.read.nr; i++) {
-			struct cfs_page_frag *frag =
-				&packet->reply.data.read.frags[i];
-			if (cfs_page_io_account(frag->page, frag->size)) {
-				SetPageUptodate(frag->page->page);
-				unlock_page(frag->page->page);
-				cfs_page_release(frag->page);
-			}
-		}
-		cfs_packet_release(packet);
-		cfs_page_iter_advance(iter, len);
-		read_bytes += len;
-	}
-
-out:
-	cfs_data_partition_release(dp);
-	return ret;
-}
-
 int cfs_extent_read_pages(struct cfs_extent_stream *es, bool direct_io,
 			  struct page **pages, size_t nr_pages,
 			  loff_t file_offset, size_t first_page_offset,
@@ -1007,10 +969,14 @@ int cfs_extent_read_pages(struct cfs_extent_stream *es, bool direct_io,
 			}
 			goto next;
 		}
-		if (direct_io)
-			ret = extent_read_pages_sync(es, io_info, &iter);
-		else
-			ret = extent_read_pages_async(es, io_info, &iter);
+		/* 统一走 async 并发路径。v3.6 移植代码原对 direct_io 用 sync:逐
+		 * EXTENT_BLOCK 串行发包、同步等 datanode 返回,大文件冷读(datanode
+		 * 从盘读)时每个 RPC 串行累加延迟,带宽崩溃(实测冷读 <80MB/s,对比
+		 * buffered async 1.5GB/s)。async 经 work queue 并发提交多个读包、
+		 * reply_cb 异步解锁页;direct 的临时页同样由外层
+		 * cfs_extent_dio_read_write 的 wait_on_page_locked 等待完成,语义与
+		 * buffered 读路径一致、安全。direct_io 参数保留以标识调用来源。 */
+		ret = extent_read_pages_async(es, io_info, &iter);
 		if (ret < 0) {
 			up_read(&es->lock_io);
 			cfs_log_error(es->ec->log,
@@ -1083,8 +1049,8 @@ static struct page **extent_dio_pages_alloc(struct iov_iter *iter, int type,
 	struct page **pages;
 	int i;
 
-	start = (unsigned long)(iter->iov->iov_base + iter->iov_offset);
-	nbytes = iter->iov->iov_len - iter->iov_offset;
+	start = (unsigned long)(iter_iov(iter)->iov_base + iter->iov_offset);
+	nbytes = iter_iov(iter)->iov_len - iter->iov_offset;
 	fpoff = start & ~PAGE_MASK;
 	npages = (fpoff + nbytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	pages = kvzalloc(sizeof(*pages) * npages, GFP_NOFS);
@@ -1173,8 +1139,15 @@ int cfs_extent_dio_read_write(struct cfs_extent_stream *es, int type,
 	else
 		cfs_extent_read_pages(es, true, pages, nr_pages, offset,
 				      first_page_offset, end_page_size);
-	cfs_extent_stream_flush(es);
-
+	/*
+	 * 不能在此调用全局 cfs_extent_stream_flush(es)：它会 flush+release 本
+	 * inode 的所有 reader/writer。并发 DIO 下，一个线程的 flush 会把另一个
+	 * 线程刚 get_reader/正 reader_request 的 reader 释放掉 → 该线程的包被
+	 * 孤立 / use-after-free → 其临时页永不解锁 → wait_on_page_locked 永久
+	 * D 死锁，高并发下 reader 频繁重建拖垮节点。
+	 * 提交已由 reader_request/writer_request 的 queue_work 异步触发，完成由
+	 * reply_cb 解锁页；本 DIO 只需等自己的页解锁即可，无需全局 flush。
+	 */
 	for (i = 0; i < nr_pages; i++) {
 		wait_on_page_locked(pages[i]);
 		if (TestClearPageError(pages[i]))

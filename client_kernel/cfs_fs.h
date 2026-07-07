@@ -22,7 +22,13 @@ extern const struct inode_operations cfs_symlink_iops;
 extern const struct inode_operations cfs_special_iops;
 extern const struct dentry_operations cfs_dentry_ops;
 extern const struct super_operations cfs_super_ops;
+extern const struct export_operations cfs_export_ops;
 extern struct file_system_type cfs_fs_type;
+
+/* NFS file handle 布局:[ino_lo:u32][ino_hi:u32][i_generation:u32] = 3 个 u32。
+ * fh_type 取私有区(0x80+),避开 enum fid_type(linux/exportfs.h)现有取值。 */
+#define CFS_FILEID_INO64_GEN 0x81
+#define CFS_FH_LEN_U32 3
 
 struct cfs_mount_info {
 	struct cfs_options *options;

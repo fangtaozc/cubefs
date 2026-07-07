@@ -207,7 +207,7 @@ cfs_extent_select_partition(struct cfs_extent_client *ec)
 	if (ec->select_dp)
 		step = 1;
 	else
-		step = prandom_u32() % ec->nr_rw_partitions;
+		step = get_random_u32() % ec->nr_rw_partitions;
 	step = max_t(u32, step, 1);
 
 	while (step-- > 0) {
