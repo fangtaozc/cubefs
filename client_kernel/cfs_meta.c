@@ -119,7 +119,7 @@ static int cfs_meta_update_partition(struct cfs_meta_client *mc)
 		cfs_log_error(mc->log, "get meta partitions error %d\n", ret);
 		return ret;
 	}
-	write_lock(&mc->lock);
+	down_write(&mc->lock);
 	btree_clear(mc->partition_ranges);
 	while (!list_empty(&mc->rw_partitions)) {
 		mp = list_first_entry(&mc->rw_partitions,
@@ -157,7 +157,7 @@ static int cfs_meta_update_partition(struct cfs_meta_client *mc)
 	}
 
 unlock:
-	write_unlock(&mc->lock);
+	up_write(&mc->lock);
 	cfs_volume_view_clear(&vol_view);
 	return 0;
 }
@@ -191,7 +191,7 @@ struct cfs_meta_client *cfs_meta_client_new(struct cfs_master_client *master,
 	}
 	mc->log = log;
 	mc->master = master;
-	rwlock_init(&mc->lock);
+	init_rwsem(&mc->lock);
 	hash_init(mc->paritions);
 	mc->partition_ranges = btree_new(sizeof(uintptr_t),
 					 META_ITEM_COUNT_PRE_BTREE_NODE,
@@ -291,7 +291,7 @@ cfs_meta_select_partition(struct cfs_meta_client *mc)
 	if (mc->select_mp)
 		step = 1;
 	else
-		step = prandom_u32() % mc->nr_rw_partitions;
+		step = get_random_u32() % mc->nr_rw_partitions;
 	step = max_t(u32, step, 1);
 
 	while (step-- > 0) {
@@ -1206,7 +1206,7 @@ int cfs_meta_create(struct cfs_meta_client *mc, u64 parent_ino,
 	u32 retry;
 	int ret = 0;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	parent_mp = cfs_meta_get_partition_by_inode(mc, parent_ino);
 	if (!parent_mp) {
 		ret = -ENOENT;
@@ -1241,7 +1241,7 @@ int cfs_meta_create(struct cfs_meta_client *mc, u64 parent_ino,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1259,7 +1259,7 @@ int cfs_meta_link(struct cfs_meta_client *mc, u64 parent_ino, struct qstr *name,
 	struct cfs_packet_inode *iinfo;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	parent_mp = cfs_meta_get_partition_by_inode(mc, parent_ino);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!parent_mp || !mp) {
@@ -1289,7 +1289,7 @@ int cfs_meta_link(struct cfs_meta_client *mc, u64 parent_ino, struct qstr *name,
 		*iinfop = iinfo;
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1314,7 +1314,7 @@ int cfs_meta_delete(struct cfs_meta_client *mc, u64 parent_ino,
 		}
 		cfs_packet_inode_release(iinfo);
 	}
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, parent_ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1344,7 +1344,7 @@ int cfs_meta_delete(struct cfs_meta_client *mc, u64 parent_ino,
 		*ret_ino = ino;
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1361,7 +1361,7 @@ int cfs_meta_rename(struct cfs_meta_client *mc, u64 src_parent_ino,
 	umode_t mode;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	src_parent_mp = cfs_meta_get_partition_by_inode(mc, src_parent_ino);
 	dst_parent_mp = cfs_meta_get_partition_by_inode(mc, dst_parent_ino);
 	if (!src_parent_mp || !dst_parent_mp) {
@@ -1429,7 +1429,7 @@ int cfs_meta_rename(struct cfs_meta_client *mc, u64 src_parent_ino,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1443,7 +1443,7 @@ int cfs_meta_lookup(struct cfs_meta_client *mc, u64 parent_ino,
 	u64 ino;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, parent_ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1466,7 +1466,7 @@ int cfs_meta_lookup(struct cfs_meta_client *mc, u64 parent_ino,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1479,7 +1479,7 @@ int cfs_meta_lookup_path(struct cfs_meta_client *mc, const char *path,
 	u64 ino = 1;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	while (path) {
 		ch = strchr(path, '/');
 		name.len = ch ? ch - path : strlen(path);
@@ -1519,7 +1519,7 @@ int cfs_meta_lookup_path(struct cfs_meta_client *mc, const char *path,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1532,7 +1532,7 @@ int cfs_meta_get(struct cfs_meta_client *mc, u64 ino,
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1545,7 +1545,7 @@ int cfs_meta_get(struct cfs_meta_client *mc, u64 ino,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1611,7 +1611,7 @@ int cfs_meta_batch_get(struct cfs_meta_client *mc, struct u64_array *ino_vec,
 	int ret;
 
 	hash_init(tasks);
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	for (i = 0; i < ino_vec->num; i++) {
 		mp = cfs_meta_get_partition_by_inode(mc, ino_vec->base[i]);
 		if (!mp)
@@ -1650,7 +1650,7 @@ int cfs_meta_batch_get(struct cfs_meta_client *mc, struct u64_array *ino_vec,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	hash_for_each_safe(tasks, i, tmp, task, hash) {
 		hash_del(&task->hash);
 		batch_iget_task_release(task);
@@ -1669,7 +1669,7 @@ int cfs_meta_readdir(struct cfs_meta_client *mc, u64 parent_ino,
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, parent_ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1683,7 +1683,7 @@ int cfs_meta_readdir(struct cfs_meta_client *mc, u64 parent_ino,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1695,7 +1695,7 @@ int cfs_meta_set_attr(struct cfs_meta_client *mc, u64 ino, struct iattr *attr)
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1708,7 +1708,7 @@ int cfs_meta_set_attr(struct cfs_meta_client *mc, u64 ino, struct iattr *attr)
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1721,7 +1721,7 @@ int cfs_meta_set_xattr(struct cfs_meta_client *mc, u64 ino, const char *name,
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1735,7 +1735,7 @@ int cfs_meta_set_xattr(struct cfs_meta_client *mc, u64 ino, const char *name,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1749,7 +1749,7 @@ ssize_t cfs_meta_get_xattr(struct cfs_meta_client *mc, u64 ino,
 	size_t out_len;
 	ssize_t ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1764,7 +1764,7 @@ ssize_t cfs_meta_get_xattr(struct cfs_meta_client *mc, u64 ino,
 	ret = out_len;
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1778,7 +1778,7 @@ ssize_t cfs_meta_list_xattr(struct cfs_meta_client *mc, u64 ino, char *names,
 	size_t out_len;
 	ssize_t ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1792,7 +1792,7 @@ ssize_t cfs_meta_list_xattr(struct cfs_meta_client *mc, u64 ino, char *names,
 	ret = out_len;
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1804,7 +1804,7 @@ int cfs_meta_remove_xattr(struct cfs_meta_client *mc, u64 ino, const char *name)
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1817,7 +1817,7 @@ int cfs_meta_remove_xattr(struct cfs_meta_client *mc, u64 ino, const char *name)
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1876,7 +1876,7 @@ int cfs_meta_list_extent(struct cfs_meta_client *mc, u64 ino, u64 *gen,
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1889,7 +1889,7 @@ int cfs_meta_list_extent(struct cfs_meta_client *mc, u64 ino, u64 *gen,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -1940,7 +1940,7 @@ int cfs_meta_append_extent(struct cfs_meta_client *mc, u64 ino,
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -1954,7 +1954,7 @@ int cfs_meta_append_extent(struct cfs_meta_client *mc, u64 ino,
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }
 
@@ -2000,7 +2000,7 @@ int cfs_meta_truncate(struct cfs_meta_client *mc, u64 ino, loff_t size)
 	struct cfs_meta_partition *mp;
 	int ret;
 
-	read_lock(&mc->lock);
+	down_read(&mc->lock);
 	mp = cfs_meta_get_partition_by_inode(mc, ino);
 	if (!mp) {
 		ret = -ENOENT;
@@ -2013,6 +2013,6 @@ int cfs_meta_truncate(struct cfs_meta_client *mc, u64 ino, loff_t size)
 	}
 
 unlock:
-	read_unlock(&mc->lock);
+	up_read(&mc->lock);
 	return ret;
 }

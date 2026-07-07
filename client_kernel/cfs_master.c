@@ -261,7 +261,7 @@ static int do_http_request(struct cfs_master_client *mc,
 	struct cfs_socket *csk;
 	int ret = -1;
 	u32 max = mc->hosts.num;
-	u32 i = prandom_u32() % mc->hosts.num;
+	u32 i = get_random_u32() % mc->hosts.num;
 
 	while (max-- > 0) {
 		host = &mc->hosts.base[i++];

@@ -103,7 +103,13 @@ static inline bool cfs_uniqid_range_next_id(struct cfs_uniqid_range *range,
 struct cfs_meta_client {
 	char *volume;
 	struct cfs_master_client *master;
-	rwlock_t lock;
+	/*
+	 * 保护 partition 列表/范围树。read 侧临界区内会做会睡眠的 socket meta I/O
+	 * (cfs_meta_lookup_internal/iget_internal → cfs_socket_create(mutex/kzalloc/
+	 * connect) + recv)，故必须是可睡眠锁；用自旋类 rwlock_t 会"持锁睡眠"，在
+	 * 抢占检查严格的内核(如 6.8)触发 scheduling while atomic + 状态损坏。
+	 */
+	struct rw_semaphore lock;
 #define META_PARTITION_BUCKET_COUNT 128
 	struct hlist_head paritions[META_PARTITION_BUCKET_COUNT];
 	struct btree *partition_ranges;

@@ -28,7 +28,7 @@ echo "#ifndef __CONFIG_H__" >> $CONFIG_H
 echo "#define __CONFIG_H__" >> $CONFIG_H
 
 cat > $MAKEFILE <<EOF
-EXTRA_CFLAGS += -Werror
+EXTRA_CFLAGS += -Werror -Wno-missing-prototypes -Wno-missing-declarations
 
 obj-m += test.o
 all:

@@ -3,7 +3,31 @@
  */
 #include <linux/tcp.h>
 #include <net/sock.h>
+#include <linux/version.h>
+#include <linux/bvec.h>
 #include "cfs_socket.h"
+
+/* 6.4 起 iov_iter 的 iov 成员改名 __iov，提供 iter_iov() 访问器。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#define iter_iov(iter) ((iter)->iov)
+#endif
+
+/* kernel_sendpage 于 6.5 移除，改用 MSG_SPLICE_PAGES + sock_sendmsg。 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+static inline int cfs_kernel_sendpage(struct socket *sock, struct page *page,
+				      int offset, size_t size, int flags)
+{
+	struct bio_vec bvec;
+	struct msghdr msg = { .msg_flags = flags | MSG_SPLICE_PAGES };
+
+	bvec_set_page(&bvec, page, size, offset);
+	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, size);
+	return sock_sendmsg(sock, &msg);
+}
+#else
+#define cfs_kernel_sendpage(sock, page, offset, size, flags) \
+	kernel_sendpage((sock), (page), (offset), (size), (flags))
+#endif
 
 #define SOCK_POOL_BUCKET_COUNT 128
 #define SOCK_POOL_LRU_INTERVAL_MS 60 * 1000u
@@ -179,8 +203,9 @@ int cfs_socket_send_iovec(struct cfs_socket *csk, struct iovec *iov,
 			.msg_flags = MSG_NOSIGNAL,
 		};
 
-		ret = kernel_sendmsg(csk->sock, &msghdr, (struct kvec *)ii.iov,
-				     ii.nr_segs, iov_iter_count(&ii));
+		ret = kernel_sendmsg(csk->sock, &msghdr,
+				     (struct kvec *)iter_iov(&ii), ii.nr_segs,
+				     iov_iter_count(&ii));
 		if (ret < 0)
 			break;
 		iov_iter_advance(&ii, ret);
@@ -226,9 +251,9 @@ static int cfs_socket_send_pages(struct cfs_socket *csk,
 	siginitsetinv(&blocked, sigmask(SIGKILL));
 	sigprocmask(SIG_SETMASK, &blocked, &oldset);
 	for (i = 0; i < nr; i++) {
-		ret = kernel_sendpage(csk->sock, frags[i].page->page,
-				      frags[i].offset, frags[i].size,
-				      MSG_NOSIGNAL);
+		ret = cfs_kernel_sendpage(csk->sock, frags[i].page->page,
+					  frags[i].offset, frags[i].size,
+					  MSG_NOSIGNAL);
 		if (ret < 0)
 			break;
 	}

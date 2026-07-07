@@ -52,6 +52,32 @@ struct cfs_extent_reader *cfs_extent_reader_new(struct cfs_extent_stream *es,
 	return reader;
 }
 
+/* 排空一条包链表：逐个以错误完成 handle_reply（解锁其绑定页）+ 释放。
+ * 用于 reader 拆除时兜底任何未处理的包，杜绝漏解锁导致 wait_on_page_locked 死锁。 */
+static void reader_drain_packet_list(struct list_head *list, spinlock_t *lock,
+				     atomic_t *inflight)
+{
+	struct cfs_packet *packet;
+	int drained = 0;
+
+	while (true) {
+		spin_lock(lock);
+		packet = list_first_entry_or_null(list, struct cfs_packet, list);
+		if (packet)
+			list_del(&packet->list);
+		spin_unlock(lock);
+		if (!packet)
+			break;
+		packet->error = -EIO;
+		if (packet->handle_reply)
+			packet->handle_reply(packet);
+		cfs_packet_release(packet);
+		drained++;
+	}
+	if (drained && inflight)
+		atomic_sub(drained, inflight);
+}
+
 void cfs_extent_reader_release(struct cfs_extent_reader *reader)
 {
 	if (!reader)
@@ -60,6 +86,14 @@ void cfs_extent_reader_release(struct cfs_extent_reader *reader)
 	cancel_work_sync(&reader->tx_work);
 	if (reader->rx_thread)
 		kthread_stop(reader->rx_thread);
+	/* 兜底：cancel_work_sync 可能截停 tx_work 使部分包滞留 tx_packets（从未
+	 * 发送、也就永远等不到回复）；rx 线程停止时也可能有滞留的 rx_packets。
+	 * 逐个以 -EIO 完成 handle_reply，保证其临时页被解锁，否则 DIO 的
+	 * wait_on_page_locked 永久 D 死锁（随机小 IO reader 高频拆除时高发）。 */
+	reader_drain_packet_list(&reader->tx_packets, &reader->lock_tx,
+				 &reader->tx_inflight);
+	reader_drain_packet_list(&reader->rx_packets, &reader->lock_rx,
+				 &reader->rx_inflight);
 	cfs_data_partition_release(reader->dp);
 	cfs_socket_release(reader->sock, true);
 	kfree(reader);

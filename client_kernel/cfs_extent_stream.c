@@ -2,6 +2,12 @@
  * Copyright 2023 The CubeFS Authors.
  */
 #include "cfs_extent.h"
+#include <linux/version.h>
+
+/* 6.4 起 struct iov_iter 的 iov 成员改名 __iov，并提供 iter_iov() 访问器。 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#define iter_iov(iter) ((iter)->iov)
+#endif
 
 #define EXTENT_RECV_TIMEOUT_MS 5000u
 
@@ -690,39 +696,67 @@ err_page:
 	return ret;
 }
 
+/* reader 处于故障/恢复态的判定：READER_* 与 WRITER_* 两套标志位值不同
+ * (rx 线程置 READER_F_RECOVER/ERROR，tx 线程置 WRITER_F_ERROR/RECOVER)，
+ * 取并集才能完整识别坏 reader（原实现只查 WRITER 掩码会漏 READER_RECOVER）。 */
+#define CFS_READER_BAD                                                   \
+	(EXTENT_READER_F_RECOVER | EXTENT_READER_F_ERROR |              \
+	 EXTENT_WRITER_F_RECOVER | EXTENT_WRITER_F_ERROR)
+
+/*
+ * 多条 LRU reader 缓存（Fix 3）。
+ * 旧实现只看链表头一个 reader，extent 不匹配就 flush+release——随机小 IO
+ * 每次命中不同 extent → 每次 IO 都拆一个建一个（疯狂 churn），且并发下
+ * 「一个线程正用该 reader、另一线程把它 release」→ 包被孤立、页永不解锁 →
+ * wait_on_page_locked D 死锁 / reader kthread 爆炸打崩节点。
+ * 现改为：遍历缓存找匹配 (pid,ext_id) 的可用 reader 复用（命中移到尾=MRU）；
+ * 仅当无匹配且超 max_readers 时淘汰表头(LRU)；顺带清理故障 reader。
+ * 工作集 <= max_readers 的随机 IO 从此零 churn，也把 release-during-use
+ * 竞争窗口降到极小（命中的 reader 在尾、淘汰只取头）。
+ */
 static struct cfs_extent_reader *
 extent_stream_get_reader(struct cfs_extent_stream *es,
 			 struct cfs_packet_extent *ext)
 {
-	struct cfs_extent_reader *reader = NULL;
+	struct cfs_extent_reader *reader, *tmp, *found = NULL, *evict = NULL;
 	struct cfs_data_partition *dp;
+	LIST_HEAD(dead);
 
-	while (true) {
-		mutex_lock(&es->lock_readers);
-		reader = list_first_entry_or_null(
+	mutex_lock(&es->lock_readers);
+	list_for_each_entry_safe(reader, tmp, &es->readers, list) {
+		if (reader->flags & CFS_READER_BAD) {
+			list_move_tail(&reader->list, &dead);
+			es->nr_readers--;
+			continue;
+		}
+		if (!found && reader->dp->id == ext->pid &&
+		    reader->ext_id == ext->ext_id)
+			found = reader;
+	}
+	if (found)
+		list_move_tail(&found->list, &es->readers); /* LRU 命中→MRU */
+	else if (es->nr_readers >= es->max_readers)
+		evict = list_first_entry_or_null(
 			&es->readers, struct cfs_extent_reader, list);
-		if (!reader) {
-			mutex_unlock(&es->lock_readers);
-			break;
-		}
+	if (evict) {
+		list_del(&evict->list);
+		es->nr_readers--;
+	}
+	mutex_unlock(&es->lock_readers);
 
-		if (reader->flags &
-		    (EXTENT_WRITER_F_RECOVER | EXTENT_WRITER_F_ERROR)) {
-			list_del(&reader->list);
-			es->nr_readers--;
-			mutex_unlock(&es->lock_readers);
-		} else if (reader->dp->id != ext->pid ||
-			   reader->ext_id != ext->ext_id) {
-			list_del(&reader->list);
-			es->nr_readers--;
-			mutex_unlock(&es->lock_readers);
-		} else {
-			mutex_unlock(&es->lock_readers);
-			return reader;
-		}
+	/* 锁外释放故障/淘汰的 reader（flush 等其在途完成，release 兜底解锁页） */
+	while ((reader = list_first_entry_or_null(&dead, struct cfs_extent_reader,
+						  list))) {
+		list_del(&reader->list);
 		cfs_extent_reader_flush(reader);
 		cfs_extent_reader_release(reader);
 	}
+	if (evict) {
+		cfs_extent_reader_flush(evict);
+		cfs_extent_reader_release(evict);
+	}
+	if (found)
+		return found;
 
 	dp = cfs_extent_get_partition(es->ec, ext->pid);
 	if (!dp) {
@@ -1015,8 +1049,8 @@ static struct page **extent_dio_pages_alloc(struct iov_iter *iter, int type,
 	struct page **pages;
 	int i;
 
-	start = (unsigned long)(iter->iov->iov_base + iter->iov_offset);
-	nbytes = iter->iov->iov_len - iter->iov_offset;
+	start = (unsigned long)(iter_iov(iter)->iov_base + iter->iov_offset);
+	nbytes = iter_iov(iter)->iov_len - iter->iov_offset;
 	fpoff = start & ~PAGE_MASK;
 	npages = (fpoff + nbytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	pages = kvzalloc(sizeof(*pages) * npages, GFP_NOFS);
@@ -1105,8 +1139,15 @@ int cfs_extent_dio_read_write(struct cfs_extent_stream *es, int type,
 	else
 		cfs_extent_read_pages(es, true, pages, nr_pages, offset,
 				      first_page_offset, end_page_size);
-	cfs_extent_stream_flush(es);
-
+	/*
+	 * 不能在此调用全局 cfs_extent_stream_flush(es)：它会 flush+release 本
+	 * inode 的所有 reader/writer。并发 DIO 下，一个线程的 flush 会把另一个
+	 * 线程刚 get_reader/正 reader_request 的 reader 释放掉 → 该线程的包被
+	 * 孤立 / use-after-free → 其临时页永不解锁 → wait_on_page_locked 永久
+	 * D 死锁，高并发下 reader 频繁重建拖垮节点。
+	 * 提交已由 reader_request/writer_request 的 queue_work 异步触发，完成由
+	 * reply_cb 解锁页；本 DIO 只需等自己的页解锁即可，无需全局 flush。
+	 */
 	for (i = 0; i < nr_pages; i++) {
 		wait_on_page_locked(pages[i]);
 		if (TestClearPageError(pages[i]))
