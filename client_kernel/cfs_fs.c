@@ -1266,7 +1266,12 @@ static int cfs_create(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *d
 	ret = cfs_meta_create(cmi->meta, dir->i_ino, &dentry->d_name, mode, uid,
 			      gid, NULL, quota, &iinfo);
 	if (ret < 0) {
-		cfs_log_error(cmi->log, "create dentry error %d\n", ret);
+		/* 并发创建同名文件：别的客户端已建，metanode 返回 -EEXIST。丢弃残留
+		 * 负 dentry，使随后 stat 重新 lookup 看到该文件（同 cfs_mkdir 注释）。 */
+		if (ret == -EEXIST)
+			d_drop(dentry);
+		else
+			cfs_log_error(cmi->log, "create dentry error %d\n", ret);
 		goto out;
 	}
 
@@ -1417,7 +1422,16 @@ static int cfs_mkdir(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *de
 	ret = cfs_meta_create(cmi->meta, dir->i_ino, &dentry->d_name, mode, uid,
 			      gid, NULL, quota, &iinfo);
 	if (ret < 0) {
-		cfs_log_error(cmi->log, "create dentry error %d\n", ret);
+		/* 并发 mkdir -p 共享中间目录：别的客户端已建同名目录，metanode 返回
+		 * -EEXIST。此时必须丢弃本地残留的负 dentry(cfs_lookup 之前种下、
+		 * d_revalidate 在 dentry_cache_valid_ms 内判其有效)，否则 coreutils
+		 * 在 mkdir=EEXIST 后 stat 该路径仍走负 dentry 得 ENOENT，误判 mkdir -p
+		 * 失败并报 "File exists"。d_drop 后紧随的 stat 重新 lookup 到 metanode
+		 * 看到该目录，mkdir -p 幂等成功。EEXIST 属并发正常路径，不记 error。 */
+		if (ret == -EEXIST)
+			d_drop(dentry);
+		else
+			cfs_log_error(cmi->log, "create dentry error %d\n", ret);
 		goto out;
 	}
 
