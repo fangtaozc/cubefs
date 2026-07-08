@@ -1010,8 +1010,18 @@ static int cfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 	if (flags & LOOKUP_RCU)
 		return -ECHILD;
 
-	if (!inode)
+	if (!inode) {
+		/* 负 dentry：按 dentry_cache_valid_ms 到期即失效(返回 false)，强制
+		 * VFS 丢弃并重新 lookup 到 metanode，使其他客户端新建的同名路径可见
+		 * （close-to-open 一致性）。d_time 于 cfs_lookup 建负 dentry 时置；
+		 * 为 0 或已过期都判失效。 */
+		unsigned long ttl =
+			msecs_to_jiffies(cmi->options->dentry_cache_valid_ms);
+
+		if (!dentry->d_time || time_after(jiffies, dentry->d_time + ttl))
+			return false;
 		return true;
+	}
 
 	if (!is_dentry_cache_valid(ci)) {
 		ret = cfs_meta_get(cmi->meta, inode->i_ino, NULL);
@@ -1186,6 +1196,10 @@ static struct dentry *cfs_lookup(struct inode *dir, struct dentry *dentry,
 
 	ret = cfs_meta_lookup(cmi->meta, dir->i_ino, &dentry->d_name, &iinfo);
 	if (ret == -ENOENT) {
+		/* 负 dentry 记录建立时刻，供 cfs_d_revalidate 按 dentry_cache_valid_ms
+		 * 到期失效。否则 VFS 永久缓存"不存在"，其他客户端随后新建的同名路径
+		 * 在本客户端永久 ENOENT（跨客户端元数据不一致）。 */
+		dentry->d_time = jiffies;
 		d_add(dentry, NULL);
 		new_dentry = NULL;
 		goto out;
