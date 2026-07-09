@@ -26,7 +26,6 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/log"
-	"github.com/cubefs/cubefs/util/timeutil"
 )
 
 type GetInodeReq struct {
