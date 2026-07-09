@@ -238,8 +238,15 @@ func (mp *metaPartition) getInodeExt(req *GetInodeReq) (resp *InodeResponse) {
 		return
 	}
 
+	/*
+	 * 原此处无条件 resp.Msg.AccessTime = GetCurrentTimeUnix()，把返回给客户端的 atime
+	 * 覆盖为读取当刻(CubeFS 历史弱 atime 设计)。后果：setattr/写入设置的 atime 对其他
+	 * 客户端不可见、每个读者看到各自访问当刻 → 跨客户端 atime 不一致。
+	 * 改为返回存储的 i.AccessTime(经 Copy 避免改动原 inode)，使 atime 反映最后一次
+	 * 写/setattr、跨客户端一致。纯读不再 bump atime(客户端本就挂 S_NOATIME，符合 noatime
+	 * 语义)；unlink delayed-delete 判定用的是 inode 内 i.AccessTime，不经此路径，不受影响。
+	 */
 	resp.Msg = i.Copy().(*Inode)
-	resp.Msg.AccessTime = timeutil.GetCurrentTimeUnix()
 	return
 }
 
