@@ -1843,9 +1843,32 @@ const struct address_space_operations cfs_address_ops = {
 #endif
 };
 
+/*
+ * CubeFS 不提供跨客户端(分布式)POSIX 锁：服务端无字节范围锁 RPC，内核客户端
+ * 也不把锁转发到 metanode。若不实现 .lock/.flock，VFS 会回退到本地锁——跨节点
+ * 应用会"各自持有本地锁"却无实际互斥，静默地并发写同一文件 → 数据损坏。
+ * 为把静默失败变成显式失败(fail-loud)，这里主动拒绝：
+ *   - fcntl 记录锁(F_SETLK/F_SETLKW/F_GETLK/OFD) → -ENOLCK("无可用锁")
+ *   - flock(整文件) → -EOPNOTSUPP("不支持")
+ * 依赖锁互斥的应用会立即报错，而非误以为拿到锁后损坏数据。副作用：单节点内的
+ * 本地锁也一并失效(加锁时无法区分单/多节点访问)；需要本地锁的场景请评估。
+ * 租约(F_SETLEASE)走 .setlease(未实现,保持内核默认),不受影响。
+ */
+static int cfs_lock(struct file *file, int cmd, struct file_lock *fl)
+{
+	return -ENOLCK;
+}
+
+static int cfs_flock(struct file *file, int cmd, struct file_lock *fl)
+{
+	return -EOPNOTSUPP;
+}
+
 const struct file_operations cfs_file_fops = {
 	.open = cfs_open,
 	.release = cfs_release,
+	.lock = cfs_lock,
+	.flock = cfs_flock,
 	.llseek = generic_file_llseek,
 #ifdef KERNEL_HAS_READ_WRITE_ITER
 	.read_iter = generic_file_read_iter,
