@@ -221,18 +221,24 @@ static inline u32 ia_valid_to_u32(unsigned int ia_valid)
 {
 	unsigned int flags = 0;
 
+	/* flags 是 CubeFS 线协议 valid 位(CFS_ATTR_*),不是 Linux iattr 位。
+	 * mode/uid/gid 的 Linux ATTR_* 与 CFS_ATTR_* 恰好都是 1<<0/1/2,故历史上
+	 * 直接 OR Linux 常量能工作;但 mtime/atime 的 Linux ATTR_MTIME_SET(1<<8)/
+	 * ATTR_ATIME_SET(1<<7) 与 CFS_ATTR_MTIME(1<<3)/CFS_ATTR_ATIME(1<<4) 不同,
+	 * 原来 OR 成 Linux 常量导致 metanode 认不出时间 valid 位→utimes/mtime 不落库
+	 * (退回写时间、他端不可见)。此处统一用 CFS_ATTR_* 线协议位。 */
 	if (ia_valid & ATTR_MODE)
-		flags |= ATTR_MODE;
+		flags |= CFS_ATTR_MODE;
 	if (ia_valid & ATTR_UID)
-		flags |= ATTR_UID;
+		flags |= CFS_ATTR_UID;
 	if (ia_valid & ATTR_GID)
-		flags |= ATTR_GID;
+		flags |= CFS_ATTR_GID;
 	/* 隐式时间更新(truncate/write/chmod 等触发 ATTR_MTIME/ATTR_ATIME,无 _SET 后缀)
 	 * 也需回写 metanode;原仅认 utimes(2) 的 ATTR_*_SET,导致 truncate 后 mtime 不更新。 */
 	if (ia_valid & (ATTR_MTIME | ATTR_MTIME_SET))
-		flags |= ATTR_MTIME_SET;
+		flags |= CFS_ATTR_MTIME;
 	if (ia_valid & (ATTR_ATIME | ATTR_ATIME_SET))
-		flags |= ATTR_ATIME_SET;
+		flags |= CFS_ATTR_ATIME;
 	return flags;
 }
 
