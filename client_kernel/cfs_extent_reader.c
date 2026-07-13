@@ -139,10 +139,13 @@ static void extent_reader_tx_work_cb(struct work_struct *work)
 		if (!(reader->flags &
 		      (EXTENT_READER_F_ERROR | EXTENT_READER_F_RECOVER))) {
 			int ret = cfs_socket_send_packet(reader->sock, packet);
+			/* 必须用 READER flag 位:原来错用 WRITER_F_ERROR(0x4)rx 按
+			 * READER_F_ERROR(0x2)认不出,而 WRITER_F_RECOVER(0x2)恰好撞成
+			 * READER_F_ERROR → 分类错乱、无 failover 反假 EIO。 */
 			if (ret == -ENOMEM)
-				reader->flags |= EXTENT_WRITER_F_ERROR;
+				reader->flags |= EXTENT_READER_F_ERROR;
 			else if (ret < 0)
-				reader->flags |= EXTENT_WRITER_F_RECOVER;
+				reader->flags |= EXTENT_READER_F_RECOVER;
 		}
 		spin_lock(&reader->lock_rx);
 		list_add_tail(&packet->list, &reader->rx_packets);
