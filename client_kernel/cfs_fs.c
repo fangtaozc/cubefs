@@ -515,6 +515,11 @@ static int cfs_writepages_cb(struct page *page, struct writeback_control *wbc,
 					     page_size);
 		cfs_page_vec_clear(vec);
 		if (ret < 0) {
+			/* 当前 page 不在刚 flush 的批次里,其 dirty 位已被 write_cache_pages
+			 * 清除;若只 unlock 会永久丢该页。redirty 以便下次回写重试,并记 mapping
+			 * 错误让 fsync/close 感知失败,避免静默丢数据。 */
+			redirty_page_for_writepage(wbc, page);
+			mapping_set_error(page->mapping, ret);
 			unlock_page(page);
 			return ret;
 		}
@@ -541,12 +546,19 @@ static int cfs_writepages(struct address_space *mapping,
 	vec = cfs_page_vec_new();
 	if (!vec)
 		return -ENOMEM;
-	write_cache_pages(mapping, wbc, cfs_writepages_cb, vec);
+	ret = write_cache_pages(mapping, wbc, cfs_writepages_cb, vec);
 	if (!cfs_page_vec_empty(vec)) {
+		int ret2;
 		page_size = cfs_inode_page_size(ci, vec->pages[vec->nr - 1]);
-		ret = cfs_extent_write_pages(ci->es, vec->pages, vec->nr,
-					     page_offset(vec->pages[0]), 0,
-					     page_size);
+		ret2 = cfs_extent_write_pages(ci->es, vec->pages, vec->nr,
+					      page_offset(vec->pages[0]), 0,
+					      page_size);
+		/* 末批 flush 错误也要记 mapping error 并作为返回值,否则被吞掉 */
+		if (ret2 < 0) {
+			mapping_set_error(mapping, ret2);
+			if (ret == 0)
+				ret = ret2;
+		}
 	}
 	cfs_page_vec_release(vec);
 	return ret;
@@ -997,7 +1009,10 @@ out:
 		ktime_us_delta(ktime_get(), time), ret);
 	cfs_stat_record(cmi->stats, CFS_VOP_READDIR,
 			ktime_us_delta(ktime_get(), time), ret);
-	return 0;
+	/* 返回 ret 而非恒 0:readdir/batch_get/ENOMEM 等中途错误(ret<0)必须上报,
+	 * 否则目录被静默截断却报"列举完成",致 ls/find/rm -rf/备份漏项。filldir 缓冲满
+	 * 的分支已显式置 ret=0(非错误,VFS 会再次调用),不受影响。 */
+	return ret;
 }
 
 /**
