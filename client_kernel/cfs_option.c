@@ -111,8 +111,9 @@ static int cfs_options_parse(const char *dev_str, const char *opt_str,
 		}
 	}
 
+	/* opt_str 可能为 NULL(mount 未带 -o 选项),不能无条件解引用 */
 	start = opt_str;
-	while (*start) {
+	while (start && *start) {
 		if (strncmp(start, "owner=", 6) == 0) {
 			start += 6;
 			end = strchr(start, ',');
@@ -207,6 +208,15 @@ static int cfs_options_parse(const char *dev_str, const char *opt_str,
 		} else {
 			start++;
 		}
+	}
+
+	/* owner 必填:缺失时(mount 未带 -o owner=,或 opt_str 为空/NULL)若放行,
+	 * 下游以 NULL owner 做字符串操作会内核 oops(panic_on_oops → 节点重启)。
+	 * 显式要求,mount 干净失败 -EINVAL 而非崩溃。 */
+	if (!options->owner) {
+		cfs_pr_err("mount: option 'owner' is required\n");
+		cfs_options_clear(options);
+		return -EINVAL;
 	}
 
 	return 0;
