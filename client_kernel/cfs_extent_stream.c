@@ -1123,6 +1123,13 @@ int cfs_extent_dio_read_write(struct cfs_extent_stream *es, int type,
 	size_t i;
 	int ret = 0;
 
+	/* extent_dio_pages_alloc 用 iter_iov() 取用户缓冲布局,仅对 IOVEC/UBUF 有效。
+	 * BVEC/KVEC(splice/sendfile/io_uring 固定缓冲/内核内部)下 iter_iov() 返野指针
+	 * → 崩溃/越界。这类 iter 直接返 -EINVAL,让上层回退 buffered 路径处理,
+	 * 避免内核崩溃(正常 read/write 的 UBUF/IOVEC 不受影响)。 */
+	if (iov_iter_is_bvec(iter) || iov_iter_is_kvec(iter))
+		return -EINVAL;
+
 #ifdef DEBUG
 	cfs_pr_debug("ino(%llu) type=%d offset=%lld, size=%lu\n", es->ino, type,
 		     offset, iov_iter_count(iter));
