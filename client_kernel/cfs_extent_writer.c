@@ -48,6 +48,9 @@ struct cfs_extent_writer *cfs_extent_writer_new(struct cfs_extent_stream *es,
 		kfree(writer);
 		return NULL;
 	}
+	/* 必须设 recv 超时:否则 datanode 短/丢回复时 rx kthread 的 recv 永久阻塞
+	 * → 无法 recover(R3)。超时后 -EIO 触发 recover。 */
+	cfs_socket_set_recv_timeout(writer->sock, EXTENT_RECV_TIMEOUT_MS);
 	writer->es = es;
 	writer->dp = dp;
 	writer->file_offset = file_offset;

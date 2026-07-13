@@ -127,7 +127,7 @@ cfs_log_audit_inline(struct cfs_log *log, const char *file, unsigned line,
 	}
 
 	if (dst_dentry) {
-		if (!(dst_buf = kzalloc(PATH_MAX, GFP_KERNEL))) {
+		if (!(dst_buf = kzalloc(PATH_MAX, GFP_NOFS))) {
 			cfs_pr_err("oom\n");
 			if (src_buf)
 				kfree(src_buf);

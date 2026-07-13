@@ -16,6 +16,11 @@
 #define EXTENT_STREAM_BUCKET_MAX_NUM 128
 #define EXTENT_DP_BUCKET_MAX_NUM 128
 
+/* 数据面 socket 收超时:reader/writer 的异步 recv 也必须设(原只有同步
+ * do_extent_request 设),否则 datanode 短/丢回复时 rx kthread 的 MSG_WAITALL
+ * 永久阻塞 → 页永不解锁 → 进程 D 态挂死、无法 recover(R3)。 */
+#define EXTENT_RECV_TIMEOUT_MS 5000u
+
 #define EXTENT_WRITER_F_DIRTY (0x1 << 0)
 #define EXTENT_WRITER_F_RECOVER (0x1 << 1)
 #define EXTENT_WRITER_F_ERROR (0x1 << 2)

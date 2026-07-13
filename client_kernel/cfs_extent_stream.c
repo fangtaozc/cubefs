@@ -9,7 +9,7 @@
 #define iter_iov(iter) ((iter)->iov)
 #endif
 
-#define EXTENT_RECV_TIMEOUT_MS 5000u
+/* EXTENT_RECV_TIMEOUT_MS 已移至 cfs_extent.h(reader/writer 也需要,R3)。 */
 
 #define EXTENT_BLOCK_COUNT 1024UL
 #define EXTENT_BLOCK_SIZE 131072UL
@@ -681,7 +681,12 @@ err_page:
 		struct cfs_page *cpage = iter.pages[0];
 		size_t first_page_size;
 
-		BUG_ON(ret == 0);
+		/* 到此仍有未消费页:正常仅错误路径(ret<0)。若 ret==0(成功却有残留
+		 * 页,本不应发生)不再 BUG_ON 打崩整机——强制 -EIO 并走下方
+		 * SetPageError+解锁,让上层返错而非 panic(防御,历史上曾因不足页
+		 * DIO 几何在此崩)。 */
+		if (ret == 0)
+			ret = -EIO;
 		first_page_size =
 			iter.nr == 1 ?
 				iter.end_page_size - iter.first_page_offset :
@@ -1032,7 +1037,12 @@ err_page:
 		struct cfs_page *cpage = iter.pages[0];
 		size_t first_page_size;
 
-		BUG_ON(ret == 0);
+		/* 到此仍有未消费页:正常仅错误路径(ret<0)。若 ret==0(成功却有残留
+		 * 页,本不应发生)不再 BUG_ON 打崩整机——强制 -EIO 并走下方
+		 * SetPageError+解锁,让上层返错而非 panic(防御,历史上曾因不足页
+		 * DIO 几何在此崩)。 */
+		if (ret == 0)
+			ret = -EIO;
 		first_page_size =
 			iter.nr == 1 ?
 				iter.end_page_size - iter.first_page_offset :
@@ -1232,7 +1242,9 @@ struct cfs_extent_stream *cfs_extent_stream_new(struct cfs_extent_client *ec,
 	es->max_writers = EXTENT_WRITER_MAX_COUNT;
 	INIT_LIST_HEAD(&es->readers);
 	es->max_readers = EXTENT_READER_MAX_COUNT;
-	hash_add(ec->streams, &es->hash, ino);
+	/* 不再挂入 ec->streams:该表从不被查询(死表),而 hash_add/hash_del 又
+	 * 不持锁——create/lookup 与 inode 回收对不同 inode 并发时会撕裂同桶链表
+	 * 指针 → UAF/panic(R2)。移除增删即消除该竞争。 */
 	mutex_init(&es->lock_writers);
 	mutex_init(&es->lock_readers);
 	init_rwsem(&es->lock_io);
@@ -1249,7 +1261,7 @@ void cfs_extent_stream_release(struct cfs_extent_stream *es)
 		return;
 	cfs_extent_stream_flush(es);
 	cfs_extent_cache_clear(&es->cache);
-	hash_del(&es->hash);
+	/* 对应 stream_new:不再从 ec->streams 摘除(已不挂入,见 R2)。 */
 	kfree(es);
 }
 

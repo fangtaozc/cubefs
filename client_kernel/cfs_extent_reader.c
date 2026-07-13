@@ -30,6 +30,9 @@ struct cfs_extent_reader *cfs_extent_reader_new(struct cfs_extent_stream *es,
 		kfree(reader);
 		return NULL;
 	}
+	/* 必须设 recv 超时:否则 datanode 短/丢回复时 rx kthread 的 recv 永久阻塞
+	 * → 页永不解锁 → 进程 D 态挂死、无法 recover(R3)。超时后 -EIO 触发 recover。 */
+	cfs_socket_set_recv_timeout(reader->sock, EXTENT_RECV_TIMEOUT_MS);
 	reader->es = es;
 	reader->dp = dp;
 	reader->ext_id = ext_id;

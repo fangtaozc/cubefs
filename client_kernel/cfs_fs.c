@@ -683,7 +683,12 @@ static int cfs_write_end(struct file *file, struct address_space *mapping,
 	struct inode *inode = page->mapping->host;
 	loff_t last_pos = pos + copied;
 
-	if (copied < len) {
+	/* 短拷贝(copied<len,用户源部分不可读)时仅对 !uptodate 页清零未拷贝区:
+	 * 对读-改-写的 uptodate 页,[from+copied, from+len) 是文件既有有效数据,
+	 * 无条件 zero_user 会清零并回写 → 静默数据损坏(R5)。未拷贝区由上层
+	 * generic_perform_write 下一轮重写;若不重写则按 POSIX 保留旧内容(uptodate
+	 * 页 set_page_dirty 后整页回写即写回其原值,正确)。 */
+	if (copied < len && !PageUptodate(page)) {
 		unsigned from = pos & (PAGE_SIZE - 1);
 
 		zero_user(page, from + copied, len - copied);
@@ -712,12 +717,23 @@ static ssize_t cfs_direct_io(struct kiocb *iocb, struct iov_iter *iter)
 	struct inode *inode = file_inode(file);
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
 	loff_t offset = iocb->ki_pos;
+	bool is_read = (iov_iter_rw(iter) == READ);
+	loff_t isize = is_read ? i_size_read(inode) : 0;
 	ssize_t ret;
 
+	/* O_DIRECT 读按 i_size 处理 EOF(R4):越 EOF 返回 0(EOF)。不截断 iter——
+	 * 截断会经 UBUF 的 iov_len==count 把不足页的几何传入 extent_dio_pages_alloc,
+	 * 触发 cfs_extent_read_pages 的 err_page BUG_ON(见 stream.c:1035)。改为读后
+	 * 钳制返回长度:越 EOF 的零填字节不返回给应用,使顺序读见 read()==0 而终止。 */
+	if (is_read && offset >= isize)
+		return 0;
 	ret = cfs_extent_dio_read_write(CFS_INODE(inode)->es,
 					iov_iter_rw(iter), iter, offset);
-	if (ret > 0)
-		cfs_stat_io(cmi->stats, iov_iter_rw(iter) == WRITE, ret);
+	if (ret > 0) {
+		if (is_read && offset + ret > isize)
+			ret = isize - offset;
+		cfs_stat_io(cmi->stats, !is_read, ret);
+	}
 	return ret;
 }
 #elif defined(KERNEL_HAS_DIO_WITH_ITER_AND_OFFSET)
@@ -727,12 +743,20 @@ static ssize_t cfs_direct_io(struct kiocb *iocb, struct iov_iter *iter,
 	struct file *file = iocb->ki_filp;
 	struct inode *inode = file_inode(file);
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
+	bool is_read = (iov_iter_rw(iter) == READ);
+	loff_t isize = is_read ? i_size_read(inode) : 0;
 	ssize_t ret;
 
+	/* O_DIRECT 读 EOF 处理 + 返回长度钳制(R4,见另一变体注释;不截断 iter)。 */
+	if (is_read && offset >= isize)
+		return 0;
 	ret = cfs_extent_dio_read_write(CFS_INODE(inode)->es,
 					iov_iter_rw(iter), iter, offset);
-	if (ret > 0)
-		cfs_stat_io(cmi->stats, iov_iter_rw(iter) == WRITE, ret);
+	if (ret > 0) {
+		if (is_read && offset + ret > isize)
+			ret = isize - offset;
+		cfs_stat_io(cmi->stats, !is_read, ret);
+	}
 	return ret;
 }
 #else
