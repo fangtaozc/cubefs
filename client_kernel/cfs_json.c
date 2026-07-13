@@ -87,6 +87,11 @@ int cfs_json_get_object(cfs_json_t *json, const char *key, cfs_json_t *val)
 		token = &parser->tokens[i];
 		if (token->parent == json->index &&
 		    jsoneq(parser->js, token, key) == 0) {
+			/* value 是 key 的下一个 token;key 若是最后一个 token(畸形/
+			 * 恶意响应如 {"k":})则 i+1==tokens_count,取值访问器会越界读
+			 * 堆(kstrndup 用垃圾 start/end → 崩溃/堆内容泄漏进文件名)。 */
+			if (i + 1 >= parser->tokens_count)
+				return -ENOENT;
 			val->parser = parser;
 			val->index = i + 1;
 			return 0;
@@ -104,6 +109,8 @@ int cfs_json_get_object_key(cfs_json_t *json, char **key)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_OBJECT)
 		return -1;
@@ -123,6 +130,8 @@ int cfs_json_get_object_key_ptr(cfs_json_t *json, const char **key, size_t *len)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	*key = parser->js + token->start;
 	*len = token->end - token->start;
@@ -239,6 +248,8 @@ size_t cfs_json_get_array_size(cfs_json_t *array)
 	jsmntok_t *token;
 
 	parser = array->parser;
+	if (array->index >= parser->tokens_count) /* 纵深防御:越界返 0 项 */
+		return 0;
 	token = &parser->tokens[array->index];
 	/* 不可信服务端响应:字段本应是数组却来成 object/primitive 时,token->size
 	 * 是键数而非数组项数,会误导 array 遍历;非数组返 0(干净拒绝)。 */
@@ -275,6 +286,8 @@ int cfs_json_get_value_string(cfs_json_t *json, char **val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_STRING)
 		return -1;
@@ -292,6 +305,8 @@ int cfs_json_get_value_string_ptr(cfs_json_t *json, const char **val,
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_STRING)
 		return -1;
@@ -306,6 +321,8 @@ int cfs_json_get_value_u64(cfs_json_t *json, u64 *val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_PRIMITIVE)
 		return -1;
@@ -319,6 +336,8 @@ int cfs_json_get_value_s64(cfs_json_t *json, s64 *val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_PRIMITIVE)
 		return -1;
@@ -332,6 +351,8 @@ int cfs_json_get_value_u32(cfs_json_t *json, u32 *val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_PRIMITIVE)
 		return -1;
@@ -345,6 +366,8 @@ int cfs_json_get_value_u8(cfs_json_t *json, u8 *val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_PRIMITIVE)
 		return -1;
@@ -358,6 +381,8 @@ int cfs_json_get_value_s8(cfs_json_t *json, s8 *val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_PRIMITIVE)
 		return -1;
@@ -371,6 +396,8 @@ int cfs_json_get_value_bool(cfs_json_t *json, bool *val)
 	jsmntok_t *token;
 
 	parser = json->parser;
+	if (json->index >= parser->tokens_count) /* 纵深防御:越界拒绝(见 get_object) */
+		return -1;
 	token = &parser->tokens[json->index];
 	if (token->type != JSMN_PRIMITIVE)
 		return -1;

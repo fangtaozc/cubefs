@@ -63,6 +63,7 @@ size_t cfs_page_iter_get_frags(struct cfs_page_iter *iter,
 			       size_t *len)
 {
 	size_t i;
+	size_t n = 0; /* 实际填充的 frag 数 */
 	size_t copied = 0;
 	size_t page_offset;
 
@@ -78,6 +79,7 @@ size_t cfs_page_iter_get_frags(struct cfs_page_iter *iter,
 			dst[i].size = iter->end_page_size - page_offset;
 		else
 			dst[i].size = PAGE_SIZE - page_offset;
+		n = i + 1;
 		copied += dst[i].size;
 		if (copied >= *len) {
 			dst[i].size -= copied - *len;
@@ -87,7 +89,9 @@ size_t cfs_page_iter_get_frags(struct cfs_page_iter *iter,
 		page_offset = 0;
 	}
 	*len = copied;
-	return i + 1;
+	/* 返回实际填充数 n:原来恒返 i+1,循环自然跑满(未 break)时 i 已自增到
+	 * 上限,i+1 比填充数多 1 → 组包读越界 frag / 野 page 指针发网络。 */
+	return n;
 }
 
 void cfs_page_iter_advance(struct cfs_page_iter *iter, size_t bytes)

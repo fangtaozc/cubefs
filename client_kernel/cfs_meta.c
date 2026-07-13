@@ -486,7 +486,8 @@ static int cfs_meta_icreate_internal(struct cfs_meta_client *mc,
 	}
 	reply_data = &packet->reply.data.icreate;
 	if (iinfo) {
-		if (S_ISLNK(reply_data->info->mode))
+		if (S_ISLNK(reply_data->info->mode) &&
+		    reply_data->info->target)
 			reply_data->info->size =
 				strlen(reply_data->info->target);
 		*iinfo = cfs_move(reply_data->info, NULL);
@@ -808,7 +809,8 @@ static int cfs_meta_ilink_internal(struct cfs_meta_client *mc,
 	}
 	reply_data = &packet->reply.data.ilink;
 	if (iinfo) {
-		if (S_ISLNK(reply_data->info->mode))
+		if (S_ISLNK(reply_data->info->mode) &&
+		    reply_data->info->target)
 			reply_data->info->size =
 				strlen(reply_data->info->target);
 		*iinfo = cfs_move(reply_data->info, NULL);
@@ -860,7 +862,8 @@ static int cfs_meta_iunlink_internal(struct cfs_meta_client *mc,
 	}
 	reply_data = &packet->reply.data.iunlink;
 	if (iinfo) {
-		if (S_ISLNK(reply_data->info->mode))
+		if (S_ISLNK(reply_data->info->mode) &&
+		    reply_data->info->target)
 			reply_data->info->size =
 				strlen(reply_data->info->target);
 		*iinfo = cfs_move(reply_data->info, NULL);

@@ -25,10 +25,18 @@ struct cfs_log {
 	spinlock_t lock;
 	enum cfs_log_level level;
 	wait_queue_head_t wait;
+	/* 引用计数:cmi 持 1,每个打开的 /proc log fd 持 1。poller 睡在 log->wait
+	 * 上,umount 释放 cmi 时若无引用会 kvfree(log) → poller 的 remove_wait_queue
+	 * 触已释放内存(UAF)。归 0 才真正释放。 */
+	atomic_t refcnt;
 };
 
 struct cfs_log *cfs_log_new(void);
 void cfs_log_release(struct cfs_log *log);
+static inline void cfs_log_get(struct cfs_log *log)
+{
+	atomic_inc(&log->refcnt);
+}
 void cfs_log_write(struct cfs_log *log, const char *fmt, ...);
 int cfs_log_read(struct cfs_log *log, char __user *buf, size_t len);
 
@@ -105,7 +113,7 @@ cfs_log_audit_inline(struct cfs_log *log, const char *file, unsigned line,
 	char *dst_buf = NULL, *dst_path = NULL;
 
 	if (src_dentry) {
-		if (!(src_buf = kzalloc(PATH_MAX, GFP_KERNEL))) {
+		if (!(src_buf = kzalloc(PATH_MAX, GFP_NOFS))) {
 			cfs_pr_err("oom\n");
 			return;
 		}

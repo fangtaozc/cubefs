@@ -340,12 +340,21 @@ static struct inode *cfs_inode_new(struct super_block *sb,
 		inode->i_op = &cfs_symlink_iops;
 		break;
 	case S_IFIFO:
+	case S_IFCHR:
+	case S_IFBLK:
+	case S_IFSOCK:
+		/* FIFO/字符/块/套接字设备:必须 init_special_inode 设好 i_fop,否则
+		 * 返回 i_fop=NULL 的半初始化 inode,open 时 NULL 解引用崩。
+		 * (查已存在设备节点时 rdev 未由 iinfo 携带,CHR/BLK 设备号可能为 0,
+		 *  属已知限制;SOCK/FIFO 不用 rdev,不受影响。) */
 		inode->i_op = &cfs_special_iops;
 		init_special_inode(inode, inode->i_mode, rdev);
 		break;
 	default:
+		/* 未知/损坏 mode:标记失败返回 NULL,不返回半初始化 inode。 */
 		cfs_pr_err("unsupport inode mode 0%o\n", inode->i_mode);
-		break;
+		iget_failed(inode);
+		return NULL;
 	}
 	unlock_new_inode(inode);
 	return inode;
@@ -2079,23 +2088,31 @@ struct file_system_type cfs_fs_type = {
 
 static int proc_log_open(struct inode *inode, struct file *file)
 {
-	file->private_data = pde_data(inode);
+	struct cfs_mount_info *cmi = pde_data(inode);
+
+	/* 持 log 引用并把 log 存入 private_data:poller 睡在 log->wait 上,umount
+	 * 释放 cmi/log 时若无引用会 UAF。open 取引用、release 放,保证 log 活到
+	 * fd 关闭;直接存 log 指针(不经 cmi)避免 cmi 先于 poller 释放后再解引用。
+	 * open 期 proc 项仍在(proc_remove 会等在途 open),故 cmi->log 有效。 */
+	if (!cmi || !cmi->log)
+		return -ENODEV;
+	cfs_log_get(cmi->log);
+	file->private_data = cmi->log;
 	return 0;
 }
 
 static ssize_t proc_log_read(struct file *file, char __user *buf, size_t size,
 			     loff_t *ppos)
 {
-	struct cfs_mount_info *cmi = file->private_data;
+	struct cfs_log *log = file->private_data;
 
-	return cfs_log_read(cmi->log, buf, size);
+	return cfs_log_read(log, buf, size);
 }
 
 static unsigned int proc_log_poll(struct file *file,
 				  struct poll_table_struct *p)
 {
-	struct cfs_mount_info *cmi = file->private_data;
-	struct cfs_log *log = cmi->log;
+	struct cfs_log *log = file->private_data;
 
 	poll_wait(file, &log->wait, p);
 	if (cfs_log_size(log))
@@ -2105,6 +2122,10 @@ static unsigned int proc_log_poll(struct file *file,
 
 static int proc_log_release(struct inode *inode, struct file *file)
 {
+	struct cfs_log *log = file->private_data;
+
+	if (log)
+		cfs_log_release(log); /* 放 open 时取的引用 */
 	return 0;
 }
 

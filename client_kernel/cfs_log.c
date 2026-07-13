@@ -13,12 +13,17 @@ struct cfs_log *cfs_log_new(void)
 	spin_lock_init(&log->lock);
 	log->level = CFS_LOG_DEBUG;
 	init_waitqueue_head(&log->wait);
+	atomic_set(&log->refcnt, 1); /* cmi 持有的初始引用 */
 	return log;
 }
 
+/* put 语义:cmi 释放与每个 /proc log fd 关闭各放一个引用,归 0 才 kvfree。
+ * 保证 poller 睡在 log->wait 期间 log 不被释放(H9 UAF)。 */
 void cfs_log_release(struct cfs_log *log)
 {
 	if (!log)
+		return;
+	if (!atomic_dec_and_test(&log->refcnt))
 		return;
 	kvfree(log);
 }
@@ -35,7 +40,9 @@ void cfs_log_write(struct cfs_log *log, const char *fmt, ...)
 	va_end(args);
 
 	nr_text++;
-	text = kvmalloc(nr_text, GFP_KERNEL);
+	/* GFP_NOFS:日志经 readahead/writepage 出错路径可达(reclaim/回写上下文),
+	 * GFP_KERNEL 会 direct reclaim 回写本 fs 脏页 → 递归死锁。 */
+	text = kvmalloc(nr_text, GFP_NOFS);
 	if (!text) {
 		cfs_pr_err("oom\n");
 		return;

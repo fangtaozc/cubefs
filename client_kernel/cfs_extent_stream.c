@@ -379,7 +379,9 @@ static int extent_write_pages_tiny(struct cfs_extent_stream *es,
 	int ret = -1;
 	u32 retry_cnt = cfs_extent_get_partition_count(es->ec);
 
-	BUG_ON(iter->nr > CFS_PAGE_VEC_NUM);
+	/* 页数超出向量容量:返错而非 BUG_ON 打崩整机(可恢复的非法输入)。 */
+	if (iter->nr > CFS_PAGE_VEC_NUM)
+		return -EINVAL;
 
 retry:
 	if (retry_cnt == 0)
