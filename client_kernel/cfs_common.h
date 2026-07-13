@@ -221,15 +221,17 @@ static inline int cfs_kstrntos8(const char *start, size_t len,
 
 static inline int cfs_kstrntobool(const char *start, size_t len, bool *res)
 {
-	if (strncasecmp(start, "false", len) == 0) {
+	/* 必须精确长度匹配:原用调用方传入的 len 做 strncasecmp,len==0 会匹配
+	 * "false"(比较 0 字符返 0)、len<5 时 "t"/"tr"/"f"/"fal" 等前缀都被接受
+	 * → 截断/空布尔值被静默曲解而非报错。 */
+	if (len == 5 && strncasecmp(start, "false", 5) == 0) {
 		*res = false;
 		return 0;
-	} else if (strncasecmp(start, "true", len) == 0) {
+	} else if (len == 4 && strncasecmp(start, "true", 4) == 0) {
 		*res = true;
 		return 0;
-	} else {
-		return -EINVAL;
 	}
+	return -EINVAL;
 }
 
 const char *cfs_pr_addr(const struct sockaddr_storage *ss);

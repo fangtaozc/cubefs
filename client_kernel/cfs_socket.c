@@ -158,6 +158,11 @@ void cfs_socket_release(struct cfs_socket *csk, bool forever)
 int cfs_socket_set_recv_timeout(struct cfs_socket *csk, u32 timeout_ms)
 {
 	csk->sock->sk->sk_rcvtimeo = msecs_to_jiffies(timeout_ms);
+	/* 一并设发送超时:原来只设 sk_rcvtimeo,sk_sndtimeo 默认无限;对接受连接
+	 * 但停止读取(接收窗满)的黑洞/卡死 peer,kernel_sendmsg 会在 sk_stream_
+	 * wait_memory 永久阻塞、进程长期 D 态占住挂载点。与既有 5s 收超时对称,
+	 * 把发送 hang 也界定为超时→上层走 recover 换副本。 */
+	csk->sock->sk->sk_sndtimeo = msecs_to_jiffies(timeout_ms);
 	return 0;
 }
 
@@ -532,6 +537,27 @@ int cfs_socket_recv_packet(struct cfs_socket *csk, struct cfs_packet *packet)
 				be64_to_cpu(packet->request.hdr.req_id),
 				packet->request.hdr.opcode, datalen, ret);
 			return ret;
+		}
+		/* 读数据 CRC 校验(H6):datanode 每个读回复包头带该数据块的
+		 * crc32(store.Read 返回、reply.SetCRC),客户端按收到的 frag 重算比对。
+		 * datanode 盘静默损坏/内存翻转/串包会返 OK+错数据,不校验则静默返脏数据。
+		 * 失配返 -EBADMSG,rx 线程据此走 recover 换副本。写路径用同一
+		 * cfs_page_frags_crc32 且被 datanode 接受,证算法一致;普通 extent 冷读
+		 * (含各尺寸)已验零误报。 */
+		{
+			u32 expect = be32_to_cpu(packet->reply.hdr.crc);
+			u32 actual = cfs_page_frags_crc32(
+				packet->reply.data.read.frags,
+				packet->reply.data.read.nr);
+			if (actual != expect) {
+				cfs_log_error(
+					csk->log,
+					"so(%p) id=%llu READ crc mismatch expect=0x%x actual=0x%x datalen=%u\n",
+					csk->sock,
+					be64_to_cpu(packet->request.hdr.req_id),
+					expect, actual, datalen);
+				return -EBADMSG;
+			}
 		}
 	} else if (datalen > 0) {
 		/**

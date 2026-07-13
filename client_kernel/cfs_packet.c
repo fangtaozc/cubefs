@@ -21,6 +21,54 @@ static atomic_t packet_seq = ATOMIC_INIT(0);
 static struct kmem_cache *packet_cache;
 static struct kmem_cache *packet_inode_cache;
 
+/* 把用户可控字符串(文件名 / xattr key/value / readdir marker)按 JSON 字符串
+ * 转义写入 buffer:未转义时含 " \ 换行等控制字符会生成非法 JSON(metanode 解析
+ * 失败,该类文件整类不可用)或注入额外 JSON 字段。普通字符逐字节原样输出,故
+ * 普通文件名字节完全不变、无回归(仅特殊字符行为改变)。 */
+static int cfs_buffer_write_json_str(struct cfs_buffer *buffer, const char *s,
+				     size_t len)
+{
+	size_t i;
+	int ret;
+
+	for (i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)s[i];
+
+		switch (c) {
+		case '"':
+			ret = cfs_buffer_write(buffer, "\\\"");
+			break;
+		case '\\':
+			ret = cfs_buffer_write(buffer, "\\\\");
+			break;
+		case '\n':
+			ret = cfs_buffer_write(buffer, "\\n");
+			break;
+		case '\r':
+			ret = cfs_buffer_write(buffer, "\\r");
+			break;
+		case '\t':
+			ret = cfs_buffer_write(buffer, "\\t");
+			break;
+		case '\b':
+			ret = cfs_buffer_write(buffer, "\\b");
+			break;
+		case '\f':
+			ret = cfs_buffer_write(buffer, "\\f");
+			break;
+		default:
+			if (c < 0x20)
+				ret = cfs_buffer_write(buffer, "\\u%04x", c);
+			else
+				ret = cfs_buffer_write(buffer, "%c", c);
+			break;
+		}
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
 static u64 cfs_packet_generate_id(void)
 {
 	return atomic_inc_return(&packet_seq);
@@ -416,8 +464,9 @@ cfs_packet_lookup_request_to_json(struct cfs_packet_lookup_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"vol\":\"%s\",", req->vol_name));
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"pino\":%llu,", req->parent_ino));
-	CHECK(cfs_buffer_write(buffer, "\"name\":\"%.*s\"", req->name->len,
-			       req->name->name));
+	CHECK(cfs_buffer_write(buffer, "\"name\":\""));
+	CHECK(cfs_buffer_write_json_str(buffer, req->name->name, req->name->len));
+	CHECK(cfs_buffer_write(buffer, "\""));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
 }
@@ -451,7 +500,11 @@ cfs_packet_readdir_request_to_json(struct cfs_packet_readdir_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"vol\":\"%s\",", req->vol_name));
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"pino\":%llu,", req->parent_ino));
-	CHECK(cfs_buffer_write(buffer, "\"marker\":\"%s\",", req->marker));
+	CHECK(cfs_buffer_write(buffer, "\"marker\":\""));
+	if (req->marker)
+		CHECK(cfs_buffer_write_json_str(buffer, req->marker,
+					       strlen(req->marker)));
+	CHECK(cfs_buffer_write(buffer, "\","));
 	CHECK(cfs_buffer_write(buffer, "\"limit\":%llu", req->limit));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
@@ -503,8 +556,9 @@ cfs_packet_dcreate_request_to_json(struct cfs_packet_dcreate_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"pino\":%llu,", req->parent_ino));
 	CHECK(cfs_buffer_write(buffer, "\"ino\":%llu,", req->ino));
-	CHECK(cfs_buffer_write(buffer, "\"name\":\"%.*s\",", req->name->len,
-			       req->name->name));
+	CHECK(cfs_buffer_write(buffer, "\"name\":\""));
+	CHECK(cfs_buffer_write_json_str(buffer, req->name->name, req->name->len));
+	CHECK(cfs_buffer_write(buffer, "\","));
 	CHECK(cfs_buffer_write(buffer, "\"mode\":%u,",
 			       umode_to_u32(req->mode)));
 	CHECK(cfs_buffer_write(buffer, "\"qids\":["));
@@ -528,8 +582,9 @@ cfs_packet_ddelete_request_to_json(struct cfs_packet_ddelete_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"vol\":\"%s\",", req->vol_name));
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"pino\":%llu,", req->parent_ino));
-	CHECK(cfs_buffer_write(buffer, "\"name\":\"%.*s\"", req->name->len,
-			       req->name->name));
+	CHECK(cfs_buffer_write(buffer, "\"name\":\""));
+	CHECK(cfs_buffer_write_json_str(buffer, req->name->name, req->name->len));
+	CHECK(cfs_buffer_write(buffer, "\""));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
 }
@@ -559,8 +614,9 @@ cfs_packet_dupdate_request_to_json(struct cfs_packet_dupdate_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"pino\":%llu,", req->parent_ino));
 	CHECK(cfs_buffer_write(buffer, "\"ino\":%llu,", req->ino));
-	CHECK(cfs_buffer_write(buffer, "\"name\":\"%.*s\"", req->name->len,
-			       req->name->name));
+	CHECK(cfs_buffer_write(buffer, "\"name\":\""));
+	CHECK(cfs_buffer_write_json_str(buffer, req->name->name, req->name->len));
+	CHECK(cfs_buffer_write(buffer, "\""));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
 }
@@ -691,11 +747,14 @@ cfs_packet_sxattr_request_to_json(struct cfs_packet_sxattr_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"vol\":\"%s\",", req->vol_name));
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"ino\":%llu,", req->ino));
-	CHECK(cfs_buffer_write(buffer, "\"key\":\"%s\",", req->key));
+	CHECK(cfs_buffer_write(buffer, "\"key\":\""));
+	CHECK(cfs_buffer_write_json_str(buffer, req->key, strlen(req->key)));
+	CHECK(cfs_buffer_write(buffer, "\","));
 	/* metanode SetXAttrRequest.Value 的 json tag 是 "val"(见 proto/fs_proto.go),
 	 * 原写成 "value" 导致 metanode 忽略、value 丢失(key 存了但取回为空)。 */
-	CHECK(cfs_buffer_write(buffer, "\"val\":\"%.*s\"", req->value_len,
-			       req->value));
+	CHECK(cfs_buffer_write(buffer, "\"val\":\""));
+	CHECK(cfs_buffer_write_json_str(buffer, req->value, req->value_len));
+	CHECK(cfs_buffer_write(buffer, "\""));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
 }
