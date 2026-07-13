@@ -432,6 +432,24 @@ int cfs_socket_recv_packet(struct cfs_socket *csk, struct cfs_packet *packet)
 		return ret;
 	}
 
+	/* 校验 reply 头,防连接错位/串包/类型混淆:magic 错,或 req_id/opcode 与本请求
+	 * 不匹配,说明服务端回了别的包(或流已错位)。若不校验就按不可信 reply.opcode 分支,
+	 * 会用错联合体成员(如非 READ 包走 read.frags)、按不可信 arglen/datalen 分配/收包
+	 * → 越界/巨额分配/把一个 inode 的数据串给另一个请求。此时返回 -EBADMSG,调用方错误
+	 * 路径会丢弃该连接(不回池),避免残留字节污染后续请求。 */
+	if (packet->reply.hdr.magic != CFS_PACKET_MAGIC ||
+	    packet->reply.hdr.req_id != packet->request.hdr.req_id ||
+	    packet->reply.hdr.opcode != packet->request.hdr.opcode) {
+		cfs_log_error(
+			csk->log,
+			"so(%p) reply mismatch: magic=0x%x req_id(reply=%llu req=%llu) op(reply=0x%x req=0x%x)\n",
+			csk->sock, packet->reply.hdr.magic,
+			be64_to_cpu(packet->reply.hdr.req_id),
+			be64_to_cpu(packet->request.hdr.req_id),
+			packet->reply.hdr.opcode, packet->request.hdr.opcode);
+		return -EBADMSG;
+	}
+
 	/* v3.5: 请求带 ProtoVersion 标志时 reply 也带,读掉 VerSeq(8)+ProtoVersion(4) 对齐 */
 	if (packet->request.hdr.ext_type & 0x10) {
 		u8 _pv[12];
