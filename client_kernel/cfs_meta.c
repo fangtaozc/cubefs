@@ -1241,6 +1241,10 @@ int cfs_meta_create(struct cfs_meta_client *mc, u64 parent_ino,
 					(*iinfo)->ino, mode, quota_infos);
 	if (ret != 0) {
 		cfs_log_error(mc->log, "create dentry error %d\n", ret);
+		/* icreate 已在 metanode 建好 inode,dentry 创建失败必须 iunlink 回收,
+		 * 否则留下无 dentry 引用的孤儿 inode(只能 fsck/gc 清)。iunlink 先于
+		 * release(需读 (*iinfo)->ino)。 */
+		cfs_meta_iunlink_internal(mc, mp, (*iinfo)->ino, NULL);
 		cfs_packet_inode_release(*iinfo);
 		ret = ret < 0 ? ret : -ret;
 		goto unlock;
@@ -1293,6 +1297,10 @@ int cfs_meta_link(struct cfs_meta_client *mc, u64 parent_ino, struct qstr *name,
 	}
 	if (iinfop)
 		*iinfop = iinfo;
+	else
+		/* 调用方不取回 inode 信息时必须释放,否则每次 link(2) 泄漏一个
+		 * cfs_packet_inode(唯一在册调用方 cfs_fs.c 正是传 NULL)。 */
+		cfs_packet_inode_release(iinfo);
 
 unlock:
 	up_read(&mc->lock);
@@ -1396,33 +1404,36 @@ int cfs_meta_rename(struct cfs_meta_client *mc, u64 src_parent_ino,
 		ret = cfs_meta_dupdate_internal(mc, dst_parent_mp,
 						dst_parent_ino, dst_name,
 						src_ino, &old_ino);
-	if (ret > 0) {
+	/* dcreate 失败(server >0 或传输 <0)都要撤销上面 ilink 的 nlink++,
+	 * 否则源 inode nlink 永久膨胀、永不回收。原 <0 分支漏了回滚。 */
+	if (ret != 0) {
 		cfs_meta_iunlink_internal(mc, src_mp, src_ino, NULL);
-		ret = -ret;
+		ret = ret < 0 ? ret : -ret;
 		goto unlock;
-	} else if (ret < 0)
-		goto unlock;
+	}
 
 	ret = cfs_meta_ddelete_internal(mc, src_parent_mp, src_parent_ino,
 					src_name, NULL);
-	if (ret > 0) {
+	/* ddelete(源 dentry)失败(server >0 或传输 <0)都要回滚:撤销上面新建的目标
+	 * dentry + 撤销 ilink 的 nlink++,否则留下双 dentry 别名 + nlink 膨胀。
+	 * 原 <0 分支直接 goto,漏了回滚。 */
+	if (ret != 0) {
 		int old_ret = ret;
+		int rb;
 		if (old_ino == 0)
-			ret = cfs_meta_ddelete_internal(mc, dst_parent_mp,
-							dst_parent_ino,
-							dst_name, NULL);
+			rb = cfs_meta_ddelete_internal(mc, dst_parent_mp,
+						       dst_parent_ino,
+						       dst_name, NULL);
 		else
-			ret = cfs_meta_dupdate_internal(mc, dst_parent_mp,
-							dst_parent_ino,
-							dst_name, old_ino,
-							NULL);
-		if (ret >= 0)
-			cfs_meta_iunlink_internal(mc, src_mp, src_ino,
-						  NULL);
-		ret = -old_ret;
+			rb = cfs_meta_dupdate_internal(mc, dst_parent_mp,
+						       dst_parent_ino,
+						       dst_name, old_ino,
+						       NULL);
+		if (rb >= 0)
+			cfs_meta_iunlink_internal(mc, src_mp, src_ino, NULL);
+		ret = old_ret < 0 ? old_ret : -old_ret;
 		goto unlock;
-	} else if (ret < 0)
-		goto unlock;
+	}
 
 	cfs_meta_iunlink_internal(mc, src_mp, src_ino, NULL);
 	if (old_ino != 0) {
