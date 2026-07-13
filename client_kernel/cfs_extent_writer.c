@@ -147,8 +147,13 @@ static void extent_writer_flush_work_cb(struct work_struct *work)
 	list_del(&writer->list);
 	spin_unlock(&es->lock_pending);
 	cfs_extent_writer_release(writer);
+	/* dec+wake 置于 lock_pending 内,配合 cfs_extent_stream_flush 在 wait_event
+	 * 之后取/放同一把锁形成屏障:保证本 cb 对 es 的最后一次访问(wake_up)先于
+	 * cfs_extent_stream_release 的 kfree(es) 完成,杜绝 es use-after-free(P2-1)。 */
+	spin_lock(&es->lock_pending);
 	atomic_dec(&es->nr_pending_flush);
 	wake_up(&es->flush_wq);
+	spin_unlock(&es->lock_pending);
 }
 
 /*

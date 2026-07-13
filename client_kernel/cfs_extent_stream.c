@@ -1245,6 +1245,10 @@ int cfs_extent_stream_flush(struct cfs_extent_stream *es)
 	 * 故不会死锁。
 	 */
 	wait_event(es->flush_wq, atomic_read(&es->nr_pending_flush) == 0);
+	/* 屏障:等正在执行 dec+wake 的 flush_work cb 退出 lock_pending 临界区,确保其对
+	 * es 的访问(wake_up)在后续 stream_release kfree(es) 前完成(P2-1 UAF)。 */
+	spin_lock(&es->lock_pending);
+	spin_unlock(&es->lock_pending);
 
 	while (true) {
 		mutex_lock(&es->lock_writers);
