@@ -50,8 +50,16 @@ cfs_json_t *cfs_json_parse(const char *js, size_t len)
 		return NULL;
 	}
 	jsmn_init(&parser->parser);
-	jsmn_parse(&parser->parser, js, len, parser->tokens,
-		   parser->tokens_count);
+	/* 必须检查第二遍解析返回值:reply.hdr.size 偏小/截断会让 body 不完整,pass-1
+	 * (tokens==NULL)较宽松返正数,pass-2 会返 JSMN_ERROR_PART/INVAL;若忽略则用半截
+	 * token 数组当成功解析 → 目录/extent 列表缺项 = 静默数据丢失。 */
+	ret = jsmn_parse(&parser->parser, js, len, parser->tokens,
+			 parser->tokens_count);
+	if (ret < 0) {
+		kfree(parser->tokens);
+		kfree(parser);
+		return NULL;
+	}
 
 	parser->js = js;
 	parser->root.parser = parser;
@@ -100,7 +108,7 @@ int cfs_json_get_object_key(cfs_json_t *json, char **key)
 	if (token->type != JSMN_OBJECT)
 		return -1;
 	*key = kstrndup(parser->js + token->start, token->end - token->start,
-			GFP_KERNEL);
+			GFP_NOFS);
 	if (!*key)
 		return -ENOMEM;
 	return 0;
@@ -267,7 +275,7 @@ int cfs_json_get_value_string(cfs_json_t *json, char **val)
 	if (token->type != JSMN_STRING)
 		return -1;
 	*val = kstrndup(parser->js + token->start, token->end - token->start,
-			GFP_KERNEL);
+			GFP_NOFS);
 	if (!*val)
 		return -ENOMEM;
 	return 0;
