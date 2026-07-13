@@ -159,7 +159,7 @@ static int cfs_meta_update_partition(struct cfs_meta_client *mc)
 unlock:
 	up_write(&mc->lock);
 	cfs_volume_view_clear(&vol_view);
-	return 0;
+	return ret;
 }
 
 static void meta_update_partition_work_cb(struct work_struct *work)
@@ -1213,6 +1213,12 @@ int cfs_meta_create(struct cfs_meta_client *mc, u64 parent_ino,
 		goto unlock;
 	}
 
+	/* 无可写元数据分区(卷只读/满,或分区表尚未拉起):否则下方 while 一次不执行,
+	 * ret 保持 0 越过 if(ret!=0) 守卫,直落 (*iinfo)->ino 解引用未初始化指针。 */
+	if (mc->nr_rw_partitions == 0) {
+		ret = -ENOSPC;
+		goto unlock;
+	}
 	retry = mc->nr_rw_partitions;
 	while (retry-- > 0) {
 		mp = cfs_meta_select_partition(mc);
