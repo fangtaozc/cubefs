@@ -424,11 +424,15 @@ static void cfs_readahead_flush(struct cfs_inode *ci, struct cfs_page_vec *vec)
 		return;
 	ret = cfs_extent_read_pages(ci->es, false, vec->pages, vec->nr,
 				    page_offset(vec->pages[0]), 0, PAGE_SIZE);
-	for (i = 0; i < vec->nr; i++) {
-		if (ret < 0)
-			cfs_page_endio(vec->pages[i], false, ret);
+	/* cfs_extent_read_pages 无论成功(reply_cb)还是失败(全部错误路径均已
+	 * 解锁页)都已负责页解锁;此处再 cfs_page_endio 会双重 unlock →
+	 * VM_BUG_ON_PAGE/UAF。只需放掉 readahead 持有的页引用。 */
+	if (ret < 0)
+		cfs_log_warn(ci->es->ec->log,
+			     "ino(%lu) readahead flush error %d\n",
+			     ci->vfs_inode.i_ino, ret);
+	for (i = 0; i < vec->nr; i++)
 		put_page(vec->pages[i]);
-	}
 	cfs_page_vec_clear(vec);
 }
 
@@ -1782,6 +1786,8 @@ static int cfs_fs_fill_super(struct super_block *sb, void *data, int silent)
 	if (!inode)
 		return -ENOMEM;
 	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
 	return 0;
 }
 

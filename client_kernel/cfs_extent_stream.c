@@ -905,11 +905,20 @@ int cfs_extent_read_pages(struct cfs_extent_stream *es, bool direct_io,
 	for (i = 0; i < nr_pages; i++) {
 		cpages[i] = cfs_page_new(pages[i]);
 		if (!cpages[i]) {
-			while (i-- > 0) {
-				ClearPageUptodate(pages[i]);
-				SetPageError(pages[i]);
-				unlock_page(pages[i]);
-				cfs_page_release(cpages[i]);
+			size_t j;
+			/* 已包装的页 [0,i):释放 cpage + 解锁 */
+			for (j = 0; j < i; j++) {
+				ClearPageUptodate(pages[j]);
+				SetPageError(pages[j]);
+				unlock_page(pages[j]);
+				cfs_page_release(cpages[j]);
+			}
+			/* 未包装的页 [i,nr)(含失败当前页):仅被 caller 上锁,必须解锁,
+			 * 否则永久 locked → wait_on_page_locked 挂死。 */
+			for (j = i; j < nr_pages; j++) {
+				ClearPageUptodate(pages[j]);
+				SetPageError(pages[j]);
+				unlock_page(pages[j]);
 			}
 			kvfree(cpages);
 			return -ENOMEM;
