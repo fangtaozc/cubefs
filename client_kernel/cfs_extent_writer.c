@@ -37,14 +37,16 @@ struct cfs_extent_writer *cfs_extent_writer_new(struct cfs_extent_stream *es,
 	int ret;
 
 	BUG_ON(dp == NULL);
+	/* 失败一律返回 NULL(不返回 ERR_PTR):所有调用点都用 if(!x) 判断,
+	 * 返回 ERR_PTR 会被漏判 → 毒指针入链表/解引用 → panic。 */
 	writer = kzalloc(sizeof(*writer), GFP_NOFS);
 	if (!writer)
-		return ERR_PTR(-ENOMEM);
+		return NULL;
 	ret = cfs_socket_create(CFS_SOCK_TYPE_TCP, &dp->members.base[0],
 				es->ec->log, &writer->sock);
 	if (ret < 0) {
 		kfree(writer);
-		return ERR_PTR(ret);
+		return NULL;
 	}
 	writer->es = es;
 	writer->dp = dp;

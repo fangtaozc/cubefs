@@ -18,15 +18,17 @@ struct cfs_extent_reader *cfs_extent_reader_new(struct cfs_extent_stream *es,
 	int ret;
 
 	BUG_ON(dp == NULL);
+	/* 失败一律返回 NULL(不返回 ERR_PTR):所有调用点都用 if(!x) 判断,
+	 * 返回 ERR_PTR 会被漏判 → 毒指针入链表/解引用 → panic。 */
 	reader = kzalloc(sizeof(*reader), GFP_NOFS);
 	if (!reader)
-		return ERR_PTR(-ENOMEM);
+		return NULL;
 	host_idx = host_idx % dp->members.num;
 	ret = cfs_socket_create(CFS_SOCK_TYPE_TCP, &dp->members.base[host_idx],
 				es->ec->log, &reader->sock);
 	if (ret < 0) {
 		kfree(reader);
-		return ERR_PTR(ret);
+		return NULL;
 	}
 	reader->es = es;
 	reader->dp = dp;
