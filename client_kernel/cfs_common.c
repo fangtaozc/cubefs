@@ -273,7 +273,9 @@ int cfs_base64_decode(const char *base64, size_t base64_len, char **str)
 
 	if (base64_len % 4 != 0)
 		return -EINVAL;
-	buf = kzalloc((base64_len / 4) * 3 + 1, GFP_KERNEL);
+	/* GFP_NOFS:base64_decode 在 reply 解析路径(symlink/xattr 目标)被调用,
+	 * 处于文件系统 I/O 上下文,GFP_KERNEL 内存压力下 reclaim 可能递归回本 fs。 */
+	buf = kzalloc((base64_len / 4) * 3 + 1, GFP_NOFS);
 	if (!buf)
 		return -ENOMEM;
 	dst = buf;
@@ -282,8 +284,10 @@ int cfs_base64_decode(const char *base64, size_t base64_len, char **str)
 		b = decode_bits(base64[i + 1]);
 		c = decode_bits(base64[i + 2]);
 		d = decode_bits(base64[i + 3]);
-		if (a < 0 || b < 0 || c < 0 || d < 0)
+		if (a < 0 || b < 0 || c < 0 || d < 0) {
+			kfree(buf); /* 非法字符:释放已分配缓冲,否则泄漏 */
 			return -EINVAL;
+		}
 
 		*dst++ = (a << 2) | (b >> 4);
 		*dst++ = (b << 4) | (c >> 2);

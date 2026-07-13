@@ -44,6 +44,9 @@ static int __init cfs_init(void)
 	proc_dir = proc_mkdir("fs/cubefs", NULL);
 	if (!proc_dir) {
 		cfs_pr_err("mkdir /proc/fs/cubefs error\n");
+		/* 否则 ret 仍为上一步的 0,insmod 报成功但 register_filesystem 未执行,
+		 * 模块成空壳、mount 得 -ENODEV。 */
+		ret = -ENOMEM;
 		goto exit;
 	}
 

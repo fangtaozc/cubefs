@@ -1489,7 +1489,11 @@ int cfs_cluster_info_from_json(cfs_json_t *json, struct cfs_cluster_info *info)
 	ret = cfs_json_get_u32(json, "DirChildrenNumLimit", &info->links_limit);
 	CHECK_GOTO(ret, "not found DirChildrenNumLimit");
 
+	return 0;
+
 failed:
+	/* 成功路径必须提前 return:否则落到 cfs_cluster_info_clear(memset 清零),
+	 * links_limit 恒为 0,集群配置的目录子项上限被忽略。 */
 	cfs_cluster_info_clear(info);
 	return ret;
 }
