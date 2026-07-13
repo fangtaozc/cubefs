@@ -66,20 +66,35 @@ int cfs_log_read(struct cfs_log *log, char __user *buf, size_t len)
 {
 	u32 offset = 0;
 	u32 copy;
+	char *tmp;
+
+	/* 绝不能在 spin_lock 内 copy_to_user:用户页缺页会睡眠 → scheduling while
+	 * atomic / 死锁(读 /proc/fs/cubefs/<vol>/log,cfs_logtail.py 触发)。
+	 * 锁内拷到临时内核缓冲并推进 ring,锁外再 copy_to_user。 */
+	spin_lock(&log->lock);
+	len = min_t(u32, len, log->size);
+	spin_unlock(&log->lock);
+	if (len == 0)
+		return 0;
+	tmp = kvmalloc(len, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
 
 	spin_lock(&log->lock);
 	len = min_t(u32, len, log->size);
-	while (len > 0) {
-		copy = min_t(u32, CFS_LOG_BUF_LEN - log->tail, len);
-		if (copy_to_user(buf + offset, log->buf + log->tail, copy)) {
-			spin_unlock(&log->lock);
-			return -EFAULT;
-		}
+	while (offset < len) {
+		copy = min_t(u32, CFS_LOG_BUF_LEN - log->tail, len - offset);
+		memcpy(tmp + offset, log->buf + log->tail, copy);
 		log->tail = (log->tail + copy) % CFS_LOG_BUF_LEN;
 		log->size -= copy;
 		offset += copy;
-		len -= copy;
 	}
 	spin_unlock(&log->lock);
+
+	if (offset && copy_to_user(buf, tmp, offset)) {
+		kvfree(tmp);
+		return -EFAULT;
+	}
+	kvfree(tmp);
 	return offset;
 }

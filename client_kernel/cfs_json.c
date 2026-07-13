@@ -240,6 +240,10 @@ size_t cfs_json_get_array_size(cfs_json_t *array)
 
 	parser = array->parser;
 	token = &parser->tokens[array->index];
+	/* 不可信服务端响应:字段本应是数组却来成 object/primitive 时,token->size
+	 * 是键数而非数组项数,会误导 array 遍历;非数组返 0(干净拒绝)。 */
+	if (token->type != JSMN_ARRAY)
+		return 0;
 	return token->size;
 }
 

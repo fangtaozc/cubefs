@@ -208,6 +208,11 @@ int cfs_socket_send_iovec(struct cfs_socket *csk, struct iovec *iov,
 				     iov_iter_count(&ii));
 		if (ret < 0)
 			break;
+		if (ret == 0) {
+			/* peer 半关闭:advance(0) 会导致 count 不减而无限自旋,按错误处理 */
+			ret = -EPIPE;
+			break;
+		}
 		iov_iter_advance(&ii, ret);
 	}
 	sigprocmask(SIG_SETMASK, &oldset, NULL);
