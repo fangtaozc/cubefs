@@ -289,16 +289,30 @@ int cfs_extent_cache_refresh(struct cfs_extent_cache *cache, bool force)
 	size_t i;
 	int ret;
 
+	/* fast path:非强制且本地已有 extent → 免 RPC(与原逻辑一致)。 */
 	mutex_lock(&cache->lock);
 	if (!force && btree_count(cache->extents) > 0) {
-		ret = 0;
-		goto out;
+		mutex_unlock(&cache->lock);
+		return 0;
 	}
+	mutex_unlock(&cache->lock);
+
+	/* RPC 必须在锁外:原实现持 cache->lock 跨 metanode 往返,使同 inode 的
+	 * 所有读/写/truncate 都串行等这次 RPC(truncate 风暴/缓存失效时大量进程
+	 * D 态堆积、吞吐塌陷)。此处锁外发 RPC,拿到结果再取锁重建 btree。 */
 	ret = cfs_meta_list_extent(ec->meta, es->ino, &gen, &size, &extents);
 	if (ret < 0)
-		goto out;
-	if (cache->generation != 0 && cache->generation >= gen)
-		goto out;
+		return ret;
+
+	mutex_lock(&cache->lock);
+	/* 重取锁后用 generation 复检:RPC 期间可能有并发 append(sync)本地
+	 * generation++ 或另一次 refresh 拉到更新数据;本地不旧则丢弃本次结果,
+	 * 保持 generation 单调前进(同原有守卫语义)。 */
+	if (cache->generation != 0 && cache->generation >= gen) {
+		mutex_unlock(&cache->lock);
+		cfs_packet_extent_array_clear(&extents);
+		return 0;
+	}
 	cache->generation = gen;
 	cache->size = size;
 	btree_clear(cache->extents);
@@ -306,11 +320,9 @@ int cfs_extent_cache_refresh(struct cfs_extent_cache *cache, bool force)
 		btree_set(cache->extents, &extents.base[i]);
 		if (btree_oom(cache->extents)) {
 			ret = -ENOMEM;
-			goto out;
+			break;
 		}
 	}
-
-out:
 	mutex_unlock(&cache->lock);
 	cfs_packet_extent_array_clear(&extents);
 	return ret;

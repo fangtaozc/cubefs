@@ -97,7 +97,7 @@ cfs_extent_client_new(struct cfs_master_client *master,
 	hash_init(ec->data_partitions);
 	INIT_LIST_HEAD(&ec->rw_partitions);
 	rwlock_init(&ec->lock);
-	mutex_init(&ec->select_lock);
+	spin_lock_init(&ec->select_lock);
 
 	ret = cfs_extent_update_partition(ec);
 	if (ret < 0) {
@@ -203,11 +203,18 @@ cfs_extent_select_partition(struct cfs_extent_client *ec)
 	u32 step;
 
 	read_lock(&ec->lock);
-	mutex_lock(&ec->select_lock);
-	if (ec->select_dp)
+	spin_lock(&ec->select_lock);
+	if (ec->select_dp) {
 		step = 1;
-	else
+	} else if (ec->nr_rw_partitions == 0) {
+		/* 无 RW 分区:避免 get_random_u32() % 0 除零 panic(update_partition
+		 * 与选盘并发可把 nr_rw_partitions 置 0)。 */
+		spin_unlock(&ec->select_lock);
+		read_unlock(&ec->lock);
+		return NULL;
+	} else {
 		step = get_random_u32() % ec->nr_rw_partitions;
+	}
 	step = max_t(u32, step, 1);
 
 	while (step-- > 0) {
@@ -227,7 +234,7 @@ cfs_extent_select_partition(struct cfs_extent_client *ec)
 	select_dp = ec->select_dp;
 	if (select_dp)
 		atomic_inc(&select_dp->refcnt);
-	mutex_unlock(&ec->select_lock);
+	spin_unlock(&ec->select_lock);
 	read_unlock(&ec->lock);
 	return select_dp;
 }

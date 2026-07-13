@@ -288,10 +288,15 @@ cfs_meta_select_partition(struct cfs_meta_client *mc)
 	u32 step;
 
 	mutex_lock(&mc->select_lock);
-	if (mc->select_mp)
+	if (mc->select_mp) {
 		step = 1;
-	else
+	} else if (mc->nr_rw_partitions == 0) {
+		/* 无 RW 分区:避免 get_random_u32() % 0 除零 panic。 */
+		mutex_unlock(&mc->select_lock);
+		return NULL;
+	} else {
 		step = get_random_u32() % mc->nr_rw_partitions;
+	}
 	step = max_t(u32, step, 1);
 
 	while (step-- > 0) {

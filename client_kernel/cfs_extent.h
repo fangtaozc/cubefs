@@ -88,7 +88,10 @@ struct cfs_extent_writer {
 	u64 ext_offset;
 	u32 ext_size; /* acked write size */
 	u32 w_size; /* write size */
-	volatile unsigned flags;
+	atomic_t flags; /* 位掩码 EXTENT_*_F_*;多线程(tx/rx/写路径)并发置位,
+			* 必须原子(原 volatile unsigned 的 |= 是非原子 RMW,会丢
+			* DIRTY 位致 extent 不提交 meta → 数据丢失)。用 atomic_or/
+			* atomic_and/atomic_read 保留掩码语义。 */
 	struct cfs_extent_writer *recover;
 	struct work_struct flush_work; /* 异步 flush（writer 切换时由 flusher 提交） */
 	/* 引用计数(P2-2):记所有持有者(es 链表/pending_flush、write 路径 caller、
@@ -115,7 +118,10 @@ struct cfs_extent_reader {
 	atomic_t rx_inflight;
 	atomic_t tx_inflight;
 	u64 ext_id;
-	volatile unsigned flags;
+	atomic_t flags; /* 位掩码 EXTENT_*_F_*;多线程(tx/rx/写路径)并发置位,
+			* 必须原子(原 volatile unsigned 的 |= 是非原子 RMW,会丢
+			* DIRTY 位致 extent 不提交 meta → 数据丢失)。用 atomic_or/
+			* atomic_and/atomic_read 保留掩码语义。 */
 	struct cfs_extent_reader *recover;
 	u32 recover_cnt;
 	u32 host_idx;
@@ -160,7 +166,9 @@ struct cfs_extent_client {
 	struct list_head rw_partitions;
 	u32 nr_rw_partitions;
 	struct cfs_data_partition *select_dp;
-	struct mutex select_lock;
+	/* 选盘游标锁:改 spinlock(原 mutex 在 read_lock(&ec->lock) 原子上下文内
+	 * 加锁=睡眠在原子上下文)。临界区仅链表游标推进+atomic_inc,无睡眠。 */
+	spinlock_t select_lock;
 	struct delayed_work update_dp_work;
 	struct cfs_log *log;
 };
@@ -221,19 +229,19 @@ void cfs_extent_writer_request(struct cfs_extent_writer *writer,
 void extent_writer_submit_async_flush(struct cfs_extent_writer *writer);
 static inline void cfs_extent_writer_set_dirty(struct cfs_extent_writer *writer)
 {
-	writer->flags |= EXTENT_WRITER_F_DIRTY;
+	atomic_or(EXTENT_WRITER_F_DIRTY, &writer->flags);
 }
 
 static inline void
 cfs_extent_writer_clear_dirty(struct cfs_extent_writer *writer)
 {
-	writer->flags &= ~EXTENT_WRITER_F_DIRTY;
+	atomic_and(~EXTENT_WRITER_F_DIRTY, &writer->flags);
 }
 
 static inline bool
 cfs_extent_writer_test_dirty(struct cfs_extent_writer *writer)
 {
-	return writer->flags & EXTENT_WRITER_F_DIRTY;
+	return atomic_read(&writer->flags) & EXTENT_WRITER_F_DIRTY;
 }
 
 static inline void

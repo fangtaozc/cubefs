@@ -127,8 +127,11 @@ void cfs_extent_reader_request(struct cfs_extent_reader *reader,
 {
 	spin_lock(&reader->lock_tx);
 	list_add_tail(&packet->list, &reader->tx_packets);
-	spin_unlock(&reader->lock_tx);
+	/* inflight 必须与入队在同一临界区自增(原在锁外自增,并发 fsync 的
+	 * cfs_extent_reader_flush 可在 list_add 与 inc 之间观测到 inflight==0
+	 * 而放行 → 提交较小 size 到 meta → 丢写)。 */
 	atomic_inc(&reader->tx_inflight);
+	spin_unlock(&reader->lock_tx);
 	queue_work(extent_work_queue, &reader->tx_work);
 }
 
@@ -151,21 +154,21 @@ static void extent_reader_tx_work_cb(struct work_struct *work)
 		if (!packet)
 			break;
 
-		if (!(reader->flags &
+		if (!(atomic_read(&reader->flags) &
 		      (EXTENT_READER_F_ERROR | EXTENT_READER_F_RECOVER))) {
 			int ret = cfs_socket_send_packet(reader->sock, packet);
 			/* 必须用 READER flag 位:原来错用 WRITER_F_ERROR(0x4)rx 按
 			 * READER_F_ERROR(0x2)认不出,而 WRITER_F_RECOVER(0x2)恰好撞成
 			 * READER_F_ERROR → 分类错乱、无 failover 反假 EIO。 */
 			if (ret == -ENOMEM)
-				reader->flags |= EXTENT_READER_F_ERROR;
+				atomic_or(EXTENT_READER_F_ERROR, &reader->flags);
 			else if (ret < 0)
-				reader->flags |= EXTENT_READER_F_RECOVER;
+				atomic_or(EXTENT_READER_F_RECOVER, &reader->flags);
 		}
 		spin_lock(&reader->lock_rx);
 		list_add_tail(&packet->list, &reader->rx_packets);
+		atomic_inc(&reader->rx_inflight); /* 与入队同临界区(见 request 注释) */
 		spin_unlock(&reader->lock_rx);
-		atomic_inc(&reader->rx_inflight);
 		wake_up(&reader->rx_pending_wq);
 	}
 	atomic_sub(cnt, &reader->tx_inflight);
@@ -199,17 +202,17 @@ static int extent_reader_rx_thread_fn(void *data)
 		if (!packet)
 			break;
 
-		if (reader->flags & EXTENT_READER_F_ERROR) {
+		if (atomic_read(&reader->flags) & EXTENT_READER_F_ERROR) {
 			packet->error = -EIO;
 			goto handle_packet;
 		}
 
-		if (reader->flags & EXTENT_READER_F_RECOVER)
+		if (atomic_read(&reader->flags) & EXTENT_READER_F_RECOVER)
 			goto recover_packet;
 
 		ret = cfs_socket_recv_packet(reader->sock, packet);
 		if (ret < 0 || packet->reply.hdr.result_code != CFS_STATUS_OK) {
-			reader->flags |= EXTENT_READER_F_RECOVER;
+			atomic_or(EXTENT_READER_F_RECOVER, &reader->flags);
 			goto recover_packet;
 		}
 		goto handle_packet;
@@ -219,7 +222,7 @@ recover_packet:
 			mutex_lock(&es->lock_readers);
 			if (es->nr_readers >= es->max_readers) {
 				mutex_unlock(&es->lock_readers);
-				reader->flags |= EXTENT_READER_F_ERROR;
+				atomic_or(EXTENT_READER_F_ERROR, &reader->flags);
 				packet->error = -EPERM;
 				goto handle_packet;
 			}
@@ -231,7 +234,7 @@ recover_packet:
 							reader->ext_id);
 			if (!recover) {
 				cfs_data_partition_put(reader->dp);
-				reader->flags |= EXTENT_READER_F_ERROR;
+				atomic_or(EXTENT_READER_F_ERROR, &reader->flags);
 				packet->error = -ENOMEM;
 				goto handle_packet;
 			}

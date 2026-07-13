@@ -205,8 +205,11 @@ void cfs_extent_writer_request(struct cfs_extent_writer *writer,
 				      be32_to_cpu(packet->request.hdr.size));
 	spin_lock(&writer->lock_tx);
 	list_add_tail(&packet->list, &writer->tx_packets);
-	spin_unlock(&writer->lock_tx);
+	/* inflight 必须与入队在同一临界区自增(原在锁外自增,并发 fsync 的
+	 * cfs_extent_writer_flush 可在 list_add 与 inc 之间观测到 inflight==0
+	 * 而放行 → 提交较小 ext_size 到 meta → 丢写)。 */
 	atomic_inc(&writer->tx_inflight);
+	spin_unlock(&writer->lock_tx);
 	queue_work(extent_work_queue, &writer->tx_work);
 }
 
@@ -235,16 +238,16 @@ static void extent_writer_tx_work_cb(struct work_struct *work)
 					packet->request.data.write.frags,
 					packet->request.data.write.nr));
 
-		if (!(writer->flags &
+		if (!(atomic_read(&writer->flags) &
 		      (EXTENT_WRITER_F_ERROR | EXTENT_WRITER_F_RECOVER))) {
 			int ret = cfs_socket_send_packet(writer->sock, packet);
 			if (ret < 0)
-				writer->flags |= EXTENT_WRITER_F_RECOVER;
+				atomic_or(EXTENT_WRITER_F_RECOVER, &writer->flags);
 		}
 		spin_lock(&writer->lock_rx);
 		list_add_tail(&packet->list, &writer->rx_packets);
+		atomic_inc(&writer->rx_inflight); /* 与入队同临界区(见 request 注释) */
 		spin_unlock(&writer->lock_rx);
-		atomic_inc(&writer->rx_inflight);
 		wake_up(&writer->rx_pending_wq);
 	}
 	atomic_sub(cnt, &writer->tx_inflight);
@@ -278,17 +281,17 @@ static int extent_writer_rx_thread_fn(void *data)
 		if (!packet)
 			break;
 
-		if (writer->flags & EXTENT_WRITER_F_ERROR) {
+		if (atomic_read(&writer->flags) & EXTENT_WRITER_F_ERROR) {
 			packet->error = -EIO;
 			goto handle_packet;
 		}
 
-		if (writer->flags & EXTENT_WRITER_F_RECOVER)
+		if (atomic_read(&writer->flags) & EXTENT_WRITER_F_RECOVER)
 			goto recover_packet;
 
 		ret = cfs_socket_recv_packet(writer->sock, packet);
 		if (ret < 0 || packet->reply.hdr.result_code != CFS_STATUS_OK) {
-			writer->flags |= EXTENT_WRITER_F_RECOVER;
+			atomic_or(EXTENT_WRITER_F_RECOVER, &writer->flags);
 			goto recover_packet;
 		}
 		goto handle_packet;
@@ -301,7 +304,7 @@ recover_packet:
 			mutex_lock(&es->lock_writers);
 			if (es->nr_writers >= es->max_writers) {
 				mutex_unlock(&es->lock_writers);
-				writer->flags |= EXTENT_WRITER_F_ERROR;
+				atomic_or(EXTENT_WRITER_F_ERROR, &writer->flags);
 				packet->error = -EPERM;
 				goto handle_packet;
 			}
@@ -309,7 +312,7 @@ recover_packet:
 
 			ret = cfs_extent_id_new(es, &dp, &ext_id);
 			if (ret < 0) {
-				writer->flags |= EXTENT_WRITER_F_ERROR;
+				atomic_or(EXTENT_WRITER_F_ERROR, &writer->flags);
 				packet->error = ret;
 				goto handle_packet;
 			}
@@ -319,7 +322,7 @@ recover_packet:
 				ext_id, 0, 0);
 			if (!recover) {
 				cfs_data_partition_release(dp);
-				writer->flags |= EXTENT_WRITER_F_ERROR;
+				atomic_or(EXTENT_WRITER_F_ERROR, &writer->flags);
 				packet->error = -ENOMEM;
 				goto handle_packet;
 			}

@@ -227,8 +227,23 @@ static inline void cfs_inode_refresh_unlock(struct cfs_inode *ci,
 	i_gid_write(inode, iinfo->gid);
 	set_nlink(inode, iinfo->nlink);
 	inode->i_generation = iinfo->generation;
-	i_size_write(inode, iinfo->size);
-	inode->i_blocks = (iinfo->size + 511) >> 9;
+	{
+		/* 有本地未回写脏页时不下调 i_size:并发 stat/open 会拉到 metanode
+		 * 尚未提交 extent 的旧(小)size,直接写回会把在核 i_size 退到脏页尾
+		 * 之下 → 回写时 cfs_inode_page_size 变负 → 崩/丢数据。extent 提交后
+		 * metanode size 追上,届时正常同步;无本地脏页时合法的他节点
+		 * truncate-变小仍会应用。 */
+		loff_t remote = (loff_t)iinfo->size;
+		loff_t local = i_size_read(inode);
+		loff_t applied =
+			(remote < local &&
+			 mapping_tagged(inode->i_mapping,
+					PAGECACHE_TAG_DIRTY)) ?
+				local :
+				remote;
+		i_size_write(inode, applied);
+		inode->i_blocks = (applied + 511) >> 9;
+	}
 	cfs_quota_info_array_clear(&ci->quota_infos);
 	cfs_quota_info_array_move(&ci->quota_infos, &iinfo->quota_infos);
 	if (ci->link_target)
@@ -469,8 +484,13 @@ static inline loff_t cfs_inode_page_size(struct cfs_inode *ci,
 					 struct page *page)
 {
 	loff_t offset = page_offset(page);
+	loff_t remain = i_size_read(&ci->vfs_inode) - offset;
 
-	return min((loff_t)PAGE_SIZE, i_size_read(&ci->vfs_inode) - offset);
+	/* 页越过 EOF(如 truncate 变小的残留、或 i_size 被并发刷新短暂回退):
+	 * 钳到 0,杜绝负值以 size_t 传入下游放大成巨值 → BUG/越界。 */
+	if (remain < 0)
+		return 0;
+	return min((loff_t)PAGE_SIZE, remain);
 }
 
 static int cfs_writepage(struct page *page, struct writeback_control *wbc)
@@ -482,6 +502,13 @@ static int cfs_writepage(struct page *page, struct writeback_control *wbc)
 	int ret;
 
 	page_size = cfs_inode_page_size(ci, page);
+	if (page_size <= 0) {
+		/* 页越过当前 i_size(并发 stat 短暂回退 i_size / truncate 残留):不下发,
+		 * redirty 保留数据待 i_size 恢复后回写,避免静默丢数据或喂 0/负 size。 */
+		redirty_page_for_writepage(wbc, page);
+		unlock_page(page);
+		return 0;
+	}
 	set_page_writeback(page);
 	ret = cfs_extent_write_pages(ci->es, &page, 1, page_offset(page), 0,
 				     page_size);

@@ -212,7 +212,7 @@ extent_stream_get_writer(struct cfs_extent_stream *es, loff_t offset,
 retry:
 	mutex_lock(&es->lock_writers);
 	list_for_each_entry(writer, &es->writers, list) {
-		if (writer->flags &
+		if (atomic_read(&writer->flags) &
 		    (EXTENT_WRITER_F_RECOVER | EXTENT_WRITER_F_ERROR)) {
 			/* 坏 writer：摘出，锁外异步 flush 后重扫 */
 			list_del(&writer->list);
@@ -734,7 +734,7 @@ extent_stream_get_reader(struct cfs_extent_stream *es,
 
 	mutex_lock(&es->lock_readers);
 	list_for_each_entry_safe(reader, tmp, &es->readers, list) {
-		if (reader->flags & CFS_READER_BAD) {
+		if (atomic_read(&reader->flags) & CFS_READER_BAD) {
 			list_move_tail(&reader->list, &dead);
 			es->nr_readers--;
 			continue;

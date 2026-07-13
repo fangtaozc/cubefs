@@ -267,7 +267,12 @@ static int do_http_request(struct cfs_master_client *mc,
 	struct cfs_socket *csk;
 	int ret = -1;
 	u32 max = mc->hosts.num;
-	u32 i = get_random_u32() % mc->hosts.num;
+	u32 i;
+
+	/* 无 host:避免 get_random_u32() % 0 除零 panic(挂载串保证 ≥1,防御性)。 */
+	if (mc->hosts.num == 0)
+		return -EINVAL;
+	i = get_random_u32() % mc->hosts.num;
 
 	while (max-- > 0) {
 		host = &mc->hosts.base[i++];
