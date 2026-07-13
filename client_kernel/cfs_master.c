@@ -177,6 +177,12 @@ static int do_recv_http_response(struct cfs_master_client *mc,
 			break;
 		cfs_buffer_seek(response->buffer, ret);
 		if (cfs_buffer_avail_size(response->buffer) == 0) {
+			/* 上限保护:防异常/恶意 master 响应驱动 buffer 无界增长致 OOM。
+			 * 64MB 远超正常 getCluster/vol-view 响应。 */
+			if (cfs_buffer_size(response->buffer) >= (64u << 20)) {
+				ret = -EMSGSIZE;
+				break;
+			}
 			ret = cfs_buffer_grow(response->buffer, HTTP_DATA_SIZE);
 			if (ret < 0)
 				break;
@@ -235,7 +241,7 @@ static int do_recv_http_response(struct cfs_master_client *mc,
 				mc->log,
 				"server response status 200: body.code=%u\n",
 				code);
-			return -EBADMSG;
+			ret = -EBADMSG;
 			goto failed;
 		}
 		break;
