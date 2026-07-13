@@ -91,6 +91,11 @@ struct cfs_extent_writer {
 	volatile unsigned flags;
 	struct cfs_extent_writer *recover;
 	struct work_struct flush_work; /* 异步 flush（writer 切换时由 flusher 提交） */
+	/* 引用计数(P2-2):记所有持有者(es 链表/pending_flush、write 路径 caller、
+	 * 前驱 writer 的 ->recover 指针)。release=put,refcnt 归 0 才真正拆除。
+	 * fsync/close 的 stream_flush 不持 lock_io,会与 write 路径的 get_writer→
+	 * request 并发释放 writer → 无 refcount 即 use-after-free。 */
+	atomic_t refcnt;
 };
 
 struct cfs_extent_reader {
@@ -114,6 +119,10 @@ struct cfs_extent_reader {
 	struct cfs_extent_reader *recover;
 	u32 recover_cnt;
 	u32 host_idx;
+	/* 引用计数(P2-2),语义同 cfs_extent_writer.refcnt:read 路径 get_reader→
+	 * request 与 fsync/close 的 stream_flush 并发,后者不持 lock_io,无 refcount
+	 * 即释放正在被读线程使用的 reader → use-after-free。 */
+	atomic_t refcnt;
 };
 
 struct cfs_extent_stream {
@@ -201,6 +210,10 @@ struct cfs_extent_writer *cfs_extent_writer_new(struct cfs_extent_stream *es,
 						loff_t file_offset, u64 ext_id,
 						u64 ext_offset, u32 ext_size);
 void cfs_extent_writer_release(struct cfs_extent_writer *writer);
+static inline void cfs_extent_writer_get(struct cfs_extent_writer *writer)
+{
+	atomic_inc(&writer->refcnt);
+}
 int cfs_extent_writer_flush(struct cfs_extent_writer *writer);
 void cfs_extent_writer_request(struct cfs_extent_writer *writer,
 			       struct cfs_packet *packet);
@@ -239,6 +252,10 @@ struct cfs_extent_reader *cfs_extent_reader_new(struct cfs_extent_stream *es,
 						struct cfs_data_partition *dp,
 						u32 host_idx, u64 ext_id);
 void cfs_extent_reader_release(struct cfs_extent_reader *reader);
+static inline void cfs_extent_reader_get(struct cfs_extent_reader *reader)
+{
+	atomic_inc(&reader->refcnt);
+}
 void cfs_extent_reader_flush(struct cfs_extent_reader *reader);
 void cfs_extent_reader_request(struct cfs_extent_reader *reader,
 			       struct cfs_packet *packet);

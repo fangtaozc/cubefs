@@ -224,6 +224,9 @@ retry:
 		if (writer->file_offset + writer->w_size == offset) {
 			/* 命中接续该 offset 流的 writer */
 			if (writer->w_size + size <= EXTENT_SIZE) {
+				/* caller 引用,锁内取:防止 return 后、caller request
+				 * 前被并发 fsync/close 的 stream_flush 释放(P2-2)。 */
+				cfs_extent_writer_get(writer);
 				mutex_unlock(&es->lock_writers);
 				return writer;
 			}
@@ -293,6 +296,8 @@ build_new:
 	mutex_lock(&es->lock_writers);
 	list_add_tail(&writer->list, &es->writers);
 	es->nr_writers++;
+	/* caller 引用(链表引用为 _new 的初始引用),锁内取(P2-2)。 */
+	cfs_extent_writer_get(writer);
 	mutex_unlock(&es->lock_writers);
 	return writer;
 }
@@ -523,6 +528,7 @@ static int extent_write_pages_normal(struct cfs_extent_stream *es,
 			writer->ext_id, offset - writer->file_offset, offset);
 		if (!packet) {
 			cfs_log_error(es->ec->log, "ino(%llu) oom\n", es->ino);
+			cfs_extent_writer_release(writer); /* 放 caller 引用(P2-2) */
 			ret = -ENOMEM;
 			return ret;
 		}
@@ -537,9 +543,13 @@ static int extent_write_pages_normal(struct cfs_extent_stream *es,
 		if (unlikely(ret < 0)) {
 			cfs_log_error(es->ec->log, "ino(%llu) oom\n", es->ino);
 			cfs_packet_release(packet);
+			cfs_extent_writer_release(writer); /* 放 caller 引用(P2-2) */
 			return ret;
 		}
 		cfs_extent_writer_request(writer, packet);
+		/* 包已入 writer 队列,后续访问由 writer 的 tx/rx/release 机制兜住;
+		 * 此处放 caller 引用(P2-2)。 */
+		cfs_extent_writer_release(writer);
 
 		cfs_page_iter_advance(iter, w_len);
 		send_bytes += w_len;
@@ -733,9 +743,12 @@ extent_stream_get_reader(struct cfs_extent_stream *es,
 		    reader->ext_id == ext->ext_id)
 			found = reader;
 	}
-	if (found)
+	if (found) {
 		list_move_tail(&found->list, &es->readers); /* LRU 命中→MRU */
-	else if (es->nr_readers >= es->max_readers)
+		/* caller 引用,锁内取:防止 return 后、caller request 前被并发
+		 * fsync/close 的 stream_flush 释放(P2-2)。 */
+		cfs_extent_reader_get(found);
+	} else if (es->nr_readers >= es->max_readers)
 		evict = list_first_entry_or_null(
 			&es->readers, struct cfs_extent_reader, list);
 	if (evict) {
@@ -775,6 +788,8 @@ extent_stream_get_reader(struct cfs_extent_stream *es,
 	mutex_lock(&es->lock_readers);
 	list_add_tail(&reader->list, &es->readers);
 	es->nr_readers++;
+	/* caller 引用(链表引用为 _new 的初始引用),锁内取(P2-2)。 */
+	cfs_extent_reader_get(reader);
 	mutex_unlock(&es->lock_readers);
 	return reader;
 }
@@ -851,6 +866,7 @@ static int extent_read_pages_async(struct cfs_extent_stream *es,
 					       read_offset + read_bytes,
 					       io_info->offset);
 		if (!packet) {
+			cfs_extent_reader_release(reader); /* 放 caller 引用(P2-2) */
 			ret = -ENOMEM;
 			goto out;
 		}
@@ -859,6 +875,9 @@ static int extent_read_pages_async(struct cfs_extent_stream *es,
 		cfs_packet_set_read_data(packet, iter, &len);
 
 		cfs_extent_reader_request(reader, packet);
+		/* 包已入 reader 队列,其后续访问由 reader 的 tx/rx/release 排空机制
+		 * 兜住;此处放 caller 引用(P2-2)。 */
+		cfs_extent_reader_release(reader);
 
 		cfs_page_iter_advance(iter, len);
 		read_bytes += len;

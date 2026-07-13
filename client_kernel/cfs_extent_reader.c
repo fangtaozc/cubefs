@@ -44,6 +44,7 @@ struct cfs_extent_reader *cfs_extent_reader_new(struct cfs_extent_stream *es,
 	atomic_set(&reader->tx_inflight, 0);
 	atomic_set(&reader->rx_inflight, 0);
 	reader->host_idx = host_idx;
+	atomic_set(&reader->refcnt, 1); /* 创建者持有的初始引用(P2-2) */
 	reader->rx_thread = kthread_run(extent_reader_rx_thread_fn, reader,
 					"cfs-rrx-%llu", ext_id);
 	if (IS_ERR(reader->rx_thread)) {
@@ -80,10 +81,9 @@ static void reader_drain_packet_list(struct list_head *list, spinlock_t *lock,
 		atomic_sub(drained, inflight);
 }
 
-void cfs_extent_reader_release(struct cfs_extent_reader *reader)
+/* 真正拆除:仅在 refcnt 归 0 时由 cfs_extent_reader_release 调用。 */
+static void __cfs_extent_reader_free(struct cfs_extent_reader *reader)
 {
-	if (!reader)
-		return;
 	/* 先停 tx（不再产生新 rx_packets），再停 recv 线程。 */
 	cancel_work_sync(&reader->tx_work);
 	if (reader->rx_thread)
@@ -96,9 +96,24 @@ void cfs_extent_reader_release(struct cfs_extent_reader *reader)
 				 &reader->tx_inflight);
 	reader_drain_packet_list(&reader->rx_packets, &reader->lock_rx,
 				 &reader->rx_inflight);
+	/* recover 指针持有其一个引用(owning),此处 put:rx 线程已 kthread_stop,
+	 * 不再有人经 reader->recover 访问,安全释放。 */
+	if (reader->recover)
+		cfs_extent_reader_release(reader->recover);
 	cfs_data_partition_release(reader->dp);
 	cfs_socket_release(reader->sock, true);
 	kfree(reader);
+}
+
+/* 引用计数 put(P2-2):归 0 才真正拆除。原 release 语义(拆除)迁入 __free,
+ * 所有旧 release 调用点自动变为"放一个引用"。 */
+void cfs_extent_reader_release(struct cfs_extent_reader *reader)
+{
+	if (!reader)
+		return;
+	if (!atomic_dec_and_test(&reader->refcnt))
+		return;
+	__cfs_extent_reader_free(reader);
 }
 
 void cfs_extent_reader_flush(struct cfs_extent_reader *reader)
@@ -216,12 +231,16 @@ recover_packet:
 							reader->ext_id);
 			if (!recover) {
 				cfs_data_partition_put(reader->dp);
-				reader->flags |= EXTENT_WRITER_F_ERROR;
+				reader->flags |= EXTENT_READER_F_ERROR;
 				packet->error = -ENOMEM;
 				goto handle_packet;
 			}
 
 			mutex_lock(&es->lock_readers);
+			/* recover 有两个持有者:es->readers 链表 + 本 reader->recover
+			 * 指针。_new 的初始引用归 reader->recover(owning),链表另取一个
+			 * (P2-2)。 */
+			cfs_extent_reader_get(recover);
 			list_add_tail(&recover->list, &es->readers);
 			es->nr_readers++;
 			mutex_unlock(&es->lock_readers);

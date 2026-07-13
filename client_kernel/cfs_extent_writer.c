@@ -66,6 +66,7 @@ struct cfs_extent_writer *cfs_extent_writer_new(struct cfs_extent_stream *es,
 	init_waitqueue_head(&writer->rx_pending_wq);
 	atomic_set(&writer->tx_inflight, 0);
 	atomic_set(&writer->rx_inflight, 0);
+	atomic_set(&writer->refcnt, 1); /* 创建者持有的初始引用(P2-2) */
 	writer->rx_thread = kthread_run(extent_writer_rx_thread_fn, writer,
 					"cfs-wrx-%llu", ext_id);
 	if (IS_ERR(writer->rx_thread)) {
@@ -76,17 +77,32 @@ struct cfs_extent_writer *cfs_extent_writer_new(struct cfs_extent_stream *es,
 	return writer;
 }
 
-void cfs_extent_writer_release(struct cfs_extent_writer *writer)
+/* 真正拆除:仅在 refcnt 归 0 时由 cfs_extent_writer_release 调用。 */
+static void __cfs_extent_writer_free(struct cfs_extent_writer *writer)
 {
-	if (!writer)
-		return;
 	/* 先停 tx（不再产生新 rx_packets），再停 recv 线程。 */
 	cancel_work_sync(&writer->tx_work);
 	if (writer->rx_thread)
 		kthread_stop(writer->rx_thread);
+	/* recover 指针持有其一个引用(owning),此处 put:rx 线程已 kthread_stop,
+	 * 不再有人经 writer->recover 访问,安全释放。 */
+	if (writer->recover)
+		cfs_extent_writer_release(writer->recover);
 	cfs_data_partition_release(writer->dp);
 	cfs_socket_release(writer->sock, true);
 	kfree(writer);
+}
+
+/* 引用计数 put(P2-2):归 0 才真正拆除。原 release 语义(拆除)迁入 __free,
+ * 所有旧 release 调用点(get_writer 淘汰、flush_work_cb、stream_flush)自动
+ * 变为"放一个引用"。 */
+void cfs_extent_writer_release(struct cfs_extent_writer *writer)
+{
+	if (!writer)
+		return;
+	if (!atomic_dec_and_test(&writer->refcnt))
+		return;
+	__cfs_extent_writer_free(writer);
 }
 
 int cfs_extent_writer_flush(struct cfs_extent_writer *writer)
@@ -309,6 +325,10 @@ recover_packet:
 			}
 
 			mutex_lock(&es->lock_writers);
+			/* recover 有两个持有者:es->writers 链表 + 本 writer->recover
+			 * 指针。_new 的初始引用归 writer->recover(owning),链表另取一个
+			 * (P2-2)。 */
+			cfs_extent_writer_get(recover);
 			list_add_tail(&recover->list, &es->writers);
 			es->nr_writers++;
 			mutex_unlock(&es->lock_writers);
