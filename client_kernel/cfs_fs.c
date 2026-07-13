@@ -1385,7 +1385,12 @@ static int cfs_symlink(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *
 	ret = cfs_meta_create(cmi->meta, dir->i_ino, &dentry->d_name, mode, uid,
 			      gid, target, quota, &iinfo);
 	if (ret < 0) {
-		cfs_log_error(cmi->log, "create dentry error %d\n", ret);
+		/* 并发创建同名:metanode 返回 -EEXIST,丢弃残留负 dentry,使随后 stat
+		 * 重新 lookup 看到该项(同 cfs_create/cfs_mkdir)。 */
+		if (ret == -EEXIST)
+			d_drop(dentry);
+		else
+			cfs_log_error(cmi->log, "create dentry error %d\n", ret);
 		goto out;
 	}
 
@@ -1523,7 +1528,11 @@ static int cfs_mknod(CFS_IDMAP *mnt_userns, struct inode *dir, struct dentry *de
 	ret = cfs_meta_create(cmi->meta, dir->i_ino, &dentry->d_name, mode, uid,
 			      gid, NULL, NULL, &iinfo);
 	if (ret < 0) {
-		cfs_log_error(cmi->log, "create dentry error %d\n", ret);
+		/* 并发创建同名:-EEXIST 时丢弃残留负 dentry(同 cfs_create/cfs_mkdir)。 */
+		if (ret == -EEXIST)
+			d_drop(dentry);
+		else
+			cfs_log_error(cmi->log, "create dentry error %d\n", ret);
 		goto out;
 	}
 	inode = cfs_inode_new(sb, iinfo, rdev);
