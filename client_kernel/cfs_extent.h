@@ -16,10 +16,15 @@
 #define EXTENT_STREAM_BUCKET_MAX_NUM 128
 #define EXTENT_DP_BUCKET_MAX_NUM 128
 
-/* 数据面 socket 收超时:reader/writer 的异步 recv 也必须设(原只有同步
- * do_extent_request 设),否则 datanode 短/丢回复时 rx kthread 的 MSG_WAITALL
- * 永久阻塞 → 页永不解锁 → 进程 D 态挂死、无法 recover(R3)。 */
+/* 控制面(do_extent_request 同步小 RPC)收超时。 */
 #define EXTENT_RECV_TIMEOUT_MS 5000u
+
+/* 数据面(reader/writer 异步批量读写)收/发超时:必须设(原只有同步路径设,
+ * 否则 datanode 短/丢回复时 rx kthread 的 MSG_WAITALL 永久阻塞 → 页永不解锁 →
+ * D 态挂死、无法 recover,R3)。但阈值须远大于控制面 5s:datanode 从 HDD 冷读、
+ * 队列深时单包合法响应可 >5s,用 5s 会把"慢"误判成"错"→ 逐副本 failover 抖动
+ * 甚至耗尽 recover 链返 EIO(T7)。取 60s,只兜死连接、不误杀慢响应。 */
+#define EXTENT_DATA_RECV_TIMEOUT_MS 60000u
 
 #define EXTENT_WRITER_F_DIRTY (0x1 << 0)
 #define EXTENT_WRITER_F_RECOVER (0x1 << 1)

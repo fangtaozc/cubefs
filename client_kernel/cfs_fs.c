@@ -1036,8 +1036,15 @@ static int cfs_readdir(struct file *file, void *dirent, filldir_t filldir)
 		 */
 		cfs_packet_inode_ptr_array_clear(&iinfo_vec);
 
-		for (cfi->denties_offset = 0;
-		     cfi->denties_offset < cfi->denties.num;
+		/* metanode readdir 的 marker 是包含性的(AscendRange[start,end)),续读
+		 * (marker≠"")时 base[0] 即上一批末项,跳过它,否则每 1024 项边界重复一条
+		 * (对齐 Go SDK ReadDir_ll / fuse 的 batches[1:])。带 strcmp 守卫:marker
+		 * 项若在两批之间被删则 base[0]≠marker,不跳以免丢项(T1)。 */
+		cfi->denties_offset = 0;
+		if (cfi->marker && cfi->marker[0] != '\0' && cfi->denties.num > 0 &&
+		    strcmp(cfi->denties.base[0].name, cfi->marker) == 0)
+			cfi->denties_offset = 1;
+		for (; cfi->denties_offset < cfi->denties.num;
 		     cfi->denties_offset++) {
 			dentry = &cfi->denties.base[cfi->denties_offset];
 #if defined(KERNEL_HAS_ITERATE_DIR_SHARED) || defined(KERNEL_HAS_ITERATE_DIR)
@@ -1103,19 +1110,34 @@ static int cfs_d_revalidate(struct dentry *dentry, unsigned int flags)
 	}
 
 	if (!is_dentry_cache_valid(ci)) {
-		ret = cfs_meta_get(cmi->meta, inode->i_ino, NULL);
+		struct cfs_packet_inode *iinfo = NULL;
+		struct dentry *parent = dget_parent(dentry);
+
+		/* 缓存过期:必须按 (parent,name) 重解析并比对 ino,而非只 meta_get(ino)
+		 * 验旧 inode 存活——后者在他客户端 rename/replace 使同名指向新 inode 后,
+		 * 只要旧 inode 仍存活(被硬链接/打开)就一直判有效 → 持续解析到旧 inode
+		 * (T5)。 */
+		ret = cfs_meta_lookup(cmi->meta, d_inode(parent)->i_ino,
+				      &dentry->d_name, &iinfo);
+		dput(parent);
 		if (ret == -ENOENT) {
+			/* name 已不存在(删除/rename 走)→ 失效,VFS 重 lookup。 */
 			update_dentry_cache(ci);
 			return false;
 		} else if (ret < 0) {
 			cfs_log_warn(cmi->log,
-				     "get inode(%lu) error %d, try again\n",
-				     inode->i_ino, ret);
-			return true;
-		} else {
-			update_dentry_cache(ci);
-			return true;
+				     "revalidate lookup '%.*s' error %d, keep\n",
+				     pr_qstr(&dentry->d_name), ret);
+			return true; /* 瞬时错误:保守保留 */
 		}
+		if (iinfo->ino != inode->i_ino) {
+			/* name 现指向另一 inode(他节点 rename/replace)→ 失效重解析。 */
+			cfs_packet_inode_release(iinfo);
+			return false;
+		}
+		cfs_packet_inode_release(iinfo);
+		update_dentry_cache(ci);
+		return true;
 	}
 	return true;
 }
@@ -1641,6 +1663,15 @@ static int cfs_rename(CFS_IDMAP *mnt_userns, struct inode *old_dir,
 	invalidate_iattr_cache(CFS_INODE(new_dir));
 	if (old_dir != new_dir)
 		invalidate_iattr_cache(CFS_INODE(old_dir));
+	/* 覆盖式 rename:被覆盖的目标 inode 在 metanode 已被 unlink,本地也要 drop
+	 * nlink(降到 0 才能本地回收);否则经幸存硬链接看到过期 nlink/属性(对齐
+	 * cfs_unlink 的处理)(T6)。 */
+	if (ret == 0 && new_dentry->d_inode) {
+		if (new_dentry->d_inode->i_nlink > 0)
+			drop_nlink(new_dentry->d_inode);
+		else
+			invalidate_iattr_cache(CFS_INODE(new_dentry->d_inode));
+	}
 
 out:
 	cfs_log_audit(cmi->log, "Rename", old_dentry, new_dentry, ret,
@@ -1684,9 +1715,27 @@ static int cfs_unlink(struct inode *dir, struct dentry *dentry)
 static const char *cfs_get_link(struct dentry *dentry, struct inode *inode,
 				struct delayed_call *done)
 {
-	const char *target = CFS_INODE(inode)->link_target;
+	struct cfs_inode *ci = CFS_INODE(inode);
+	char *copy;
 
-	return target ? target : ERR_PTR(-ENOENT);
+	/* RCU-walk(dentry==NULL):不能持锁/分配,回退 ref-walk。 */
+	if (!dentry)
+		return ERR_PTR(-ECHILD);
+	/* 必须返回稳定副本:link_target 会被并发 cfs_inode_refresh_unlock
+	 * (getattr/readdir 批量刷新,持 i_lock)kfree+重赋 → 直接返回裸指针,
+	 * readlink_copy 读时可能已释放 → UAF(T4)。锁内 kstrdup(GFP_ATOMIC,
+	 * 不睡眠),经 delayed_call 在用完后 kfree。 */
+	spin_lock(&inode->i_lock);
+	if (!ci->link_target) {
+		spin_unlock(&inode->i_lock);
+		return ERR_PTR(-ENOENT);
+	}
+	copy = kstrdup(ci->link_target, GFP_ATOMIC);
+	spin_unlock(&inode->i_lock);
+	if (!copy)
+		return ERR_PTR(-ENOMEM);
+	set_delayed_call(done, kfree_link, copy);
+	return copy;
 }
 #else
 static void *cfs_follow_link(struct dentry *dentry, struct nameidata *nd)
@@ -1979,6 +2028,26 @@ const struct inode_operations cfs_file_iops = {
 	.listxattr = cfs_listxattr,
 };
 
+/* 目录 llseek:保留 generic_file_llseek 的 pos 语义(NFS re-export 的 seekdir/
+ * telldir 依赖),但目录遍历游标(cfi->marker/done/denties)独立于 ctx->pos,
+ * generic 只动 pos 不复位 cfi → rewinddir/seekdir(0) 后 done 仍为真 → 二次遍历
+ * 得空目录(T2)。seek 到起点(结果 pos==0)时复位 cfi,使下次 iterate 从头拉。 */
+static loff_t cfs_dir_llseek(struct file *file, loff_t offset, int whence)
+{
+	struct cfs_file_info *cfi = file->private_data;
+	loff_t ret;
+
+	ret = generic_file_llseek(file, offset, whence);
+	if (cfi && ret == 0) {
+		if (cfi->marker)
+			cfi->marker[0] = '\0'; /* 复位为空串(不重分配,免 OOM) */
+		cfs_packet_dentry_array_clear(&cfi->denties);
+		cfi->denties_offset = 0;
+		cfi->done = false;
+	}
+	return ret;
+}
+
 const struct file_operations cfs_dir_fops = {
 	.open = cfs_open,
 	.release = cfs_release,
@@ -1992,8 +2061,9 @@ const struct file_operations cfs_dir_fops = {
 #endif
 	/* NFS re-export:ganesha/nfsd readdir 用 seekdir 在目录 fd 上 lseek 定位 cookie,
 	 * llseek=NULL 返回 ESPIPE 致 readdir 失败(Remote I/O error)。generic_file_llseek
-	 * 让目录 fd 支持 seek(seekdir(0) rewind + telldir),修复 NFS 下 ls/readdir。 */
-	.llseek = generic_file_llseek,
+	 * 让目录 fd 支持 seek(seekdir(0) rewind + telldir),修复 NFS 下 ls/readdir。
+	 * 用 cfs_dir_llseek 包装:seek 到起点时同时复位 cfi 遍历游标(T2)。 */
+	.llseek = cfs_dir_llseek,
 	.fsync = noop_fsync,
 };
 
