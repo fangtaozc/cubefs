@@ -36,6 +36,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/stream"
@@ -386,7 +387,6 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	leaseExpire := parseUintForm(r, "leaseExpire", 0)
 	delayDelMinute := parseUintForm(r, "delayDelMinute", 0)
 
 	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
@@ -397,8 +397,22 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 	defer metaWrapper.Close()
 	defer extentClient.Close()
 
-	before, _ := metaWrapper.InodeGet_ll(ino)
-	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, leaseExpire, delayDelMinute, path); err != nil {
+	before, gerr := metaWrapper.InodeGet_ll(ino)
+	if gerr != nil || before == nil {
+		http.Error(w, fmt.Sprintf("InodeGet_ll err: %v", gerr), http.StatusInternalServerError)
+		return
+	}
+	// Migration is forbidden while the write-migration lease is still valid (a file
+	// written within ForbiddenMigrationRenewalSeonds=3600s carries a lease). Refuse
+	// early with a clear message rather than a raw metanode 500, and pass the inode's
+	// current lease generation so the metanode generation check matches.
+	now := uint64(time.Now().Unix())
+	if before.LeaseExpireTime >= now {
+		http.Error(w, fmt.Sprintf("migration lease not expired: inode(%v) leaseExpireTime(%v) >= now(%v); file written recently, retry after ~%vs",
+			ino, before.LeaseExpireTime, now, before.LeaseExpireTime-now), http.StatusConflict)
+		return
+	}
+	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path); err != nil {
 		http.Error(w, fmt.Sprintf("UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
 		return
 	}
