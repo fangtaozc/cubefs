@@ -246,11 +246,29 @@ func (l *LcNode) buildVolClients(vol string, vsc uint32, asc []uint32) (*meta.Me
 }
 
 // httpServiceOssAccelRecall handles GET /ossAccelRecall?vol=&ino=&size=&sc=&vsc=&asc=&path=&checksum=
-// M1 recall data leaf (isolated): pull the object bytes from external S3 and write
-// them into the target inode's extents, verifying the whole-file sha256 against the
-// expected checksum. This is the materialize-from-S3 half of recall-to-resident; it
-// does NOT yet flip StorageClass or drive the client read path (later slices). For
-// safe isolated testing, recall into a fresh (empty) inode.
+// Pulls the object bytes from external S3 and materializes them on the target
+// inode, verifying the whole-file sha256 against the expected checksum, then
+// (when the inode is currently cold) flips StorageClass back to the replica
+// tier so the file is transparently readable again.
+//
+// Write path depends on the inode's CURRENT StorageClass (read via InodeGet_ll,
+// not trusted from the request):
+//   - Already a replica (e.g. a fresh empty inode used for isolated recall
+//     testing): plain write (isMigration=false) — AppendExtents works normally.
+//   - Still BlobStore (the real recall-to-resident case): AppendExtents no-ops
+//     for BlobStore-class inodes (metanode/inode.go), so bytes MUST go through
+//     the migration-write path (isMigration=true — recorded into
+//     HybridCloudExtentsMigration, not HybridCloudExtents) and only become
+//     visible once UpdateExtentKeyAfterMigration atomically swaps them in and
+//     flips StorageClass back.
+//
+// Pre-check (BlobStore case only): HybridCloudExtentsMigration is the SAME slot
+// used by commit-cold to stage the old replica extents for delayed release. If
+// that release hasn't completed yet (info.HasMigrationEk), a migration-write now
+// would append alongside the still-present old extents rather than replacing
+// them — a real data-corruption risk. So recall refuses early (425) rather than
+// racing the delayed-release window; callers (the client cold-read gate) are
+// expected to surface a clear retryable error, not spin internally.
 func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if err = r.ParseForm(); err != nil {
@@ -273,7 +291,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		http.Error(w, fmt.Sprintf("ParseUint size err: %v", err), http.StatusBadRequest)
 		return
 	}
-	sc, vsc, asc, err := parseStorageClassForm(r)
+	_, vsc, asc, err := parseStorageClassForm(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -300,6 +318,28 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	defer metaWrapper.Close()
 	defer extentClient.Close()
 
+	before, gerr := metaWrapper.InodeGet_ll(ino)
+	if gerr != nil || before == nil {
+		http.Error(w, fmt.Sprintf("InodeGet_ll err: %v", gerr), http.StatusInternalServerError)
+		return
+	}
+	isCold := before.StorageClass == proto.StorageClass_BlobStore
+	if isCold && before.HasMigrationEk {
+		http.Error(w, fmt.Sprintf(
+			"not yet safe to recall: inode(%v) still has a pending delayed-release migration slot (from a prior tier-out); retry once background cleanup finishes",
+			ino), http.StatusTooEarly)
+		return
+	}
+	// writeStorageClass/isMigration: BlobStore case writes into the migration slot
+	// (target = vsc, the volume's replica class) and gets swapped in atomically by
+	// the commit call below. Already-replica case writes in place as usual.
+	writeStorageClass := before.StorageClass
+	isMigration := false
+	if isCold {
+		writeStorageClass = vsc
+		isMigration = true
+	}
+
 	if err = extentClient.OpenStream(ino, false, false, ""); err != nil {
 		http.Error(w, fmt.Sprintf("OpenStream err: %v", err), http.StatusBadRequest)
 		return
@@ -322,7 +362,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	for {
 		n, rerr := body.Read(buf)
 		if n > 0 {
-			wn, werr := extentClient.Write(ino, off, buf[:n], 0, nil, sc, false, false)
+			wn, werr := extentClient.Write(ino, off, buf[:n], 0, nil, writeStorageClass, isMigration, false)
 			if werr != nil {
 				http.Error(w, fmt.Sprintf("extent write err at off(%v): %v", off, werr), http.StatusInternalServerError)
 				return
@@ -349,9 +389,19 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v)",
-		vol, ino, off, s3key, got)
-	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v\n", vol, ino, off, s3key, got)
+	if isCold {
+		// Atomically swap the migration-write bytes into HybridCloudExtents and
+		// flip StorageClass back to the replica tier. No grace period needed —
+		// the swapped-out slot holds the (empty) BlobStore ObjExtents, not real data.
+		if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, false); err != nil {
+			http.Error(w, fmt.Sprintf("commit-hot UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
+		vol, ino, off, s3key, got, isCold)
+	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v wasCold=%v\n", vol, ino, off, s3key, got, isCold)
 }
 
 // httpServiceOssAccelCommitCold handles GET /ossAccelCommitCold?vol=&ino=&sc=&vsc=&asc=&path=&delayDelMinute=&leaseExpire=
