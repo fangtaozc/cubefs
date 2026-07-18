@@ -28,6 +28,8 @@ package lcnode
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -136,42 +138,12 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	}
 	defer s3Backend.Close()
 
-	// Meta + extent client for the volume, mirroring httpServiceGetFile.
-	metaConfig := &meta.MetaConfig{
-		Volume:               vol,
-		Masters:              l.masters,
-		Authenticate:         false,
-		ValidateOwner:        false,
-		InnerReq:             true,
-		MetaSendTimeout:      600,
-		DisableTrashByClient: true,
-	}
-	metaWrapper, err := meta.NewMetaWrapper(metaConfig)
+	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("NewMetaWrapper err: %v", err), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer metaWrapper.Close()
-
-	extentConfig := &stream.ExtentConfig{
-		Volume:                      vol,
-		Masters:                     l.masters,
-		OnAppendExtentKey:           metaWrapper.AppendExtentKey,
-		OnSplitExtentKey:            metaWrapper.SplitExtentKey,
-		OnGetExtents:                metaWrapper.GetExtents,
-		OnTruncate:                  metaWrapper.Truncate,
-		OnRenewalForbiddenMigration: metaWrapper.RenewalForbiddenMigration,
-		VolStorageClass:             vsc,
-		VolAllowedStorageClass:      asc,
-		OnForbiddenMigration:        metaWrapper.ForbiddenMigration,
-		InnerReq:                    true,
-		MetaWrapper:                 metaWrapper,
-	}
-	extentClient, err := stream.NewExtentClient(extentConfig)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("NewExtentClient err: %v", err), http.StatusBadRequest)
-		return
-	}
 	defer extentClient.Close()
 
 	if err = extentClient.OpenStream(ino, false, false, ""); err != nil {
@@ -233,6 +205,152 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	log.LogInfof("ossAccelFlush success: vol(%v) ino(%v) size(%v) s3key(%v) checksum(%v)",
 		vol, ino, size, s3key, checksum)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v size=%v s3key=%v checksum=%v\n", vol, ino, size, s3key, checksum)
+}
+
+// buildVolClients constructs a meta + extent client pair for a volume, shared by
+// the mover flush / recall endpoints (mirrors httpServiceGetFile setup). Callers
+// defer Close() on both returned clients.
+func (l *LcNode) buildVolClients(vol string, vsc uint32, asc []uint32) (*meta.MetaWrapper, *stream.ExtentClient, error) {
+	metaWrapper, err := meta.NewMetaWrapper(&meta.MetaConfig{
+		Volume:               vol,
+		Masters:              l.masters,
+		Authenticate:         false,
+		ValidateOwner:        false,
+		InnerReq:             true,
+		MetaSendTimeout:      600,
+		DisableTrashByClient: true,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("NewMetaWrapper err: %v", err)
+	}
+	extentClient, err := stream.NewExtentClient(&stream.ExtentConfig{
+		Volume:                      vol,
+		Masters:                     l.masters,
+		OnAppendExtentKey:           metaWrapper.AppendExtentKey,
+		OnSplitExtentKey:            metaWrapper.SplitExtentKey,
+		OnGetExtents:                metaWrapper.GetExtents,
+		OnTruncate:                  metaWrapper.Truncate,
+		OnRenewalForbiddenMigration: metaWrapper.RenewalForbiddenMigration,
+		VolStorageClass:             vsc,
+		VolAllowedStorageClass:      asc,
+		OnForbiddenMigration:        metaWrapper.ForbiddenMigration,
+		InnerReq:                    true,
+		MetaWrapper:                 metaWrapper,
+	})
+	if err != nil {
+		metaWrapper.Close()
+		return nil, nil, fmt.Errorf("NewExtentClient err: %v", err)
+	}
+	return metaWrapper, extentClient, nil
+}
+
+// httpServiceOssAccelRecall handles GET /ossAccelRecall?vol=&ino=&size=&sc=&vsc=&asc=&path=&checksum=
+// M1 recall data leaf (isolated): pull the object bytes from external S3 and write
+// them into the target inode's extents, verifying the whole-file sha256 against the
+// expected checksum. This is the materialize-from-S3 half of recall-to-resident; it
+// does NOT yet flip StorageClass or drive the client read path (later slices). For
+// safe isolated testing, recall into a fresh (empty) inode.
+func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Request) {
+	var err error
+	if err = r.ParseForm(); err != nil {
+		http.Error(w, fmt.Sprintf("ParseForm err: %v", err), http.StatusBadRequest)
+		return
+	}
+	vol := r.FormValue("vol")
+	path := r.FormValue("path")
+	if vol == "" || path == "" {
+		http.Error(w, "missing required form value: vol and path", http.StatusBadRequest)
+		return
+	}
+	var ino uint64
+	if ino, err = strconv.ParseUint(r.FormValue("ino"), 10, 64); err != nil {
+		http.Error(w, fmt.Sprintf("ParseUint ino err: %v", err), http.StatusBadRequest)
+		return
+	}
+	var size uint64
+	if size, err = strconv.ParseUint(r.FormValue("size"), 10, 64); err != nil {
+		http.Error(w, fmt.Sprintf("ParseUint size err: %v", err), http.StatusBadRequest)
+		return
+	}
+	sc, vsc, asc, err := parseStorageClassForm(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	wantChecksum := strings.TrimPrefix(r.FormValue("checksum"), proto.ChecksumPrefixSHA256)
+
+	s3Cfg, err := loadOssAccelS3Config()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	s3Backend, err := s3.New(s3Cfg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer s3Backend.Close()
+
+	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer metaWrapper.Close()
+	defer extentClient.Close()
+
+	if err = extentClient.OpenStream(ino, false, false, ""); err != nil {
+		http.Error(w, fmt.Sprintf("OpenStream err: %v", err), http.StatusBadRequest)
+		return
+	}
+	defer extentClient.CloseStream(ino)
+
+	s3key := normalizeOssAccelKey(path)
+	ctx := context.Background()
+	body, getErr := s3Backend.Get(ctx, s3key, 0, int64(size))
+	if getErr != nil {
+		http.Error(w, fmt.Sprintf("s3 get err: %v", getErr), http.StatusInternalServerError)
+		return
+	}
+	defer body.Close()
+
+	// Stream S3 → extents; compute sha256 alongside; verify against expected.
+	h := sha256.New()
+	buf := make([]byte, 4*1024*1024)
+	var off int
+	for {
+		n, rerr := body.Read(buf)
+		if n > 0 {
+			wn, werr := extentClient.Write(ino, off, buf[:n], 0, nil, sc, false, false)
+			if werr != nil {
+				http.Error(w, fmt.Sprintf("extent write err at off(%v): %v", off, werr), http.StatusInternalServerError)
+				return
+			}
+			h.Write(buf[:n])
+			off += wn
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			http.Error(w, fmt.Sprintf("s3 read err: %v", rerr), http.StatusInternalServerError)
+			return
+		}
+	}
+	if err = extentClient.Flush(ino); err != nil {
+		http.Error(w, fmt.Sprintf("extent flush err: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	got := hex.EncodeToString(h.Sum(nil))
+	if wantChecksum != "" && got != wantChecksum {
+		http.Error(w, fmt.Sprintf("checksum mismatch: recalled(sha256:%v) expected(sha256:%v)", got, wantChecksum), http.StatusInternalServerError)
+		return
+	}
+
+	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v)",
+		vol, ino, off, s3key, got)
+	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v\n", vol, ino, off, s3key, got)
 }
 
 // parseStorageClassForm parses sc/vsc/asc form values shared by the mover
