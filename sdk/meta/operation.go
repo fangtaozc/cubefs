@@ -2932,10 +2932,7 @@ func (mw *MetaWrapper) updateExtentKeyAfterMigration(mp *MetaPartition, inode ui
 	packet := proto.NewPacketReqID()
 	packet.Opcode = proto.OpMetaUpdateExtentKeyAfterMigration
 	packet.PartitionID = mp.PartitionID
-	log.LogWarnf("[oss-accel-debug] sdk/meta updateExtentKeyAfterMigration: inode(%v) coldBackendExternal(param)=%v req.ColdBackendExternal=%v",
-		inode, coldBackendExternal, req.ColdBackendExternal)
 	err = packet.MarshalData(req)
-	log.LogWarnf("[oss-accel-debug] sdk/meta updateExtentKeyAfterMigration: marshaled packet.Data=%s", string(packet.Data))
 	if err != nil {
 		err = fmt.Errorf("lcNode marshal request err(%v)", err)
 		log.LogErrorf("updateExtentKeyAfterMigration: ino(%v) %v", inode, err)
