@@ -681,11 +681,28 @@ func (client *ExtentClient) ForceRefreshExtentsCache(inode uint64) error {
 // extents may already be freed and reallocated to unrelated data on the
 // datanode. Callers that know their streamer's extent view was invalidated by
 // something other than a normal write on this same client must use this.
+//
+// It also clears the streamer's isCache flag before asking the server for a
+// fresh extent list. isCache is latched once at Open() time from the inode's
+// StorageClass at that moment; metanode's ExtentsList handler special-cases
+// IsCache==true (or a currently-BlobStore inode) by never populating
+// resp.Extents at all (extents live in the blob backend, not as native
+// ExtentKeys) — see metanode/partition_op_extent.go. A streamer opened while
+// the inode was still BlobStore keeps isCache=true for its whole lifetime, so
+// a caller that flips the inode back to Replica out-of-band (e.g. a
+// cold-read-gate recall) and then force-refreshes with the stale isCache=true
+// still gets an empty extent list back — and because this call is force=true,
+// that empty list unconditionally overwrites the cache, turning every
+// subsequent read on this same streamer into a silent all-zero "hole" read
+// instead of the just-recalled data. The caller here is explicitly asserting
+// the inode is Replica-class now, so isCache=false is the correct value to
+// persist on the streamer going forward, not just for this one call.
 func (client *ExtentClient) ForceRefreshExtentsCacheStrict(inode uint64) error {
 	s := client.GetStreamer(inode)
 	if s == nil {
 		return nil
 	}
+	s.isCache = false
 	return s.GetExtentsForceRefresh()
 }
 
