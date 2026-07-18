@@ -390,17 +390,18 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	// not supported" error), and separately rejects a losing commit with
 	// OpNotPerm once the winner's swap already landed. Either rejection means
 	// the SAME thing: someone else is doing (or already did) this recall for
-	// us. So on ANY error in this block, before reporting a failure, check
-	// whether the inode has already reached the target StorageClass — if so,
-	// the recall's actual goal was already achieved and this is a success,
-	// not an error.
+	// us. But the loser's write can be rejected within the first append
+	// (well under a second) while the winner's own S3-GET-and-write is still
+	// running (multiple seconds for a large file) — a single immediate
+	// recheck right after the loser's error would still see the pre-recall
+	// StorageClass and wrongly conclude this is a real failure. So on ANY
+	// error in this block, poll (bounded) for the winner to finish rather
+	// than checking once.
 	off, got, recallErr := runOssAccelRecallWrite(extentClient, s3Backend, ino, s3key, size, writeStorageClass, isMigration, wantChecksum)
-	if recallErr != nil && isCold {
-		if after, aerr := metaWrapper.InodeGet_ll(ino); aerr == nil && after != nil && after.StorageClass == vsc {
-			log.LogWarnf("ossAccelRecall: lost a concurrent recall race (%v) but ino(%v) is already StorageClass(%v) — treating as success",
-				recallErr, ino, vsc)
-			recallErr = nil
-		}
+	if recallErr != nil && isCold && waitForConcurrentRecallWinner(metaWrapper, ino, vsc) {
+		log.LogWarnf("ossAccelRecall: lost a concurrent recall race (%v) but ino(%v) reached StorageClass(%v) — treating as success",
+			recallErr, ino, vsc)
+		recallErr = nil
 	}
 	if recallErr != nil {
 		http.Error(w, recallErr.Error(), http.StatusInternalServerError)
@@ -412,9 +413,8 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		// flip StorageClass back to the replica tier. No grace period needed —
 		// the swapped-out slot holds the (empty) BlobStore ObjExtents, not real data.
 		if cerr := metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true); cerr != nil {
-			after, aerr := metaWrapper.InodeGet_ll(ino)
-			if aerr == nil && after != nil && after.StorageClass == vsc {
-				log.LogWarnf("ossAccelRecall: commit lost a concurrent recall race (commit err: %v) but ino(%v) is already StorageClass(%v) — treating as success",
+			if waitForConcurrentRecallWinner(metaWrapper, ino, vsc) {
+				log.LogWarnf("ossAccelRecall: commit lost a concurrent recall race (commit err: %v) but ino(%v) reached StorageClass(%v) — treating as success",
 					cerr, ino, vsc)
 			} else {
 				http.Error(w, fmt.Sprintf("commit-hot UpdateExtentKeyAfterMigration err: %v", cerr), http.StatusInternalServerError)
@@ -426,6 +426,30 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
 		vol, ino, off, s3key, got, isCold)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v wasCold=%v\n", vol, ino, off, s3key, got, isCold)
+}
+
+// concurrentRecallWaitBound is how long a losing recall waits for a concurrent
+// winner to finish its own S3-GET-and-write before giving up and reporting a
+// real failure. Generous relative to observed recall latency (single-digit
+// seconds even for tens-of-MB files over a slow S3 path) without approaching
+// HTTP client/proxy timeouts.
+const concurrentRecallWaitBound = 60 * time.Second
+
+// waitForConcurrentRecallWinner polls the inode until it reaches storageClass
+// vsc (a concurrent recall winner's commit landed) or concurrentRecallWaitBound
+// elapses. No new coordination primitive — just repeated InodeGet_ll calls,
+// deliberately not a lock/singleflight (see design doc).
+func waitForConcurrentRecallWinner(metaWrapper *meta.MetaWrapper, ino uint64, vsc uint32) bool {
+	deadline := time.Now().Add(concurrentRecallWaitBound)
+	for {
+		if after, err := metaWrapper.InodeGet_ll(ino); err == nil && after != nil && after.StorageClass == vsc {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 // runOssAccelRecallWrite streams the S3 object into the inode's extents (S3 GET →
