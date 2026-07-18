@@ -64,21 +64,21 @@ int cfs_oss_accel_recall_via_helper(const char *mover_addr, const char *vol,
 	argv[10] = NULL;
 
 	/* UMH_WAIT_PROC blocks this (process-context, sleepable) thread until
-	 * the helper exits. status follows the standard wait() encoding —
-	 * WIFEXITED/WEXITSTATUS, same as userspace wait(2). A negative
-	 * return means the fork/exec itself failed (helper missing, bad
-	 * permissions) before any exit code exists. */
+	 * the helper exits. status encodes the same wait()-status word a
+	 * userspace wait(2) would see, but WIFEXITED/WEXITSTATUS are libc
+	 * macros, not available in kernel space — extract the exit code
+	 * manually (status>>8 & 0xff is exactly what WEXITSTATUS expands to).
+	 * A negative return means the fork/exec itself failed (helper
+	 * missing, bad permissions) before any exit code exists; bit 0x7f of
+	 * a non-negative status set means the child died from a signal
+	 * rather than exiting normally — treat both as a hard failure. */
 	status = call_usermodehelper(oss_accel_helper_path, argv, envp,
 				     UMH_WAIT_PROC);
-	if (status < 0) {
+	if (status < 0 || (status & 0x7f) != 0) {
 		ret = -EIO;
 		goto out_free;
 	}
-	if (!WIFEXITED(status)) {
-		ret = -EIO;
-		goto out_free;
-	}
-	switch (WEXITSTATUS(status)) {
+	switch ((status >> 8) & 0xff) {
 	case HELPER_EXIT_SUCCESS:
 		ret = 0;
 		break;
