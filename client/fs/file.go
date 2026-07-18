@@ -441,7 +441,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		if gateErr, recalled := f.super.ossAccelColdReadGate(f.info.Inode); gateErr != nil {
 			msg := fmt.Sprintf("Read: oss-accel cold read gate ino(%v) err(%v)", f.info.Inode, gateErr)
 			f.super.handleError("Read", msg)
-			return gateErr
+			return ParseError(gateErr)
 		} else if recalled {
 			// StorageClass flipped back to replica; refresh the cached inode info
 			// (bypassing the cache the gate just invalidated) before re-deciding
