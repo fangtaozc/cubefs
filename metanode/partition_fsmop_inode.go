@@ -1034,20 +1034,11 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 		return
 	}
 
-	// for empty file, HybridCloudExtents.sortedEks is nil and StorageClass_Unspecified
-	// but HybridCloudExtentsMigration.sortedEks for inoParam is always not nil
-	if i.EmptyHybridExtents() && i.StorageClass != proto.StorageClass_Unspecified && !inoParam.HybridCloudExtentsMigration.Empty() {
-		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) extent key is empty, but extent key "+
-			"for migration storageClass(%v) is not empty",
-			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
-		resp.Status = proto.OpNotPerm
-		return
-	}
-
-	// oss-accel bypasses two invariants below that otherwise assume "empty extents
-	// == lost data". Two distinct directions, each gated on allowEmptyColdTarget
-	// (only set via the ColdBackendExternal-flagged opcode; the native migration
-	// path, allowEmptyColdTarget=false, is byte-for-byte unchanged):
+	// oss-accel bypasses three invariants below that otherwise assume "empty
+	// extents == lost data". Two distinct directions, each gated on
+	// allowEmptyColdTarget (only set via the ColdBackendExternal-flagged opcode;
+	// the native migration path, allowEmptyColdTarget=false, is byte-for-byte
+	// unchanged):
 	//   - coldExternalToCold: migrating INTO BlobStore (tier-out/commit-cold) — the
 	//     target's bytes are referenced by an external object store via xattr, so
 	//     empty target ObjExtents is the expected, correct representation.
@@ -1058,6 +1049,19 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 	//     prior migration-write recall staged there, awaiting this swap.
 	coldExternalToCold := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
 	coldExternalFromCold := allowEmptyColdTarget && proto.IsStorageClassBlobStore(i.StorageClass)
+
+	// for empty file, HybridCloudExtents.sortedEks is nil and StorageClass_Unspecified
+	// but HybridCloudExtentsMigration.sortedEks for inoParam is always not nil.
+	// coldExternalFromCold hits this same shape (i is BlobStore => EmptyHybridExtents
+	// == true by design, and the migration slot legitimately holds a pending
+	// migration-write recall's bytes) — same bypass as below.
+	if !coldExternalFromCold && i.EmptyHybridExtents() && i.StorageClass != proto.StorageClass_Unspecified && !inoParam.HybridCloudExtentsMigration.Empty() {
+		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) extent key is empty, but extent key "+
+			"for migration storageClass(%v) is not empty",
+			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
+		resp.Status = proto.OpNotPerm
+		return
+	}
 
 	if !i.EmptyHybridExtents() && inoParam.HybridCloudExtentsMigration.Empty() {
 		if !coldExternalToCold {
