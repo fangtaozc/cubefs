@@ -426,9 +426,25 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		// Atomically swap the migration-write bytes into HybridCloudExtents and
 		// flip StorageClass back to the replica tier. No grace period needed —
 		// the swapped-out slot holds the (empty) BlobStore ObjExtents, not real data.
-		if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true); err != nil {
-			http.Error(w, fmt.Sprintf("commit-hot UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
-			return
+		if cerr := metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true); cerr != nil {
+			// Unguarded concurrent recall: two callers can both see the same
+			// BlobStore inode, both do the migration-write dance, and both race
+			// to commit. Only one commit RPC actually lands — metanode's raft
+			// apply order picks a winner, and the loser's commit is rejected
+			// (OpNotPerm: "storageClass is same with req, may be migrated
+			// before", or an invariant-3 self-consistency rejection if the
+			// loser's pre-check ran before the winner's swap). That specific
+			// outcome isn't a real failure: the recall's actual goal — this
+			// inode is now readable as vsc — was already achieved by whoever
+			// won. Re-check before deciding this is an error.
+			after, aerr := metaWrapper.InodeGet_ll(ino)
+			if aerr == nil && after != nil && after.StorageClass == vsc {
+				log.LogWarnf("ossAccelRecall: commit lost a concurrent recall race (commit err: %v) but ino(%v) is already StorageClass(%v) — treating as success",
+					cerr, ino, vsc)
+			} else {
+				http.Error(w, fmt.Sprintf("commit-hot UpdateExtentKeyAfterMigration err: %v", cerr), http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 
