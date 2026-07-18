@@ -380,45 +380,30 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	defer extentClient.CloseStream(ino)
 
 	s3key := normalizeOssAccelKey(path)
-	ctx := context.Background()
-	body, getErr := s3Backend.Get(ctx, s3key, 0, int64(size))
-	if getErr != nil {
-		http.Error(w, fmt.Sprintf("s3 get err: %v", getErr), http.StatusInternalServerError)
-		return
-	}
-	defer body.Close()
 
-	// Stream S3 → extents; compute sha256 alongside; verify against expected.
-	h := sha256.New()
-	buf := make([]byte, 4*1024*1024)
-	var off int
-	for {
-		n, rerr := body.Read(buf)
-		if n > 0 {
-			wn, werr := extentClient.Write(ino, off, buf[:n], 0, nil, writeStorageClass, isMigration, false)
-			if werr != nil {
-				http.Error(w, fmt.Sprintf("extent write err at off(%v): %v", off, werr), http.StatusInternalServerError)
-				return
-			}
-			h.Write(buf[:n])
-			off += wn
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			http.Error(w, fmt.Sprintf("s3 read err: %v", rerr), http.StatusInternalServerError)
-			return
+	// The whole recall (S3 GET, migration-write, checksum verify, commit) is
+	// unguarded against a concurrent caller doing the exact same thing for the
+	// same inode — no distributed lock, by design (see design doc). Two
+	// callers racing this way isn't rare data corruption: metanode explicitly
+	// detects a conflicting concurrent extent append and rejects the loser's
+	// write with StatusConflictExtents (surfaces here as a plain "operation
+	// not supported" error), and separately rejects a losing commit with
+	// OpNotPerm once the winner's swap already landed. Either rejection means
+	// the SAME thing: someone else is doing (or already did) this recall for
+	// us. So on ANY error in this block, before reporting a failure, check
+	// whether the inode has already reached the target StorageClass — if so,
+	// the recall's actual goal was already achieved and this is a success,
+	// not an error.
+	off, got, recallErr := runOssAccelRecallWrite(extentClient, s3Backend, ino, s3key, size, writeStorageClass, isMigration, wantChecksum)
+	if recallErr != nil && isCold {
+		if after, aerr := metaWrapper.InodeGet_ll(ino); aerr == nil && after != nil && after.StorageClass == vsc {
+			log.LogWarnf("ossAccelRecall: lost a concurrent recall race (%v) but ino(%v) is already StorageClass(%v) — treating as success",
+				recallErr, ino, vsc)
+			recallErr = nil
 		}
 	}
-	if err = extentClient.Flush(ino); err != nil {
-		http.Error(w, fmt.Sprintf("extent flush err: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	got := hex.EncodeToString(h.Sum(nil))
-	if wantChecksum != "" && got != wantChecksum {
-		http.Error(w, fmt.Sprintf("checksum mismatch: recalled(sha256:%v) expected(sha256:%v)", got, wantChecksum), http.StatusInternalServerError)
+	if recallErr != nil {
+		http.Error(w, recallErr.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -427,16 +412,6 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		// flip StorageClass back to the replica tier. No grace period needed —
 		// the swapped-out slot holds the (empty) BlobStore ObjExtents, not real data.
 		if cerr := metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true); cerr != nil {
-			// Unguarded concurrent recall: two callers can both see the same
-			// BlobStore inode, both do the migration-write dance, and both race
-			// to commit. Only one commit RPC actually lands — metanode's raft
-			// apply order picks a winner, and the loser's commit is rejected
-			// (OpNotPerm: "storageClass is same with req, may be migrated
-			// before", or an invariant-3 self-consistency rejection if the
-			// loser's pre-check ran before the winner's swap). That specific
-			// outcome isn't a real failure: the recall's actual goal — this
-			// inode is now readable as vsc — was already achieved by whoever
-			// won. Re-check before deciding this is an error.
 			after, aerr := metaWrapper.InodeGet_ll(ino)
 			if aerr == nil && after != nil && after.StorageClass == vsc {
 				log.LogWarnf("ossAccelRecall: commit lost a concurrent recall race (commit err: %v) but ino(%v) is already StorageClass(%v) — treating as success",
@@ -451,6 +426,49 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
 		vol, ino, off, s3key, got, isCold)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v wasCold=%v\n", vol, ino, off, s3key, got, isCold)
+}
+
+// runOssAccelRecallWrite streams the S3 object into the inode's extents (S3 GET →
+// ExtentClient.Write, migration-write when isCold), verifying the whole-file sha256
+// against wantChecksum along the way. Returns the bytes written and the computed
+// checksum even on error (best-effort, for logging) — callers decide whether an
+// error here is real or just "lost a concurrent recall race" (see call site).
+func runOssAccelRecallWrite(extentClient *stream.ExtentClient, s3Backend backend.Backend, ino uint64, s3key string, size uint64, writeStorageClass uint32, isMigration bool, wantChecksum string) (off int, checksum string, err error) {
+	ctx := context.Background()
+	body, getErr := s3Backend.Get(ctx, s3key, 0, int64(size))
+	if getErr != nil {
+		return 0, "", fmt.Errorf("s3 get err: %v", getErr)
+	}
+	defer body.Close()
+
+	h := sha256.New()
+	buf := make([]byte, 4*1024*1024)
+	for {
+		n, rerr := body.Read(buf)
+		if n > 0 {
+			wn, werr := extentClient.Write(ino, off, buf[:n], 0, nil, writeStorageClass, isMigration, false)
+			if werr != nil {
+				return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("extent write err at off(%v): %v", off, werr)
+			}
+			h.Write(buf[:n])
+			off += wn
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("s3 read err: %v", rerr)
+		}
+	}
+	if ferr := extentClient.Flush(ino); ferr != nil {
+		return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("extent flush err: %v", ferr)
+	}
+
+	checksum = hex.EncodeToString(h.Sum(nil))
+	if wantChecksum != "" && checksum != wantChecksum {
+		return off, checksum, fmt.Errorf("checksum mismatch: recalled(sha256:%v) expected(sha256:%v)", checksum, wantChecksum)
+	}
+	return off, checksum, nil
 }
 
 // httpServiceOssAccelCommitCold handles GET /ossAccelCommitCold?vol=&ino=&sc=&vsc=&asc=&path=&delayDelMinute=&leaseExpire=
