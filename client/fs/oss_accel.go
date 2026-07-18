@@ -93,6 +93,19 @@ func (s *Super) ossAccelColdReadGate(ino uint64) (err error, recalled bool) {
 	case http.StatusOK:
 		log.LogInfof("ossAccelColdReadGate: recall success ino(%v) s3key(%v) resp(%v)", ino, s3key, string(body))
 		s.ic.Delete(ino) // force the caller to re-fetch StorageClass on next InodeGet
+		// The recall committed a brand-new set of extents server-side (the old
+		// replica extents were released back at the cold-flip and may already be
+		// reclaimed/reallocated). If this client process ever read this inode
+		// while it was still hot, its Streamer has a cached extent-location view
+		// of the OLD extents. RefreshExtentsCache's generation check would treat
+		// a same-or-lower server generation as "nothing changed" and skip the
+		// update, silently leaving stale (and by now possibly reused) extent
+		// locations in place — a subsequent read would return garbage/unrelated
+		// bytes rather than the just-recalled data. Force an unconditional
+		// replace instead of relying on generation comparison.
+		if rerr := s.ec.ForceRefreshExtentsCacheStrict(ino); rerr != nil {
+			log.LogWarnf("ossAccelColdReadGate: ForceRefreshExtentsCacheStrict ino(%v) err(%v)", ino, rerr)
+		}
 		return nil, true
 	case http.StatusTooEarly:
 		log.LogWarnf("ossAccelColdReadGate: recall not yet safe ino(%v) s3key(%v): %v", ino, s3key, string(body))

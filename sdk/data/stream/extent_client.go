@@ -671,6 +671,24 @@ func (client *ExtentClient) ForceRefreshExtentsCache(inode uint64) error {
 	return s.GetExtentsForce()
 }
 
+// ForceRefreshExtentsCacheStrict unconditionally replaces the streamer's cached
+// extent list, bypassing the generation-based staleness check that
+// RefreshExtentsCache/ForceRefreshExtentsCache still apply at the cache-merge
+// step (ExtentCache.update skips the update whenever cache.gen >= the server's
+// returned gen). That check assumes generation only moves forward for the same
+// logical extent identity; it does not hold across an out-of-band extent-identity
+// swap (e.g. an oss-accel cold<->hot migration commit), where the old cached
+// extents may already be freed and reallocated to unrelated data on the
+// datanode. Callers that know their streamer's extent view was invalidated by
+// something other than a normal write on this same client must use this.
+func (client *ExtentClient) ForceRefreshExtentsCacheStrict(inode uint64) error {
+	s := client.GetStreamer(inode)
+	if s == nil {
+		return nil
+	}
+	return s.GetExtentsForceRefresh()
+}
+
 // GetExtentCacheGen return extent generation
 func (client *ExtentClient) GetExtentCacheGen(inode uint64) uint64 {
 	s := client.GetStreamer(inode)
