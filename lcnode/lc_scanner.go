@@ -457,7 +457,7 @@ func (s *LcScanner) handleFile(dentry *proto.ScanDentry) {
 			log.LogErrorf("migrate err: %v, dentry: %+v", err, dentry)
 			return
 		}
-		err = s.mw.UpdateExtentKeyAfterMigration(dentry.Inode, proto.OpTypeToStorageType(op), nil, dentry.LeaseExpire, delayDelMinute, dentry.Path)
+		err = s.mw.UpdateExtentKeyAfterMigration(dentry.Inode, proto.OpTypeToStorageType(op), nil, dentry.LeaseExpire, delayDelMinute, dentry.Path, false)
 		if err != nil {
 			if isSkipErr(err) {
 				err = fmt.Errorf("skip (%v)", err)
@@ -493,7 +493,7 @@ func (s *LcScanner) handleFile(dentry *proto.ScanDentry) {
 			log.LogErrorf("migrate blobstore err: %v, dentry: %+v", err, dentry)
 			return
 		}
-		err = s.mw.UpdateExtentKeyAfterMigration(dentry.Inode, proto.OpTypeToStorageType(op), oek, dentry.LeaseExpire, delayDelMinute, dentry.Path)
+		err = s.mw.UpdateExtentKeyAfterMigration(dentry.Inode, proto.OpTypeToStorageType(op), oek, dentry.LeaseExpire, delayDelMinute, dentry.Path, false)
 		if err != nil {
 			if isSkipErr(err) {
 				err = fmt.Errorf("skip (%v)", err)

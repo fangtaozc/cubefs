@@ -997,6 +997,20 @@ func (mp *metaPartition) fsmRenewalInodeForbiddenMigration(ino *Inode) (resp *In
 }
 
 func (mp *metaPartition) fsmUpdateExtentKeyAfterMigration(inoParam *Inode) (resp *InodeResponse) {
+	return mp.fsmUpdateExtentKeyAfterMigrationImpl(inoParam, false)
+}
+
+// fsmUpdateExtentKeyAfterMigrationColdExternal is the oss-accel variant: the
+// migration target's real bytes live in an external object store (referenced by
+// xattr, outside CubeFS), so an intentionally-empty NewObjExtentKeys for a
+// non-empty source file is expected, not a data-loss bug. Everything else
+// (lease check, self-consistency checks, extent swap, delayed release) is
+// identical to the native path.
+func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationColdExternal(inoParam *Inode) (resp *InodeResponse) {
+	return mp.fsmUpdateExtentKeyAfterMigrationImpl(inoParam, true)
+}
+
+func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, allowEmptyColdTarget bool) (resp *InodeResponse) {
 	resp = NewInodeResponse()
 	resp.Status = proto.OpOk
 	item := mp.inodeTree.CopyGet(inoParam)
@@ -1031,11 +1045,17 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigration(inoParam *Inode) (resp
 	}
 
 	if !i.EmptyHybridExtents() && inoParam.HybridCloudExtentsMigration.Empty() {
-		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
-			"storageClass(%v) is empty ",
-			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
-		resp.Status = proto.OpNotPerm
-		return
+		coldExternal := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
+		if !coldExternal {
+			log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
+				"storageClass(%v) is empty ",
+				mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
+			resp.Status = proto.OpNotPerm
+			return
+		}
+		log.LogInfof("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v)->BlobStore: allowing empty "+
+			"target extents (oss-accel external cold backend, data referenced by xattr outside CubeFS)",
+			mp.config.PartitionId, i.Inode, i.StorageClass)
 	}
 
 	if (!i.EmptyHybridExtents() && i.HybridCloudExtentsMigration.Empty()) || (i.EmptyHybridExtents() && !i.HybridCloudExtentsMigration.Empty()) {

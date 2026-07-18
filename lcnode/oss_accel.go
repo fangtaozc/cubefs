@@ -412,7 +412,7 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 			ino, before.LeaseExpireTime, now, before.LeaseExpireTime-now), http.StatusConflict)
 		return
 	}
-	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path); err != nil {
+	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path, true); err != nil {
 		http.Error(w, fmt.Sprintf("UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
 		return
 	}

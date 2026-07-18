@@ -1117,6 +1117,13 @@ type UpdateExtentKeyAfterMigrationRequest struct {
 	NewObjExtentKeys  []ObjExtentKey `json:"newObjExtentKeys"`
 	LeaseExpire       uint64         `json:"leaseExpireTime"`
 	DelayDeleteMinute uint64         `json:"delayDeleteMinute"`
+	// ColdBackendExternal marks the target StorageClass_BlobStore data as referenced
+	// by an external object store (oss-accel), not by native ObjExtentKeys. When true
+	// (and StorageClass is BlobStore), metanode permits NewObjExtentKeys to be
+	// intentionally empty for a non-empty source file, bypassing the data-loss
+	// invariant that otherwise guards blobstore-native migrations. Additive field;
+	// defaults false, zero behavior change for existing callers.
+	ColdBackendExternal bool `json:"coldBackendExternal,omitempty"`
 	RequestExtend
 }
 

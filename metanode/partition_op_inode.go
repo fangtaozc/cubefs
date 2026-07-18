@@ -1207,7 +1207,11 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 		return
 	}
 
-	fsmResp, submitErr := mp.submit(opFSMUpdateExtentKeyAfterMigration, val)
+	opcode := opFSMUpdateExtentKeyAfterMigration
+	if req.ColdBackendExternal && req.StorageClass == proto.StorageClass_BlobStore {
+		opcode = opFSMUpdateExtentKeyAfterMigrationColdExternal
+	}
+	fsmResp, submitErr := mp.submit(opcode, val)
 	if submitErr != nil {
 		if submitErr == raft.ErrNotLeader {
 			err = fmt.Errorf("mp(%v) inode(%v), not leader when submit raft", mp.config.PartitionId, inoParm.Inode)

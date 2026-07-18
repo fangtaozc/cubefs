@@ -209,6 +209,12 @@ const (
 
 	// freeze meta partition
 	opFSMSetFreeze = 92
+
+	// oss-accel: cold data referenced by an external object store, not native
+	// ObjExtentKeys. Same wire encoding (Inode marshal) as
+	// opFSMUpdateExtentKeyAfterMigration; routes to a variant FSM handler that
+	// permits intentionally-empty target extents for a non-empty source file.
+	opFSMUpdateExtentKeyAfterMigrationColdExternal = 93
 )
 
 // new inode opCode
