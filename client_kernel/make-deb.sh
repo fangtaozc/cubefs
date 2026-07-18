@@ -29,6 +29,12 @@ echo "==> 构建 cubefs-client-exporter"
     -o "$HERE/cubefs-client-exporter" ./cmd/cubefs-client-exporter )
 [ -f "$HERE/cubefs-client-exporter" ] || { echo "exporter 编译失败"; exit 1; }
 
+# 1c. 构建 oss-accel 冷读召回 helper(内核态冷读门通过 call_usermodehelper 调用)
+echo "==> 构建 cfs-oss-accel-helper"
+( cd "$ROOT" && GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath -ldflags='-s -w' \
+    -o "$HERE/cfs-oss-accel-helper" ./cmd/cfs-oss-accel-helper )
+[ -f "$HERE/cfs-oss-accel-helper" ] || { echo "cfs-oss-accel-helper 编译失败"; exit 1; }
+
 # 2. 组装包目录
 P=$(mktemp -d)/cubefs-kmod
 mkdir -p "$P/DEBIAN" \
@@ -40,6 +46,7 @@ cp "$HERE/cubefs.ko"                           "$P/lib/modules/$KVER/extra/"
 cp "$SERVICES/cubefs-mount@.service"           "$P/lib/systemd/system/"
 cp "$SERVICES/cubefs-client-exporter.service"  "$P/lib/systemd/system/"
 cp "$HERE/cubefs-client-exporter"              "$P/usr/local/bin/"
+cp "$HERE/cfs-oss-accel-helper"                "$P/usr/local/bin/"
 cp "$SERVICES/cubefs.conf.example"             "$P/etc/cubefs/"
 cp "$SERVICES/cubefs-exporter.conf.example"    "$P/etc/cubefs/"
 

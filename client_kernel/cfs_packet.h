@@ -284,7 +284,11 @@ struct cfs_packet_inode {
 	struct timespec64 access_time; /* json: at */
 	char *target; /* json: tgt */
 	struct cfs_quota_info_array quota_infos; /* json: qifs */
+	u32 storage_class; /* json: storageClass */
 };
+
+/* proto.StorageClass_BlobStore (proto/admin_proto.go) */
+#define CFS_STORAGE_CLASS_BLOBSTORE 3
 
 static inline void cfs_packet_inode_clear(struct cfs_packet_inode *info)
 {

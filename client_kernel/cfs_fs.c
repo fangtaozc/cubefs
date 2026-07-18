@@ -127,6 +127,7 @@ struct cfs_inode {
 	struct cfs_extent_stream *es;
 	char *link_target;
 	struct cfs_quota_info_array quota_infos;
+	u32 storage_class;
 };
 
 struct cfs_file_info {
@@ -249,6 +250,7 @@ static inline void cfs_inode_refresh_unlock(struct cfs_inode *ci,
 	if (ci->link_target)
 		kfree(ci->link_target);
 	ci->link_target = cfs_move(iinfo->target, NULL);
+	ci->storage_class = iinfo->storage_class;
 }
 
 static int cfs_inode_refresh(struct cfs_inode *ci)

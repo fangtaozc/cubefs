@@ -178,6 +178,13 @@ static int cfs_packet_inode_from_json(cfs_json_t *json,
 						     &info->quota_infos);
 		CHECK_GOTO(ret, "failed to parse qifs");
 	}
+
+	/* Optional: absent on servers/opcodes that never carried hybrid-cloud
+	 * storage-class info. Not treated as a hard parse failure — callers
+	 * that care check info->storage_class against CFS_STORAGE_CLASS_BLOBSTORE
+	 * explicitly, and a zero-value default is never mistaken for that.
+	 */
+	cfs_json_get_u32(json, "storageClass", &info->storage_class);
 	return 0;
 
 failed:
