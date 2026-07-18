@@ -287,7 +287,8 @@ struct cfs_packet_inode {
 	u32 storage_class; /* json: storageClass */
 };
 
-/* proto.StorageClass_BlobStore (proto/admin_proto.go) */
+/* proto.StorageClass_* (proto/admin_proto.go) */
+#define CFS_STORAGE_CLASS_REPLICA_HDD 2
 #define CFS_STORAGE_CLASS_BLOBSTORE 3
 
 static inline void cfs_packet_inode_clear(struct cfs_packet_inode *info)

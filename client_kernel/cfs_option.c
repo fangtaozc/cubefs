@@ -54,6 +54,8 @@ static void cfs_options_clear(struct cfs_options *options)
 	options->path = NULL;
 	kfree(options->owner);
 	options->owner = NULL;
+	kfree(options->oss_accel_mover_addr);
+	options->oss_accel_mover_addr = NULL;
 }
 
 /**
@@ -180,6 +182,29 @@ static int cfs_options_parse(const char *dev_str, const char *opt_str,
 			if (ret < 0) {
 				cfs_options_clear(options);
 				return -EINVAL;
+			}
+			if (end)
+				start = end + 1;
+			else
+				break;
+		} else if (strncmp(start, "ossaccelmoveraddr=", 18) == 0) {
+			/* Single "host:port" only (no comma-separated list) —
+			 * the value would otherwise collide with this parser's
+			 * own comma-as-option-separator convention. This also
+			 * matches actual behavior: the FUSE client's equivalent
+			 * option (client/fs/oss_accel.go) only ever uses the
+			 * first address of its own comma-separated list too. */
+			start += 18;
+			end = strchr(start, ',');
+			if (end)
+				options->oss_accel_mover_addr = kstrndup(
+					start, end - start, GFP_NOFS);
+			else
+				options->oss_accel_mover_addr =
+					kstrdup(start, GFP_NOFS);
+			if (!options->oss_accel_mover_addr) {
+				cfs_options_clear(options);
+				return -ENOMEM;
 			}
 			if (end)
 				start = end + 1;

@@ -18,6 +18,7 @@ cubefs-y :=	btree.o \
 	cfs_master.o \
 	cfs_meta.o \
 	cfs_option.o \
+	cfs_oss_accel.o \
 	cfs_packet.o \
 	cfs_page.o \
 	cfs_socket.o \

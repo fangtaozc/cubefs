@@ -1,10 +1,12 @@
 /*
  * Copyright 2023 The CubeFS Authors.
  */
+#include <linux/completion.h>
 #include <linux/exportfs.h>
 #include <linux/proc_fs.h>
 #include <linux/version.h>
 #include "cfs_fs.h"
+#include "cfs_oss_accel.h"
 
 /*
  * VFS idmap 兼容层：
@@ -128,6 +130,14 @@ struct cfs_inode {
 	char *link_target;
 	struct cfs_quota_info_array quota_infos;
 	u32 storage_class;
+	/* oss-accel cold-read gate: dedups concurrent readers of the same
+	 * inode on THIS node into a single recall helper invocation. Purely a
+	 * client-local efficiency optimization — cross-node concurrency
+	 * safety is handled server-side (lcnode's idempotent-winner-check).
+	 * See cfs_oss_accel.c. */
+	bool oss_accel_recalling;
+	struct completion oss_accel_done;
+	int oss_accel_result;
 };
 
 struct cfs_file_info {
@@ -296,6 +306,123 @@ static int cfs_inode_refresh(struct cfs_inode *ci)
 	return 0;
 }
 
+#define OSS_ACCEL_XATTR_S3KEY "oss-accel.s3key"
+#define OSS_ACCEL_XATTR_CHECKSUM "oss-accel.checksum"
+#define OSS_ACCEL_XATTR_SIZE "oss-accel.size"
+#define OSS_ACCEL_XATTR_MAXLEN 255
+
+/* cfs_oss_accel_gate is called immediately before a BlobStore-class inode's
+ * pages are handed to cfs_extent_read_pages (see cfs_readpage/cfs_readpages/
+ * cfs_readahead below). Mirrors client/fs/oss_accel.go's FUSE-side cold-read
+ * gate: on a cache/oss-accel file, synchronously recalls the data back into
+ * replica extents via cfs_oss_accel_recall_via_helper before the read
+ * proceeds, so the caller never falls through to reading empty/stale extents.
+ *
+ * Returns 0 if the caller should proceed with a normal read (either the
+ * inode was never an oss-accel file — no s3key xattr, transparent no-op —
+ * or the recall just succeeded), or a negative errno (-EAGAIN/-EIO) if the
+ * caller must abort without reading.
+ */
+static int cfs_oss_accel_gate(struct cfs_inode *ci)
+{
+	struct inode *inode = &ci->vfs_inode;
+	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
+	char *mover_addr;
+	char s3key[OSS_ACCEL_XATTR_MAXLEN + 1];
+	char checksum[OSS_ACCEL_XATTR_MAXLEN + 1];
+	char size_str[24];
+	ssize_t xlen;
+	u64 size;
+	int ret;
+
+	if (ci->storage_class != CFS_STORAGE_CLASS_BLOBSTORE)
+		return 0;
+
+	mover_addr = cmi->options->oss_accel_mover_addr;
+	if (!mover_addr || !*mover_addr)
+		return 0;
+
+	/* Dedup concurrent gate calls for the SAME inode on THIS node into a
+	 * single helper invocation — a client-local efficiency optimization
+	 * only. Cross-node/cross-client-type concurrency correctness is
+	 * handled server-side (lcnode's idempotent-winner-check; see design
+	 * doc bug#10) regardless of what any client does locally. */
+	spin_lock(&inode->i_lock);
+	if (ci->oss_accel_recalling) {
+		spin_unlock(&inode->i_lock);
+		wait_for_completion(&ci->oss_accel_done);
+		return ci->storage_class == CFS_STORAGE_CLASS_BLOBSTORE ?
+			       ci->oss_accel_result :
+			       0;
+	}
+	ci->oss_accel_recalling = true;
+	reinit_completion(&ci->oss_accel_done);
+	spin_unlock(&inode->i_lock);
+
+	xlen = cfs_meta_get_xattr(cmi->meta, inode->i_ino,
+				  OSS_ACCEL_XATTR_S3KEY, s3key,
+				  OSS_ACCEL_XATTR_MAXLEN);
+	if (xlen <= 0) {
+		/* BlobStore but not an oss-accel file (e.g. a native blobstore
+		 * volume, or the xattr genuinely isn't set) — transparent
+		 * passthrough, unchanged pre-existing behavior. */
+		ret = 0;
+		goto done;
+	}
+	s3key[xlen] = '\0';
+
+	xlen = cfs_meta_get_xattr(cmi->meta, inode->i_ino,
+				  OSS_ACCEL_XATTR_CHECKSUM, checksum,
+				  OSS_ACCEL_XATTR_MAXLEN);
+	checksum[xlen > 0 ? xlen : 0] = '\0';
+
+	xlen = cfs_meta_get_xattr(cmi->meta, inode->i_ino,
+				  OSS_ACCEL_XATTR_SIZE, size_str,
+				  sizeof(size_str) - 1);
+	if (xlen > 0) {
+		size_str[xlen] = '\0';
+		if (kstrtou64(size_str, 10, &size) < 0)
+			size = i_size_read(inode);
+	} else {
+		size = i_size_read(inode);
+	}
+
+	ret = cfs_oss_accel_recall_via_helper(mover_addr, cmi->options->volume,
+					      inode->i_ino, size, s3key,
+					      checksum);
+	if (ret == 0) {
+		/* Recall committed brand-new extents server-side. The
+		 * inode's own attrs (storage_class included) are always
+		 * unconditionally re-copied by cfs_inode_refresh, but its
+		 * extent-cache refresh is conditional on mtime/size having
+		 * visibly changed — not a safe assumption to rely on here
+		 * (same class of staleness bug fixed in the Go SDK client as
+		 * bug#8/#9: a generation comparison that doesn't hold across
+		 * an out-of-band extent-identity swap can silently discard
+		 * the correct answer). Force it unconditionally instead:
+		 * reset the cached generation so cfs_extent_cache_refresh's
+		 * own generation guard can't reject the fresh result, then
+		 * invalidate any clean cached pages so the next read actually
+		 * goes to backend using the new extents. */
+		cfs_inode_refresh(ci);
+		if (ci->es) {
+			mutex_lock(&ci->es->cache.lock);
+			ci->es->cache.generation = 0;
+			mutex_unlock(&ci->es->cache.lock);
+			cfs_extent_cache_refresh(&ci->es->cache, true);
+		}
+		invalidate_mapping_pages(inode->i_mapping, 0, -1);
+	}
+
+done:
+	spin_lock(&inode->i_lock);
+	ci->oss_accel_recalling = false;
+	ci->oss_accel_result = ret;
+	spin_unlock(&inode->i_lock);
+	complete_all(&ci->oss_accel_done);
+	return ret;
+}
+
 static struct inode *cfs_inode_new(struct super_block *sb,
 				   struct cfs_packet_inode *iinfo, dev_t rdev)
 {
@@ -372,6 +499,17 @@ static int cfs_readpage(struct file *file, struct page *page)
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
 	int ret;
 
+	/* The page is already locked on entry (VFS readpage/read_folio
+	 * contract) and cfs_oss_accel_gate runs in ordinary sleepable process
+	 * context before any workqueue hand-off below — safe to block here
+	 * for the mover round trip. On failure we own unlocking the page;
+	 * cfs_extent_read_pages (not yet called) is what normally does that. */
+	ret = cfs_oss_accel_gate(ci);
+	if (ret < 0) {
+		unlock_page(page);
+		return ret;
+	}
+
 	ret = cfs_extent_read_pages(ci->es, false, &page, 1, page_offset(page),
 				    0, PAGE_SIZE);
 	if (ret >= 0)
@@ -387,6 +525,15 @@ static int cfs_readpages_cb(void *data, struct page *page)
 	struct cfs_inode *ci = (struct cfs_inode *)inode;
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
 	int ret;
+
+	/* Gate once per inode — after the first page's successful recall,
+	 * ci->storage_class is already Replica and this is a cheap no-op for
+	 * every later page in the same batch. */
+	ret = cfs_oss_accel_gate(ci);
+	if (ret < 0) {
+		cfs_page_endio(page, false, ret);
+		return ret;
+	}
 
 	cfs_stat_io(cmi->stats, false, PAGE_SIZE);
 	if (cfs_page_vec_append(vec, page))
@@ -468,6 +615,16 @@ static void cfs_readahead(struct readahead_control *rac)
 	struct cfs_inode *ci = (struct cfs_inode *)inode;
 	struct cfs_page_vec *vec;
 	struct page *page;
+
+	/* Gate before pulling any page out of rac — readahead_page() locks
+	 * each page as it's returned, so checking first means there is
+	 * nothing to unlock if we bail. Readahead is best-effort: on gate
+	 * failure we simply don't populate anything and return. The
+	 * synchronous read that actually blocks the caller goes through
+	 * cfs_readpage/cfs_read_folio separately, which has its own gate and
+	 * surfaces the real -EAGAIN/-EIO. */
+	if (cfs_oss_accel_gate(ci) < 0)
+		return;
 
 	vec = cfs_page_vec_new();
 	if (!vec) {
@@ -1769,6 +1926,9 @@ static struct inode *cfs_alloc_inode(struct super_block *sb)
 	memset(&ci->quota_infos, 0, sizeof(ci->quota_infos));
 	ci->link_target = NULL;
 	ci->es = 0;
+	ci->oss_accel_recalling = false;
+	ci->oss_accel_result = 0;
+	init_completion(&ci->oss_accel_done);
 	return (struct inode *)ci;
 }
 
