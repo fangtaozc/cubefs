@@ -373,6 +373,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/getFile").
 		HandlerFunc(l.httpServiceGetFile)
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelFlush").
+		HandlerFunc(l.httpServiceOssAccelFlush)
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{
