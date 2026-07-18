@@ -325,30 +325,41 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	}
 	isCold := before.StorageClass == proto.StorageClass_BlobStore
 	if isCold && before.HasMigrationEk {
-		if before.MigrationExtentKeyExpiredTime.Unix() > 0 {
-			// Legitimate staged old-data awaiting delayed release (commit-cold's
-			// UpdateExtentKeyAfterMigration outer handler always sets a real
+		if before.MigrationExtentKeyExpiredTime.After(time.Now()) {
+			// Legitimate staged old-data still within its grace period (commit-cold's
+			// UpdateExtentKeyAfterMigration outer handler always sets a real future
 			// expiredTime). A migration-write now would append alongside it rather
 			// than replacing it — a real data-corruption risk. Refuse; the caller
 			// (client cold-read gate) surfaces a retryable error.
 			http.Error(w, fmt.Sprintf(
-				"not yet safe to recall: inode(%v) still has a pending delayed-release migration slot (from a prior tier-out); retry once background cleanup finishes",
-				ino), http.StatusTooEarly)
+				"not yet safe to recall: inode(%v) still has a pending delayed-release migration slot (from a prior tier-out); retry once its grace period ends (expires %v)",
+				ino, before.MigrationExtentKeyExpiredTime), http.StatusTooEarly)
 			return
 		}
-		// expiredTime==0 with a non-empty slot is the signature of an orphaned
-		// migration-write: a previous recall attempt's isMigration writes landed in
-		// HybridCloudExtentsMigration, but its final UpdateExtentKeyAfterMigration
-		// commit never ran (crash, bug, network partition) — so it was never
-		// swapped in and never queued for background cleanup either (that only
-		// happens inside a successful swap). This orphan is safe to discard: it
-		// was never referenced by anything live, and the real bytes remain safe
-		// in S3 (this is the recall/commit-hot direction). DeleteMigrationExtentKey
-		// unconditionally clears the slot and queues its extents for real release,
-		// then we fall through and retry the recall from scratch.
-		log.LogWarnf("ossAccelRecall: discarding orphaned migration slot (expiredTime=0, prior commit likely failed) ino(%v)", ino)
+		// expiredTime <= now with a non-empty slot means the slot is safe to
+		// discard, covering two distinct cases:
+		//   - expiredTime==0: an orphaned migration-write. A previous recall
+		//     attempt's isMigration writes landed in HybridCloudExtentsMigration,
+		//     but its final UpdateExtentKeyAfterMigration commit never ran
+		//     (crash, bug, network partition) — so it was never queued for
+		//     background cleanup either (that only happens inside a successful
+		//     swap's mp.freeHybridList.Push).
+		//   - expiredTime in the past: legitimate staged old-data whose grace
+		//     period has genuinely elapsed, but never got processed because
+		//     mp.freeHybridList/mp.freeList are IN-MEMORY ONLY (metanode/free_list.go)
+		//     — any metanode restart (a routine rolling deploy, not just a
+		//     crash) wipes the queue, silently orphaning every inode still
+		//     awaiting its 30-minute checkHybridMigrationInode sweep. Waiting
+		//     longer never helps in this case; the queue entry is gone for good.
+		// Either way it's safe to discard: nothing live still references this
+		// slot, and the real bytes remain safe in S3 (this is the recall/
+		// commit-hot direction). DeleteMigrationExtentKey unconditionally clears
+		// the slot and queues its extents for real release, then we fall through
+		// and retry the recall from scratch.
+		log.LogWarnf("ossAccelRecall: discarding expired/orphaned migration slot (expiredTime=%v, now=%v) ino(%v)",
+			before.MigrationExtentKeyExpiredTime, time.Now(), ino)
 		if derr := metaWrapper.DeleteMigrationExtentKey(ino, path); derr != nil {
-			http.Error(w, fmt.Sprintf("failed to discard orphaned migration slot: %v", derr), http.StatusInternalServerError)
+			http.Error(w, fmt.Sprintf("failed to discard expired/orphaned migration slot: %v", derr), http.StatusInternalServerError)
 			return
 		}
 	}
