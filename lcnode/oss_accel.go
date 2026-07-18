@@ -353,6 +353,84 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v\n", vol, ino, off, s3key, got)
 }
 
+// httpServiceOssAccelCommitCold handles GET /ossAccelCommitCold?vol=&ino=&sc=&vsc=&asc=&path=&delayDelMinute=&leaseExpire=
+// Flips a previously-flushed inode to the cold tier: StorageClass=BlobStore + empty
+// ObjExtents (the bytes live in external S3, referenced by the oss-accel xattrs),
+// staging the old replica extents into the migration slot for delayed release
+// (grace period = delayDelMinute). DESTRUCTIVE after the grace period: local extents
+// are freed. Safe because the bytes are already durable in S3 (verified by a prior
+// flush) and recoverable via /ossAccelRecall.
+//
+// Reuses the existing metanode UpdateExtentKeyAfterMigration op, which already accepts
+// StorageClass_BlobStore with nil ObjExtentKeys (→ empty obj-extents). leaseExpire is
+// the inode's current migration-lease generation (0 when no lease is held).
+func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Request) {
+	var err error
+	if err = r.ParseForm(); err != nil {
+		http.Error(w, fmt.Sprintf("ParseForm err: %v", err), http.StatusBadRequest)
+		return
+	}
+	vol := r.FormValue("vol")
+	path := r.FormValue("path")
+	if vol == "" || path == "" {
+		http.Error(w, "missing required form value: vol and path", http.StatusBadRequest)
+		return
+	}
+	var ino uint64
+	if ino, err = strconv.ParseUint(r.FormValue("ino"), 10, 64); err != nil {
+		http.Error(w, fmt.Sprintf("ParseUint ino err: %v", err), http.StatusBadRequest)
+		return
+	}
+	_, vsc, asc, err := parseStorageClassForm(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	leaseExpire := parseUintForm(r, "leaseExpire", 0)
+	delayDelMinute := parseUintForm(r, "delayDelMinute", 0)
+
+	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer metaWrapper.Close()
+	defer extentClient.Close()
+
+	before, _ := metaWrapper.InodeGet_ll(ino)
+	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, leaseExpire, delayDelMinute, path); err != nil {
+		http.Error(w, fmt.Sprintf("UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
+		return
+	}
+	after, aerr := metaWrapper.InodeGet_ll(ino)
+
+	var beforeSC, afterSC, afterMig uint32
+	var afterSize uint64
+	if before != nil {
+		beforeSC = before.StorageClass
+	}
+	if aerr == nil && after != nil {
+		afterSC, afterMig, afterSize = after.StorageClass, after.MigrationStorageClass, after.Size
+	}
+	log.LogInfof("ossAccelCommitCold: vol(%v) ino(%v) storageClass %v->%v migrationSC(%v) size(%v) grace(%vmin)",
+		vol, ino, beforeSC, afterSC, afterMig, afterSize, delayDelMinute)
+	fmt.Fprintf(w, "ok: vol=%v ino=%v storageClass=%v->%v migrationStorageClass=%v size=%v graceMinute=%v\n",
+		vol, ino, beforeSC, afterSC, afterMig, afterSize, delayDelMinute)
+}
+
+// parseUintForm parses an optional uint64 form value, returning def when absent/empty.
+func parseUintForm(r *http.Request, key string, def uint64) uint64 {
+	s := r.FormValue(key)
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
 // parseStorageClassForm parses sc/vsc/asc form values shared by the mover
 // endpoints (same encoding as httpServiceGetFile).
 func parseStorageClassForm(r *http.Request) (sc, vsc uint32, asc []uint32, err error) {

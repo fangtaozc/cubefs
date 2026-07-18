@@ -379,6 +379,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelRecall").
 		HandlerFunc(l.httpServiceOssAccelRecall)
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelCommitCold").
+		HandlerFunc(l.httpServiceOssAccelCommitCold)
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{
