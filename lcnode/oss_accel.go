@@ -325,10 +325,32 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	}
 	isCold := before.StorageClass == proto.StorageClass_BlobStore
 	if isCold && before.HasMigrationEk {
-		http.Error(w, fmt.Sprintf(
-			"not yet safe to recall: inode(%v) still has a pending delayed-release migration slot (from a prior tier-out); retry once background cleanup finishes",
-			ino), http.StatusTooEarly)
-		return
+		if before.MigrationExtentKeyExpiredTime.Unix() > 0 {
+			// Legitimate staged old-data awaiting delayed release (commit-cold's
+			// UpdateExtentKeyAfterMigration outer handler always sets a real
+			// expiredTime). A migration-write now would append alongside it rather
+			// than replacing it — a real data-corruption risk. Refuse; the caller
+			// (client cold-read gate) surfaces a retryable error.
+			http.Error(w, fmt.Sprintf(
+				"not yet safe to recall: inode(%v) still has a pending delayed-release migration slot (from a prior tier-out); retry once background cleanup finishes",
+				ino), http.StatusTooEarly)
+			return
+		}
+		// expiredTime==0 with a non-empty slot is the signature of an orphaned
+		// migration-write: a previous recall attempt's isMigration writes landed in
+		// HybridCloudExtentsMigration, but its final UpdateExtentKeyAfterMigration
+		// commit never ran (crash, bug, network partition) — so it was never
+		// swapped in and never queued for background cleanup either (that only
+		// happens inside a successful swap). This orphan is safe to discard: it
+		// was never referenced by anything live, and the real bytes remain safe
+		// in S3 (this is the recall/commit-hot direction). DeleteMigrationExtentKey
+		// unconditionally clears the slot and queues its extents for real release,
+		// then we fall through and retry the recall from scratch.
+		log.LogWarnf("ossAccelRecall: discarding orphaned migration slot (expiredTime=0, prior commit likely failed) ino(%v)", ino)
+		if derr := metaWrapper.DeleteMigrationExtentKey(ino, path); derr != nil {
+			http.Error(w, fmt.Sprintf("failed to discard orphaned migration slot: %v", derr), http.StatusInternalServerError)
+			return
+		}
 	}
 	// writeStorageClass/isMigration: BlobStore case writes into the migration slot
 	// (target = vsc, the volume's replica class) and gets swapped in atomically by
