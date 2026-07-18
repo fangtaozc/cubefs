@@ -1211,6 +1211,8 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 	if req.ColdBackendExternal && req.StorageClass == proto.StorageClass_BlobStore {
 		opcode = opFSMUpdateExtentKeyAfterMigrationColdExternal
 	}
+	log.LogWarnf("[oss-accel-debug] action[UpdateExtentKeyAfterMigration] mp(%v) inode(%v) req.ColdBackendExternal(%v) req.StorageClass(%v) chosenOpcode(%v)",
+		mp.config.PartitionId, inoParm.Inode, req.ColdBackendExternal, req.StorageClass, opcode)
 	fsmResp, submitErr := mp.submit(opcode, val)
 	if submitErr != nil {
 		if submitErr == raft.ErrNotLeader {
