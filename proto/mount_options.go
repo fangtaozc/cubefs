@@ -100,6 +100,11 @@ const (
 	MinimumNlinkReadDir
 	InodeLruLimit
 	FuseServeThreads
+
+	// oss-accel: comma-separated lcnode (mover) addresses. Empty (default) means
+	// oss-accel is not enabled for this mount — the cold read gate is a no-op and
+	// StorageClass=BlobStore files fall back to the native blobstore reader.
+	OssAccelMoverAddr
 	MaxMountOption
 )
 
@@ -209,6 +214,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[MinimumNlinkReadDir] = MountOption{"minimumNlinkReadDir", "the minimum Nlink value of the directory that actively triggers the ReadDir operation", "", int64(10000)}
 	opts[InodeLruLimit] = MountOption{"inodeLruLimit", "capacity for inode lru", "", int64(10000000)}
 	opts[FuseServeThreads] = MountOption{"fuseServeThreads", "Fuse Serve Threads", "", int64(0)}
+	opts[OssAccelMoverAddr] = MountOption{"ossAccelMoverAddr", "oss-accel mover (lcnode) addresses, comma-separated; empty disables oss-accel", "", ""}
 	for i := 0; i < MaxMountOption; i++ {
 		flag.StringVar(&opts[i].cmdlineValue, opts[i].keyword, "", opts[i].description)
 	}
@@ -401,4 +407,8 @@ type MountOptions struct {
 	InodeLruLimit         int64
 	FuseServeThreads      int64
 	MinReadAheadSize      int64
+
+	// oss-accel: comma-separated lcnode (mover) addresses. Empty disables the
+	// cold read gate (see OssAccelMoverAddr mount option).
+	OssAccelMoverAddr string
 }

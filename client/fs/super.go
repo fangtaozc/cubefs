@@ -101,6 +101,10 @@ type Super struct {
 	metaCacheAcceleration bool
 	minimumNlinkReadDir   int64
 	inodeLruLimit         int64
+
+	// oss-accel: comma-separated lcnode (mover) addresses driving the cold read
+	// gate. Empty (default) disables oss-accel for this mount.
+	ossAccelMoverAddrs []string
 }
 
 // Functions that Super needs to implement
@@ -219,6 +223,14 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 	s.readThreads = int(opt.ReadThreads)
 	s.writeThreads = int(opt.WriteThreads)
 
+	if opt.OssAccelMoverAddr != "" {
+		for _, addr := range strings.Split(opt.OssAccelMoverAddr, ",") {
+			if addr = strings.TrimSpace(addr); addr != "" {
+				s.ossAccelMoverAddrs = append(s.ossAccelMoverAddrs, addr)
+			}
+		}
+	}
+
 	if s.enableBcache {
 		s.bc = bcache.NewBcacheClient()
 	}
@@ -280,7 +292,6 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 		return nil, errors.Trace(err, "NewExtentClient failed!")
 	}
 	s.mw.VerReadSeq = s.ec.GetReadVer()
-
 
 	needCreateBlobClient := false
 	if !proto.IsValidStorageClass(opt.VolStorageClass) {

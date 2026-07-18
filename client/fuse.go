@@ -1024,6 +1024,7 @@ func parseMountOption(cfg *config.Config) (*proto.MountOptions, error) {
 	opt.DisableMountSubtype = GlobalMountOptions[proto.DisableMountSubtype].GetBool()
 	opt.StreamRetryTimeout = int(GlobalMountOptions[proto.StreamRetryTimeOut].GetInt64())
 	opt.ForceRemoteCache = GlobalMountOptions[proto.ForceRemoteCache].GetBool()
+	opt.OssAccelMoverAddr = GlobalMountOptions[proto.OssAccelMoverAddr].GetString()
 	opt.AheadReadEnable = GlobalMountOptions[proto.AheadReadEnable].GetBool()
 	opt.EnableAsyncFlush = GlobalMountOptions[proto.EnableAsyncFlush].GetBool()
 	if opt.AheadReadEnable {

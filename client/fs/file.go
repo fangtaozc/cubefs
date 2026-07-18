@@ -437,6 +437,21 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: f.super.volname})
 	}()
 
+	if !f.shouldAccessReplicaStorageClass() {
+		if gateErr, recalled := f.super.ossAccelColdReadGate(f.info.Inode); gateErr != nil {
+			msg := fmt.Sprintf("Read: oss-accel cold read gate ino(%v) err(%v)", f.info.Inode, gateErr)
+			f.super.handleError("Read", msg)
+			return gateErr
+		} else if recalled {
+			// StorageClass flipped back to replica; refresh the cached inode info
+			// (bypassing the cache the gate just invalidated) before re-deciding
+			// the read path below.
+			if refreshed, rerr := f.super.mw.InodeGet_ll(f.info.Inode); rerr == nil && refreshed != nil {
+				f.info = refreshed
+			}
+		}
+	}
+
 	var size int
 	if f.shouldAccessReplicaStorageClass() {
 		f.super.ec.GetStreamer(f.info.Inode).SetParentInode(f.parentIno)
