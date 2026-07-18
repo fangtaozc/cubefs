@@ -430,10 +430,23 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 
 // concurrentRecallWaitBound is how long a losing recall waits for a concurrent
 // winner to finish its own S3-GET-and-write before giving up and reporting a
-// real failure. Generous relative to observed recall latency (single-digit
-// seconds even for tens-of-MB files over a slow S3 path) without approaching
-// HTTP client/proxy timeouts.
-const concurrentRecallWaitBound = 60 * time.Second
+// real failure. Real-machine testing showed recall latency for the same file
+// size varies far more than expected under network contention (a 64MB recall
+// observed anywhere from ~11s to ~255s depending on S3 path conditions,
+// worsened by two concurrent downloads of the same object competing for
+// bandwidth) — a short fixed bound like 60s is not a reliable margin. Matched
+// instead to the client cold-read gate's own HTTP timeout to the mover
+// (ossAccelHTTPClient, client/fs/oss_accel.go, 5 minutes) minus a safety
+// margin: the caller is already prepared to wait that long for a response,
+// so the mover should use nearly all of that budget deciding "real failure"
+// vs "still waiting on a slower concurrent winner" rather than giving up
+// early and forcing a spurious error the caller didn't need to see yet.
+// This is still fundamentally a bounded best-effort wait, not a lock — under
+// sufficiently extreme network degradation beyond what a 5-minute client
+// timeout is designed to tolerate, a losing recall can still surface a
+// genuine (rare) error. That is an accepted tradeoff of not introducing a
+// distributed lock (see design doc), not a bug in this wait logic.
+const concurrentRecallWaitBound = 4 * time.Minute
 
 // waitForConcurrentRecallWinner polls the inode until it reaches storageClass
 // vsc (a concurrent recall winner's commit landed) or concurrentRecallWaitBound
