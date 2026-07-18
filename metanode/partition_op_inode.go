@@ -1207,8 +1207,12 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 		return
 	}
 
+	// ColdBackendExternal routes to the variant FSM handler regardless of migration
+	// direction (into BlobStore for tier-out, or out of BlobStore for recall commit)
+	// — the FSM computes precise, direction-specific bypass conditions internally, so
+	// this flag alone never widens behavior beyond what those conditions allow.
 	opcode := uint32(opFSMUpdateExtentKeyAfterMigration)
-	if req.ColdBackendExternal && req.StorageClass == proto.StorageClass_BlobStore {
+	if req.ColdBackendExternal {
 		opcode = opFSMUpdateExtentKeyAfterMigrationColdExternal
 	}
 	fsmResp, submitErr := mp.submit(opcode, val)

@@ -1044,16 +1044,23 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 		return
 	}
 
-	// coldExternal: the migration target is BlobStore and its bytes are referenced by
-	// an external object store via xattr (oss-accel), not by native ObjExtentKeys.
-	// Gates two invariants below that otherwise assume "empty extents == lost data";
-	// for this case empty is the expected, correct target representation. Scoped to
-	// the ColdBackendExternal-flagged opcode only (allowEmptyColdTarget) — the native
-	// migration path (allowEmptyColdTarget=false) is byte-for-byte unchanged.
-	coldExternal := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
+	// oss-accel bypasses two invariants below that otherwise assume "empty extents
+	// == lost data". Two distinct directions, each gated on allowEmptyColdTarget
+	// (only set via the ColdBackendExternal-flagged opcode; the native migration
+	// path, allowEmptyColdTarget=false, is byte-for-byte unchanged):
+	//   - coldExternalToCold: migrating INTO BlobStore (tier-out/commit-cold) — the
+	//     target's bytes are referenced by an external object store via xattr, so
+	//     empty target ObjExtents is the expected, correct representation.
+	//   - coldExternalFromCold: migrating OUT OF BlobStore (recall commit) — the
+	//     CURRENT inode `i` is BlobStore, so i.EmptyHybridExtents()==true is itself
+	//     the normal representation (BlobStore carries no native ObjExtentKeys), not
+	//     evidence of data loss; the migration slot is expected to hold the bytes a
+	//     prior migration-write recall staged there, awaiting this swap.
+	coldExternalToCold := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
+	coldExternalFromCold := allowEmptyColdTarget && proto.IsStorageClassBlobStore(i.StorageClass)
 
 	if !i.EmptyHybridExtents() && inoParam.HybridCloudExtentsMigration.Empty() {
-		if !coldExternal {
+		if !coldExternalToCold {
 			log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
 				"storageClass(%v) is empty ",
 				mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass)
@@ -1068,12 +1075,13 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 	// The check below guards self-consistency of the CURRENTLY COMMITTED inode `i`
 	// (independent of inoParam): active data and a pending migration slot should
 	// agree on emptiness. Its first clause also fires for a virgin (never-migrated)
-	// file with real data and an untouched (empty) migration slot — exactly our
-	// first-time coldExternal case — so that clause alone gets the bypass. The
-	// second clause (empty active data but a non-empty migration slot — a
-	// genuinely torn/leftover state) still applies even for coldExternal.
-	if (!coldExternal && !i.EmptyHybridExtents() && i.HybridCloudExtentsMigration.Empty()) ||
-		(i.EmptyHybridExtents() && !i.HybridCloudExtentsMigration.Empty()) {
+	// file with real data and an untouched (empty) migration slot — exactly the
+	// first-time coldExternalToCold case — so that clause gets that bypass. Its
+	// second clause fires for a BlobStore inode with a non-empty migration slot —
+	// exactly the coldExternalFromCold (recall commit) case, where the slot holds
+	// legitimate migration-written bytes, not a torn state — so it gets that bypass.
+	if (!coldExternalToCold && !i.EmptyHybridExtents() && i.HybridCloudExtentsMigration.Empty()) ||
+		(!coldExternalFromCold && i.EmptyHybridExtents() && !i.HybridCloudExtentsMigration.Empty()) {
 		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
 			"storageClass(%v) is empty, eks(%v), migrateEks(%v) ",
 			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass, i.EmptyHybridExtents(), i.HybridCloudExtentsMigration.Empty())

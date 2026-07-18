@@ -393,7 +393,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		// Atomically swap the migration-write bytes into HybridCloudExtents and
 		// flip StorageClass back to the replica tier. No grace period needed —
 		// the swapped-out slot holds the (empty) BlobStore ObjExtents, not real data.
-		if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, false); err != nil {
+		if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true); err != nil {
 			http.Error(w, fmt.Sprintf("commit-hot UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
 			return
 		}
