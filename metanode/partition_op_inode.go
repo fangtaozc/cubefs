@@ -1207,7 +1207,7 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 		return
 	}
 
-	opcode := opFSMUpdateExtentKeyAfterMigration
+	opcode := uint32(opFSMUpdateExtentKeyAfterMigration)
 	if req.ColdBackendExternal && req.StorageClass == proto.StorageClass_BlobStore {
 		opcode = opFSMUpdateExtentKeyAfterMigrationColdExternal
 	}
