@@ -1044,8 +1044,15 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 		return
 	}
 
+	// coldExternal: the migration target is BlobStore and its bytes are referenced by
+	// an external object store via xattr (oss-accel), not by native ObjExtentKeys.
+	// Gates two invariants below that otherwise assume "empty extents == lost data";
+	// for this case empty is the expected, correct target representation. Scoped to
+	// the ColdBackendExternal-flagged opcode only (allowEmptyColdTarget) — the native
+	// migration path (allowEmptyColdTarget=false) is byte-for-byte unchanged.
+	coldExternal := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
+
 	if !i.EmptyHybridExtents() && inoParam.HybridCloudExtentsMigration.Empty() {
-		coldExternal := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
 		if !coldExternal {
 			log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
 				"storageClass(%v) is empty ",
@@ -1058,7 +1065,15 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 			mp.config.PartitionId, i.Inode, i.StorageClass)
 	}
 
-	if (!i.EmptyHybridExtents() && i.HybridCloudExtentsMigration.Empty()) || (i.EmptyHybridExtents() && !i.HybridCloudExtentsMigration.Empty()) {
+	// The check below guards self-consistency of the CURRENTLY COMMITTED inode `i`
+	// (independent of inoParam): active data and a pending migration slot should
+	// agree on emptiness. Its first clause also fires for a virgin (never-migrated)
+	// file with real data and an untouched (empty) migration slot — exactly our
+	// first-time coldExternal case — so that clause alone gets the bypass. The
+	// second clause (empty active data but a non-empty migration slot — a
+	// genuinely torn/leftover state) still applies even for coldExternal.
+	if (!coldExternal && !i.EmptyHybridExtents() && i.HybridCloudExtentsMigration.Empty()) ||
+		(i.EmptyHybridExtents() && !i.HybridCloudExtentsMigration.Empty()) {
 		log.LogWarnf("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) migrate extent key for migration "+
 			"storageClass(%v) is empty, eks(%v), migrateEks(%v) ",
 			mp.config.PartitionId, i.Inode, i.StorageClass, i.HybridCloudExtentsMigration.storageClass, i.EmptyHybridExtents(), i.HybridCloudExtentsMigration.Empty())
