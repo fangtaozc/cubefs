@@ -1124,6 +1124,22 @@ type UpdateExtentKeyAfterMigrationRequest struct {
 	// invariant that otherwise guards blobstore-native migrations. Additive field;
 	// defaults false, zero behavior change for existing callers.
 	ColdBackendExternal bool `json:"coldBackendExternal,omitempty"`
+	// ExternalSize, when non-zero AND ColdBackendExternal is true AND the inode's
+	// CURRENT size is still 0, tells metanode to set the inode's Size directly to
+	// this value as part of the same commit. Exists for oss-accel M2 (reverse
+	// acceleration): materializing a brand-new placeholder inode for data that
+	// was written directly to the external S3 bucket (never through CubeFS) needs
+	// its size known upfront, but there is no existing primitive to set Size on
+	// an inode without either (a) a normal write, which sets a 1h
+	// forbidden-migration lease this materialization path must not incur, or
+	// (b) writing dummy bytes matching the full size through the extent-append
+	// path, which is wasteful for large objects and conflicts with the
+	// empty-migration-slot invariant this same ColdBackendExternal path relies
+	// on. The i.Size==0 guard means this can only ever set the size of an inode
+	// that has truly never been written to — it can never silently corrupt the
+	// recorded size of a real, previously-written file. Additive/optional;
+	// omitted (0) is a no-op, zero behavior change for M1 callers.
+	ExternalSize uint64 `json:"externalSize,omitempty"`
 	RequestExtend
 }
 

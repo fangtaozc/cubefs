@@ -2914,6 +2914,7 @@ func (mw *MetaWrapper) renewalForbiddenMigration(mp *MetaPartition, inode uint64
 
 func (mw *MetaWrapper) updateExtentKeyAfterMigration(mp *MetaPartition, inode uint64, storageType uint32,
 	extentKeys []proto.ObjExtentKey, leaseExpire uint64, delayDelMinute uint64, fullPath string, coldBackendExternal bool,
+	externalSize uint64,
 ) (status int, err error) {
 	bgTime := stat.BeginStat()
 	defer func() {
@@ -2926,6 +2927,7 @@ func (mw *MetaWrapper) updateExtentKeyAfterMigration(mp *MetaPartition, inode ui
 		NewObjExtentKeys:    extentKeys,
 		LeaseExpire:         leaseExpire,
 		ColdBackendExternal: coldBackendExternal,
+		ExternalSize:        externalSize,
 	}
 	req.DelayDeleteMinute = delayDelMinute
 	req.FullPaths = []string{fullPath}

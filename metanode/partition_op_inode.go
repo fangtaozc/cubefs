@@ -1198,6 +1198,11 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 		return
 	}
 
+	// See ExternalSize's doc comment (proto/fs_proto.go): carried through as a
+	// plain Inode.Size value (an existing, already-marshaled field) rather than
+	// a new wire field — the FSM applies it only under its own i.Size==0 guard.
+	inoParm.Size = req.ExternalSize
+
 	val, err := inoParm.Marshal()
 	if err != nil {
 		err = fmt.Errorf("mp(%v) inode(%v) Marshal inner err: %v",

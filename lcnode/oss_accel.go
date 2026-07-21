@@ -477,7 +477,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		// Atomically swap the migration-write bytes into HybridCloudExtents and
 		// flip StorageClass back to the replica tier. No grace period needed —
 		// the swapped-out slot holds the (empty) BlobStore ObjExtents, not real data.
-		if cerr := metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true); cerr != nil {
+		if cerr := metaWrapper.UpdateExtentKeyAfterMigration(ino, vsc, nil, before.LeaseExpireTime, 0, path, true, 0); cerr != nil {
 			if waitForConcurrentRecallWinner(metaWrapper, ino, vsc) {
 				log.LogWarnf("ossAccelRecall: commit lost a concurrent recall race (commit err: %v) but ino(%v) reached StorageClass(%v) — treating as success",
 					cerr, ino, vsc)
@@ -631,7 +631,7 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 			ino, before.LeaseExpireTime, now, before.LeaseExpireTime-now), http.StatusConflict)
 		return
 	}
-	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path, true); err != nil {
+	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path, true, 0); err != nil {
 		http.Error(w, fmt.Sprintf("UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
 		return
 	}

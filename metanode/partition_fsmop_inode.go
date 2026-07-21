@@ -1133,6 +1133,17 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 	// store new storage ek  in HybridCloudExtents
 	i.StorageClass = inoParam.HybridCloudExtentsMigration.storageClass
 	i.HybridCloudExtents.sortedEks = inoParam.HybridCloudExtentsMigration.sortedEks
+	// oss-accel M2 (reverse acceleration) placeholder materialization: a
+	// brand-new, never-written inode (i.Size==0) being tiered out straight to
+	// an external-S3-referenced BlobStore has no extent-derived size to carry
+	// forward — there's nothing else that sets Size for it. Guarded to i.Size==0
+	// so this can only ever set the size of an inode that was truly never
+	// written to; it can never overwrite the size of a real, previously-written
+	// file (which always already has the correct size by the time it reaches
+	// this swap, same as every other oss-accel/native migration caller).
+	if coldExternalToCold && i.Size == 0 && inoParam.Size > 0 {
+		i.Size = inoParam.Size
+	}
 	// delete migration ek in future
 	i.Flag |= DeleteMigrationExtentKeyFlag
 	log.LogInfof("action[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storage class change from %v to %v",

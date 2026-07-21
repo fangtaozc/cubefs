@@ -3137,8 +3137,10 @@ func (mw *MetaWrapper) RenewalForbiddenMigration(inode uint64) error {
 	return nil
 }
 
+// externalSize: see proto.UpdateExtentKeyAfterMigrationRequest.ExternalSize's doc
+// comment. Pass 0 for every caller except oss-accel M2 placeholder materialization.
 func (mw *MetaWrapper) UpdateExtentKeyAfterMigration(inode uint64, storageType uint32, objExtentKeys []proto.ObjExtentKey,
-	leaseExpire uint64, delayDelMinute uint64, fullPath string, coldBackendExternal bool,
+	leaseExpire uint64, delayDelMinute uint64, fullPath string, coldBackendExternal bool, externalSize uint64,
 ) error {
 	mp := mw.getPartitionByInode(inode)
 	if mp == nil {
@@ -3147,7 +3149,7 @@ func (mw *MetaWrapper) UpdateExtentKeyAfterMigration(inode uint64, storageType u
 			inode, storageType, objExtentKeys, leaseExpire, err.Error())
 		return err
 	}
-	status, err := mw.updateExtentKeyAfterMigration(mp, inode, storageType, objExtentKeys, leaseExpire, delayDelMinute, fullPath, coldBackendExternal)
+	status, err := mw.updateExtentKeyAfterMigration(mp, inode, storageType, objExtentKeys, leaseExpire, delayDelMinute, fullPath, coldBackendExternal, externalSize)
 	if err != nil || status != statusOK {
 		msg := fmt.Sprintf("UpdateExtentKeyAfterMigration: inode(%v) storageType(%v) extentKeys(%v) leaseExpire(%v) status(%v) err: %v",
 			inode, storageType, objExtentKeys, leaseExpire, status, err)
