@@ -37,6 +37,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
@@ -832,24 +833,83 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 		vol, changelogKey, cursor, newCursor, processed, skipped, failed)
 }
 
+// ensureOssAccelParentDir walks key's path segments (all but the last) from
+// the volume root, creating any missing directory along the way, and
+// returns the resolved parent inode plus the leaf (file) name (DEC-M2-3).
+//
+// Two changelog events sharing a parent directory race to create it —
+// Create_ll returning EEXIST is treated as "someone else already created
+// it," not a failure: the loser re-Lookup_ll's to pick up the winner's
+// inode and continues (same loser-treats-a-conflict-as-success philosophy
+// as the concurrent recall race fix, see waitForConcurrentRecallWinner
+// above — not a new pattern). A losing Create_ll call still orphans the
+// inode it speculatively allocated before hitting the existing-dentry check
+// — a pre-existing sdk/meta behavior (create_ll only unlinks its inode on
+// non-EEXIST failures), not something introduced or fixed here.
+func ensureOssAccelParentDir(mw *meta.MetaWrapper, key string) (parentIno uint64, leaf string, err error) {
+	segments := strings.Split(key, "/")
+	leaf = segments[len(segments)-1]
+	if leaf == "" {
+		return 0, "", fmt.Errorf("key %q ends in \"/\"", key)
+	}
+	parentIno = proto.RootIno
+	pathSoFar := ""
+	for _, seg := range segments[:len(segments)-1] {
+		if seg == "" {
+			return 0, "", fmt.Errorf("empty path segment in key %q", key)
+		}
+		pathSoFar += "/" + seg
+
+		if ino, mode, lerr := mw.Lookup_ll(parentIno, seg); lerr == nil {
+			if !proto.IsDir(mode) {
+				return 0, "", fmt.Errorf("path segment %q is an existing non-directory", pathSoFar)
+			}
+			parentIno = ino
+			continue
+		} else if lerr != syscall.ENOENT {
+			return 0, "", fmt.Errorf("Lookup_ll(%v, %q) err: %v", parentIno, seg, lerr)
+		}
+
+		dirMode := uint32(0o755)
+		dirMode |= uint32(os.ModeDir)
+		info, cerr := mw.Create_ll(parentIno, seg, dirMode, 0, 0, nil, pathSoFar, true)
+		if cerr == nil {
+			parentIno = info.Inode
+			continue
+		}
+		if cerr != syscall.EEXIST {
+			return 0, "", fmt.Errorf("Create_ll dir %q err: %v", pathSoFar, cerr)
+		}
+		ino, mode, lerr := mw.Lookup_ll(parentIno, seg)
+		if lerr != nil {
+			return 0, "", fmt.Errorf("lost mkdir race on %q but re-Lookup_ll failed: %v", pathSoFar, lerr)
+		}
+		if !proto.IsDir(mode) {
+			return 0, "", fmt.Errorf("path segment %q is an existing non-directory (race)", pathSoFar)
+		}
+		parentIno = ino
+	}
+	return parentIno, leaf, nil
+}
+
 // materializeOssAccelChangelogEvent creates a cold placeholder inode for ev
-// under the volume root (flat namespace — a key containing "/" would need
-// DEC-M2-3's recursive mkdir, not implemented in this slice, so it's rejected
-// rather than silently created as a garbled flat name). Returns
+// under the volume root, walking/creating any missing directory segments for
+// a nested key (DEC-M2-3, see ensureOssAccelParentDir). Returns
 // created=false, err=nil when a dentry with this name already exists —
 // idempotent re-processing (or a prior partial run), not an error.
 func materializeOssAccelChangelogEvent(mw *meta.MetaWrapper, ev ossAccelChangelogEvent) (created bool, err error) {
 	if ev.Key == "" {
 		return false, fmt.Errorf("changelog event missing key")
 	}
-	if strings.Contains(ev.Key, "/") {
-		return false, fmt.Errorf("nested key %q requires recursive mkdir (DEC-M2-3, not implemented in this slice)", ev.Key)
+	parentIno, leaf, derr := ensureOssAccelParentDir(mw, ev.Key)
+	if derr != nil {
+		return false, fmt.Errorf("ensureOssAccelParentDir err: %v", derr)
 	}
-	if _, _, lerr := mw.Lookup_ll(proto.RootIno, ev.Key); lerr == nil {
+	if _, _, lerr := mw.Lookup_ll(parentIno, leaf); lerr == nil {
 		return false, nil
 	}
 
-	info, cerr := mw.Create_ll(proto.RootIno, ev.Key, 0o644, 0, 0, nil, "/"+ev.Key, false)
+	info, cerr := mw.Create_ll(parentIno, leaf, 0o644, 0, 0, nil, "/"+ev.Key, false)
 	if cerr != nil {
 		return false, fmt.Errorf("Create_ll err: %v", cerr)
 	}
