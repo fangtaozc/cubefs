@@ -26,8 +26,17 @@ package proto
 //
 // These constants are shared across mover (lcnode, writes them), fuse/kernel
 // client (reads them to route cold reads), and objectnode (reads them for the
-// S3 interface). Backend-specific connection config (endpoint/AK/SK) is NOT here
-// — it lives on the mover/server side only and never reaches the client.
+// S3 interface). Per-inode cold-reference xattrs never carry connection config.
+//
+// XAttrKeyOSSAccelBackendConfig is the one exception, and it lives on a
+// DIFFERENT inode (the volume root, proto.RootIno) rather than on any
+// tiered-out file: an optional per-volume override of the mover's cold S3
+// backend (endpoint/bucket/region/path-style/TLS + the NAMES of the env vars
+// holding AK/SK — never the credential values themselves, which still only
+// ever live in the lcnode process environment). Absent on a volume, the
+// mover falls back to its global OSS_ACCEL_S3_* environment config
+// (lcnode/oss_accel.go loadOssAccelS3Config) — zero behavior change for any
+// deployment that hasn't set this.
 
 // XAttr keys for the cold reference carried on a tiered-out inode.
 // Prefix "oss-accel." is distinct from objectnode's "oss:" keys to avoid clash.
@@ -46,6 +55,30 @@ const (
 	// XAttrKeyOSSAccelState is the cold sub-state (see ColdState* below).
 	XAttrKeyOSSAccelState = "oss-accel.state"
 )
+
+// XAttrKeyOSSAccelBackendConfig is the per-volume cold-backend override,
+// stored on the VOLUME ROOT inode (proto.RootIno), not on any tiered-out
+// file. See the package doc comment above for why this is the one xattr that
+// carries backend config (never credentials) rather than a per-file cold
+// reference.
+const XAttrKeyOSSAccelBackendConfig = "oss-accel.backend"
+
+// OSSAccelBackendConfig is the JSON shape stored at XAttrKeyOSSAccelBackendConfig.
+// Every field mirrors the corresponding OSS_ACCEL_S3_* env var; AccessKeyEnv/
+// SecretKeyEnv name the environment variables the mover reads for credentials
+// (defaulting to the global OSS_ACCEL_S3_AK/OSS_ACCEL_S3_SK names when empty),
+// so a volume-specific backend can still reuse the deployment's existing
+// credentials, or point at differently-named env vars for a distinct
+// credential pair — but the credential VALUES are never written here.
+type OSSAccelBackendConfig struct {
+	Endpoint      string `json:"endpoint"`
+	Region        string `json:"region,omitempty"`
+	Bucket        string `json:"bucket"`
+	AccessKeyEnv  string `json:"accessKeyEnv,omitempty"`
+	SecretKeyEnv  string `json:"secretKeyEnv,omitempty"`
+	PathStyle     bool   `json:"pathStyle,omitempty"`
+	SkipTLSVerify bool   `json:"skipTlsVerify,omitempty"`
+}
 
 // ChecksumPrefixSHA256 prefixes the value stored in XAttrKeyOSSAccelChecksum.
 const ChecksumPrefixSHA256 = "sha256:"

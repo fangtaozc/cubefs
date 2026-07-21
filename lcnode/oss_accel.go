@@ -30,6 +30,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -62,16 +63,76 @@ const (
 	envNameOssAccelS3SK = "OSS_ACCEL_S3_SK"
 )
 
-// loadOssAccelS3Config builds the s3 backend config from the lcnode environment.
-// Returns an error (not a panic) when the cold backend is unconfigured so the
-// flush endpoint fails cleanly rather than the daemon refusing to start.
-func loadOssAccelS3Config() (*s3.Config, error) {
+// loadOssAccelS3Config builds the s3 backend config for vol. Checks the
+// volume's own per-vol override first (proto.XAttrKeyOSSAccelBackendConfig on
+// proto.RootIno — see proto/oss_accel.go), falling back to the lcnode
+// process's global OSS_ACCEL_S3_* environment when the volume has no
+// override (zero behavior change for every deployment that never sets one).
+//
+// A volume WITH an override that fails to parse or is missing a required
+// field is a hard error, never a silent fallback to global config — a
+// misconfigured per-vol override must not quietly start writing to the
+// wrong (deployment-global) bucket.
+func loadOssAccelS3Config(mw *meta.MetaWrapper, vol string) (*s3.Config, error) {
+	if cfg, err := loadOssAccelS3ConfigFromVol(mw); cfg != nil || err != nil {
+		return cfg, err
+	}
+	return loadOssAccelS3ConfigFromEnv()
+}
+
+// loadOssAccelS3ConfigFromVol returns (nil, nil) when the volume has no
+// oss-accel.backend override on its root inode (the normal, unconfigured
+// case — caller falls back to global env). Returns (nil, non-nil error) when
+// an override is present but malformed/incomplete — caller must NOT fall
+// back in that case. Returns (non-nil, nil) on a valid override.
+func loadOssAccelS3ConfigFromVol(mw *meta.MetaWrapper) (*s3.Config, error) {
+	xattrs, err := mw.BatchGetXAttr([]uint64{proto.RootIno}, []string{proto.XAttrKeyOSSAccelBackendConfig})
+	if err != nil || len(xattrs) == 0 {
+		return nil, nil
+	}
+	raw := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelBackendConfig]
+	if raw == "" {
+		return nil, nil
+	}
+	var cfg proto.OSSAccelBackendConfig
+	if jerr := json.Unmarshal([]byte(raw), &cfg); jerr != nil {
+		return nil, fmt.Errorf("oss-accel per-vol backend override on root inode is not valid JSON: %v", jerr)
+	}
+	if cfg.Endpoint == "" || cfg.Bucket == "" {
+		return nil, fmt.Errorf("oss-accel per-vol backend override missing required field(s): endpoint=%q bucket=%q", cfg.Endpoint, cfg.Bucket)
+	}
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	accessKeyEnv := cfg.AccessKeyEnv
+	if accessKeyEnv == "" {
+		accessKeyEnv = envNameOssAccelS3AK
+	}
+	secretKeyEnv := cfg.SecretKeyEnv
+	if secretKeyEnv == "" {
+		secretKeyEnv = envNameOssAccelS3SK
+	}
+	return &s3.Config{
+		Endpoint:           cfg.Endpoint,
+		Region:             region,
+		Bucket:             cfg.Bucket,
+		AccessKeyEnv:       accessKeyEnv,
+		SecretKeyEnv:       secretKeyEnv,
+		UsePathStyle:       cfg.PathStyle,
+		InsecureSkipVerify: cfg.SkipTLSVerify,
+	}, nil
+}
+
+// loadOssAccelS3ConfigFromEnv is the pre-existing global-config path
+// (deployment-wide OSS_ACCEL_S3_* env vars), unchanged.
+func loadOssAccelS3ConfigFromEnv() (*s3.Config, error) {
 	endpoint := os.Getenv(envOssAccelS3Endpoint)
 	bucket := os.Getenv(envOssAccelS3Bucket)
 	region := os.Getenv(envOssAccelS3Region)
 	if endpoint == "" || bucket == "" {
-		return nil, fmt.Errorf("oss-accel S3 not configured: set %s and %s in lcnode env",
-			envOssAccelS3Endpoint, envOssAccelS3Bucket)
+		return nil, fmt.Errorf("oss-accel S3 not configured: set %s and %s in lcnode env, or set %s on the volume's root inode",
+			envOssAccelS3Endpoint, envOssAccelS3Bucket, proto.XAttrKeyOSSAccelBackendConfig)
 	}
 	if region == "" {
 		region = "us-east-1" // harmless default for S3-compatible stores
@@ -127,7 +188,17 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	s3Cfg, err := loadOssAccelS3Config()
+	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer metaWrapper.Close()
+	defer extentClient.Close()
+
+	// Per-vol backend override lives on this vol's own root inode, so the S3
+	// config can only be resolved once metaWrapper (above) exists.
+	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -138,14 +209,6 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer s3Backend.Close()
-
-	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer metaWrapper.Close()
-	defer extentClient.Close()
 
 	if err = extentClient.OpenStream(ino, false, false, ""); err != nil {
 		http.Error(w, fmt.Sprintf("OpenStream err: %v", err), http.StatusBadRequest)
@@ -298,7 +361,17 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	}
 	wantChecksum := strings.TrimPrefix(r.FormValue("checksum"), proto.ChecksumPrefixSHA256)
 
-	s3Cfg, err := loadOssAccelS3Config()
+	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer metaWrapper.Close()
+	defer extentClient.Close()
+
+	// Per-vol backend override lives on this vol's own root inode, so the S3
+	// config can only be resolved once metaWrapper (above) exists.
+	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
@@ -309,14 +382,6 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer s3Backend.Close()
-
-	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer metaWrapper.Close()
-	defer extentClient.Close()
 
 	before, gerr := metaWrapper.InodeGet_ll(ino)
 	if gerr != nil || before == nil {
