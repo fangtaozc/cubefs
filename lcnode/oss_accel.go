@@ -271,10 +271,11 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	fmt.Fprintf(w, "ok: vol=%v ino=%v size=%v s3key=%v checksum=%v\n", vol, ino, size, s3key, checksum)
 }
 
-// buildVolClients constructs a meta + extent client pair for a volume, shared by
-// the mover flush / recall endpoints (mirrors httpServiceGetFile setup). Callers
-// defer Close() on both returned clients.
-func (l *LcNode) buildVolClients(vol string, vsc uint32, asc []uint32) (*meta.MetaWrapper, *stream.ExtentClient, error) {
+// buildVolMetaWrapper constructs a bare meta client for a volume, for
+// endpoints that only touch metadata (no extent I/O) — e.g. changelog sync,
+// which materializes placeholder inodes purely via Create_ll /
+// UpdateExtentKeyAfterMigration and never streams bytes. Caller defers Close().
+func (l *LcNode) buildVolMetaWrapper(vol string) (*meta.MetaWrapper, error) {
 	metaWrapper, err := meta.NewMetaWrapper(&meta.MetaConfig{
 		Volume:               vol,
 		Masters:              l.masters,
@@ -285,7 +286,18 @@ func (l *LcNode) buildVolClients(vol string, vsc uint32, asc []uint32) (*meta.Me
 		DisableTrashByClient: true,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("NewMetaWrapper err: %v", err)
+		return nil, fmt.Errorf("NewMetaWrapper err: %v", err)
+	}
+	return metaWrapper, nil
+}
+
+// buildVolClients constructs a meta + extent client pair for a volume, shared by
+// the mover flush / recall endpoints (mirrors httpServiceGetFile setup). Callers
+// defer Close() on both returned clients.
+func (l *LcNode) buildVolClients(vol string, vsc uint32, asc []uint32) (*meta.MetaWrapper, *stream.ExtentClient, error) {
+	metaWrapper, err := l.buildVolMetaWrapper(vol)
+	if err != nil {
+		return nil, nil, err
 	}
 	extentClient, err := stream.NewExtentClient(&stream.ExtentConfig{
 		Volume:                      vol,
@@ -649,6 +661,246 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 		vol, ino, beforeSC, afterSC, afterMig, afterSize, delayDelMinute)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v storageClass=%v->%v migrationStorageClass=%v size=%v graceMinute=%v\n",
 		vol, ino, beforeSC, afterSC, afterMig, afterSize, delayDelMinute)
+}
+
+// defaultOssAccelChangelogKey is the well-known changelog object key used
+// when the caller doesn't override it via ?changelogKey= (DEC-M2-1).
+const defaultOssAccelChangelogKey = ".changelog/events.ndjson"
+
+// ossAccelChangelogEvent is one NDJSON line in a volume's external changelog
+// object (DEC-M2-1). Checksum may or may not carry the "sha256:" prefix used
+// by the oss-accel xattr convention (M1 design doc §2) — normalized in
+// materializeOssAccelChangelogEvent before being written to the xattr.
+type ossAccelChangelogEvent struct {
+	Key       string `json:"key"`
+	Size      uint64 `json:"size"`
+	Checksum  string `json:"checksum"`
+	EventTime string `json:"eventTime"`
+}
+
+// httpServiceOssAccelChangelogSync handles GET /ossAccelChangelogSync?vol=&prefix=&changelogKey=
+// M2 first vertical slice (DEC-M2-1/2; flat namespace only — DEC-M2-3
+// recursive mkdir is design-only, not implemented here, so a changelog key
+// containing "/" is rejected rather than silently mismaterialized).
+//
+// Reads the volume's external S3 changelog object (NDJSON, one event per
+// line) from where the last sync left off (oss-accel.changelog.cursor xattr
+// on the volume root, 0 if unset) via an HTTP Range GET, and for each
+// COMPLETE line since the cursor materializes a cold placeholder inode:
+// Create_ll an empty inode, then a single UpdateExtentKeyAfterMigration
+// (ColdBackendExternal=true, ExternalSize=<line's size>) flips it straight to
+// the cold tier at the correct size — the one validated way to materialize a
+// never-written inode (see design doc DEC-M2-2) — followed by the same
+// oss-accel.{s3key,checksum,size,state} xattr tagging M1 uses, so the result
+// is byte-for-byte the same shape as a file M1 tiered out itself and needs
+// no new code on the read/recall side.
+//
+// A trailing incomplete line (the producer still writing it) is left
+// unconsumed — the cursor never advances past the last complete newline, so
+// the next sync re-reads it from the start once it's finished. A line that
+// fails to materialize is logged and the run continues with subsequent
+// lines, but the persisted cursor stops right before the first failing line
+// (matches design doc §3 step 5d / §5: a persistently failing line blocks
+// this volume's changelog indefinitely — accepted for this manually
+// triggered slice; later lines that succeed anyway are simply idempotent
+// no-ops on the next re-run once the cursor does catch up, thanks to the
+// Lookup_ll dedup check in materializeOssAccelChangelogEvent).
+func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, fmt.Sprintf("ParseForm err: %v", err), http.StatusBadRequest)
+		return
+	}
+	vol := r.FormValue("vol")
+	if vol == "" {
+		http.Error(w, "missing required form value: vol", http.StatusBadRequest)
+		return
+	}
+	prefix := r.FormValue("prefix")
+	changelogKey := r.FormValue("changelogKey")
+	if changelogKey == "" {
+		changelogKey = defaultOssAccelChangelogKey
+	}
+
+	metaWrapper, err := l.buildVolMetaWrapper(vol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer metaWrapper.Close()
+
+	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	s3Backend, err := s3.New(s3Cfg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer s3Backend.Close()
+
+	cursor := loadOssAccelChangelogCursor(metaWrapper)
+
+	ctx := context.Background()
+	changelogSize, _, _, headErr := s3Backend.Head(ctx, changelogKey)
+	if headErr != nil {
+		http.Error(w, fmt.Sprintf("s3 head changelog(%v) err: %v", changelogKey, headErr), http.StatusInternalServerError)
+		return
+	}
+	if uint64(changelogSize) <= cursor {
+		fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v changelogSize=%v processed=0 skipped=0 failed=0 (no new events)\n",
+			vol, changelogKey, cursor, changelogSize)
+		return
+	}
+
+	body, getErr := s3Backend.Get(ctx, changelogKey, int64(cursor), 0)
+	if getErr != nil {
+		http.Error(w, fmt.Sprintf("s3 get changelog(%v) from offset(%v) err: %v", changelogKey, cursor, getErr), http.StatusInternalServerError)
+		return
+	}
+	raw, readErr := io.ReadAll(body)
+	body.Close()
+	if readErr != nil {
+		http.Error(w, fmt.Sprintf("read changelog body err: %v", readErr), http.StatusInternalServerError)
+		return
+	}
+
+	var processed, skipped, failed int
+	newCursor := cursor
+	firstFailureOffset := -1 // -1 = no failure yet; else byte offset (within raw) of the first failing line
+	lineStart := 0
+	for i, b := range raw {
+		if b != '\n' {
+			continue
+		}
+		line := raw[lineStart:i]
+		lineEnd := i + 1 // consume the newline itself
+		thisLineStart := lineStart
+		lineStart = lineEnd
+
+		if len(strings.TrimSpace(string(line))) == 0 {
+			if firstFailureOffset < 0 {
+				newCursor = cursor + uint64(lineEnd)
+			}
+			continue
+		}
+		var ev ossAccelChangelogEvent
+		if jerr := json.Unmarshal(line, &ev); jerr != nil {
+			log.LogErrorf("ossAccelChangelogSync: vol(%v) bad changelog line at byte(%v): %v", vol, cursor+uint64(thisLineStart), jerr)
+			failed++
+			if firstFailureOffset < 0 {
+				firstFailureOffset = thisLineStart
+			}
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(ev.Key, prefix) {
+			if firstFailureOffset < 0 {
+				newCursor = cursor + uint64(lineEnd)
+			}
+			continue
+		}
+		created, merr := materializeOssAccelChangelogEvent(metaWrapper, ev)
+		if merr != nil {
+			log.LogErrorf("ossAccelChangelogSync: vol(%v) key(%v) materialize err: %v", vol, ev.Key, merr)
+			failed++
+			if firstFailureOffset < 0 {
+				firstFailureOffset = thisLineStart
+			}
+			continue
+		}
+		if created {
+			processed++
+		} else {
+			skipped++
+		}
+		if firstFailureOffset < 0 {
+			newCursor = cursor + uint64(lineEnd)
+		}
+	}
+
+	if newCursor != cursor {
+		if serr := saveOssAccelChangelogCursor(metaWrapper, newCursor); serr != nil {
+			http.Error(w, fmt.Sprintf("persist changelog cursor err: %v", serr), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	log.LogInfof("ossAccelChangelogSync: vol(%v) changelogKey(%v) cursor %v->%v processed(%v) skipped(%v) failed(%v)",
+		vol, changelogKey, cursor, newCursor, processed, skipped, failed)
+	fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v->%v processed=%v skipped=%v failed=%v\n",
+		vol, changelogKey, cursor, newCursor, processed, skipped, failed)
+}
+
+// materializeOssAccelChangelogEvent creates a cold placeholder inode for ev
+// under the volume root (flat namespace — a key containing "/" would need
+// DEC-M2-3's recursive mkdir, not implemented in this slice, so it's rejected
+// rather than silently created as a garbled flat name). Returns
+// created=false, err=nil when a dentry with this name already exists —
+// idempotent re-processing (or a prior partial run), not an error.
+func materializeOssAccelChangelogEvent(mw *meta.MetaWrapper, ev ossAccelChangelogEvent) (created bool, err error) {
+	if ev.Key == "" {
+		return false, fmt.Errorf("changelog event missing key")
+	}
+	if strings.Contains(ev.Key, "/") {
+		return false, fmt.Errorf("nested key %q requires recursive mkdir (DEC-M2-3, not implemented in this slice)", ev.Key)
+	}
+	if _, _, lerr := mw.Lookup_ll(proto.RootIno, ev.Key); lerr == nil {
+		return false, nil
+	}
+
+	info, cerr := mw.Create_ll(proto.RootIno, ev.Key, 0o644, 0, 0, nil, "/"+ev.Key, false)
+	if cerr != nil {
+		return false, fmt.Errorf("Create_ll err: %v", cerr)
+	}
+	ino := info.Inode
+
+	if uerr := mw.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, info.LeaseExpireTime, 0, "/"+ev.Key, true, ev.Size); uerr != nil {
+		return false, fmt.Errorf("UpdateExtentKeyAfterMigration err: %v (placeholder inode %v created but never flipped cold — needs manual cleanup)", uerr, ino)
+	}
+
+	checksum := ev.Checksum
+	if checksum != "" && !strings.HasPrefix(checksum, proto.ChecksumPrefixSHA256) {
+		checksum = proto.ChecksumPrefixSHA256 + checksum
+	}
+	attrs := map[string]string{
+		proto.XAttrKeyOSSAccelS3Key:    normalizeOssAccelKey(ev.Key),
+		proto.XAttrKeyOSSAccelChecksum: checksum,
+		proto.XAttrKeyOSSAccelSize:     strconv.FormatUint(ev.Size, 10),
+		proto.XAttrKeyOSSAccelState:    proto.ColdStateClean,
+	}
+	if serr := mw.BatchSetXAttr_ll(ino, attrs); serr != nil {
+		return false, fmt.Errorf("set oss-accel xattr err: %v (ino %v already flipped cold but missing xattr — needs manual xattr repair, not a leaked inode)", serr, ino)
+	}
+	return true, nil
+}
+
+// loadOssAccelChangelogCursor reads the volume's changelog read position
+// (oss-accel.changelog.cursor on RootIno), defaulting to 0 when unset or
+// unparsable — never a hard error, since a corrupt/missing cursor just means
+// "start from the beginning," which is safe: materialization is idempotent
+// via the Lookup_ll dedup check in materializeOssAccelChangelogEvent.
+func loadOssAccelChangelogCursor(mw *meta.MetaWrapper) uint64 {
+	xattrs, err := mw.BatchGetXAttr([]uint64{proto.RootIno}, []string{proto.XAttrKeyOSSAccelChangelogCursor})
+	if err != nil || len(xattrs) == 0 {
+		return 0
+	}
+	raw := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelChangelogCursor]
+	if raw == "" {
+		return 0
+	}
+	cursor, perr := strconv.ParseUint(raw, 10, 64)
+	if perr != nil {
+		return 0
+	}
+	return cursor
+}
+
+// saveOssAccelChangelogCursor persists the volume's changelog read position.
+func saveOssAccelChangelogCursor(mw *meta.MetaWrapper, cursor uint64) error {
+	return mw.BatchSetXAttr_ll(proto.RootIno, map[string]string{
+		proto.XAttrKeyOSSAccelChangelogCursor: strconv.FormatUint(cursor, 10),
+	})
 }
 
 // parseUintForm parses an optional uint64 form value, returning def when absent/empty.

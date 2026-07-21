@@ -63,6 +63,16 @@ const (
 // reference.
 const XAttrKeyOSSAccelBackendConfig = "oss-accel.backend"
 
+// XAttrKeyOSSAccelChangelogCursor is the M2 (reverse acceleration) changelog
+// read position, stored on the VOLUME ROOT inode alongside
+// XAttrKeyOSSAccelBackendConfig. Value is a decimal uint64 byte offset into
+// the volume's external changelog object (see lcnode/oss_accel.go
+// httpServiceOssAccelChangelogSync) — "how far the mover has read", not an
+// authoritative record of what's been materialized (that's derivable from
+// the CubeFS namespace itself via idempotent Lookup_ll checks), so a lost or
+// reset cursor causes at most reprocessing, never corruption.
+const XAttrKeyOSSAccelChangelogCursor = "oss-accel.changelog.cursor"
+
 // OSSAccelBackendConfig is the JSON shape stored at XAttrKeyOSSAccelBackendConfig.
 // Every field mirrors the corresponding OSS_ACCEL_S3_* env var; AccessKeyEnv/
 // SecretKeyEnv name the environment variables the mover reads for credentials
