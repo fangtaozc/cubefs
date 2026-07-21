@@ -718,57 +718,80 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 	}
 	prefix := r.FormValue("prefix")
 	changelogKey := r.FormValue("changelogKey")
-	if changelogKey == "" {
-		changelogKey = defaultOssAccelChangelogKey
+
+	processed, skipped, failed, cursor, newCursor, err := l.runOssAccelChangelogSync(vol, prefix, changelogKey)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
+	fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v->%v processed=%v skipped=%v failed=%v\n",
+		vol, effectiveOssAccelChangelogKey(changelogKey), cursor, newCursor, processed, skipped, failed)
+}
+
+// effectiveOssAccelChangelogKey applies the same "" -> default substitution
+// runOssAccelChangelogSync does internally, purely so callers that already
+// have the resolved value for logging/response purposes don't have to
+// duplicate the constant.
+func effectiveOssAccelChangelogKey(changelogKey string) string {
+	if changelogKey == "" {
+		return defaultOssAccelChangelogKey
+	}
+	return changelogKey
+}
+
+// runOssAccelChangelogSync is the shared core behind both the manual
+// GET /ossAccelChangelogSync debug endpoint and the master-scheduled
+// AdminTask path (opOssAccelChangelogSync, OpLcNodeOssAccelChangelogSync —
+// M2 production automation, see docs/plan/cubefs-oss-accel-m2-design.md
+// and the master-side OSSAccelChangelogRuleManager). See the former
+// httpServiceOssAccelChangelogSync doc comment (still applies verbatim):
+// Range-GETs the volume's external changelog NDJSON object from the
+// persisted cursor, materializes a cold placeholder inode per complete new
+// line (DEC-M2-2 + DEC-M2-3 recursive mkdir), and persists the new cursor.
+// A trailing incomplete line is left unconsumed; a failing line halts
+// cursor advancement (not processing of later lines) — see the design
+// doc's §3 step 5d / §5 for the accepted tradeoffs.
+func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string) (processed, skipped, failed int, cursor, newCursor uint64, err error) {
+	changelogKey = effectiveOssAccelChangelogKey(changelogKey)
 
 	metaWrapper, err := l.buildVolMetaWrapper(vol)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return 0, 0, 0, 0, 0, err
 	}
 	defer metaWrapper.Close()
 
 	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		return 0, 0, 0, 0, 0, err
 	}
 	s3Backend, err := s3.New(s3Cfg)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
-		return
+		return 0, 0, 0, 0, 0, fmt.Errorf("s3 backend init err: %v", err)
 	}
 	defer s3Backend.Close()
 
-	cursor := loadOssAccelChangelogCursor(metaWrapper)
+	cursor = loadOssAccelChangelogCursor(metaWrapper)
+	newCursor = cursor
 
 	ctx := context.Background()
 	changelogSize, _, _, headErr := s3Backend.Head(ctx, changelogKey)
 	if headErr != nil {
-		http.Error(w, fmt.Sprintf("s3 head changelog(%v) err: %v", changelogKey, headErr), http.StatusInternalServerError)
-		return
+		return 0, 0, 0, cursor, cursor, fmt.Errorf("s3 head changelog(%v) err: %v", changelogKey, headErr)
 	}
 	if uint64(changelogSize) <= cursor {
-		fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v changelogSize=%v processed=0 skipped=0 failed=0 (no new events)\n",
-			vol, changelogKey, cursor, changelogSize)
-		return
+		return 0, 0, 0, cursor, cursor, nil // no new events
 	}
 
 	body, getErr := s3Backend.Get(ctx, changelogKey, int64(cursor), 0)
 	if getErr != nil {
-		http.Error(w, fmt.Sprintf("s3 get changelog(%v) from offset(%v) err: %v", changelogKey, cursor, getErr), http.StatusInternalServerError)
-		return
+		return 0, 0, 0, cursor, cursor, fmt.Errorf("s3 get changelog(%v) from offset(%v) err: %v", changelogKey, cursor, getErr)
 	}
 	raw, readErr := io.ReadAll(body)
 	body.Close()
 	if readErr != nil {
-		http.Error(w, fmt.Sprintf("read changelog body err: %v", readErr), http.StatusInternalServerError)
-		return
+		return 0, 0, 0, cursor, cursor, fmt.Errorf("read changelog body err: %v", readErr)
 	}
 
-	var processed, skipped, failed int
-	newCursor := cursor
 	firstFailureOffset := -1 // -1 = no failure yet; else byte offset (within raw) of the first failing line
 	lineStart := 0
 	for i, b := range raw {
@@ -788,7 +811,7 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 		}
 		var ev ossAccelChangelogEvent
 		if jerr := json.Unmarshal(line, &ev); jerr != nil {
-			log.LogErrorf("ossAccelChangelogSync: vol(%v) bad changelog line at byte(%v): %v", vol, cursor+uint64(thisLineStart), jerr)
+			log.LogErrorf("runOssAccelChangelogSync: vol(%v) bad changelog line at byte(%v): %v", vol, cursor+uint64(thisLineStart), jerr)
 			failed++
 			if firstFailureOffset < 0 {
 				firstFailureOffset = thisLineStart
@@ -803,7 +826,7 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 		}
 		created, merr := materializeOssAccelChangelogEvent(metaWrapper, ev)
 		if merr != nil {
-			log.LogErrorf("ossAccelChangelogSync: vol(%v) key(%v) materialize err: %v", vol, ev.Key, merr)
+			log.LogErrorf("runOssAccelChangelogSync: vol(%v) key(%v) materialize err: %v", vol, ev.Key, merr)
 			failed++
 			if firstFailureOffset < 0 {
 				firstFailureOffset = thisLineStart
@@ -822,15 +845,13 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 
 	if newCursor != cursor {
 		if serr := saveOssAccelChangelogCursor(metaWrapper, newCursor); serr != nil {
-			http.Error(w, fmt.Sprintf("persist changelog cursor err: %v", serr), http.StatusInternalServerError)
-			return
+			return processed, skipped, failed, cursor, cursor, fmt.Errorf("persist changelog cursor err: %v", serr)
 		}
 	}
 
-	log.LogInfof("ossAccelChangelogSync: vol(%v) changelogKey(%v) cursor %v->%v processed(%v) skipped(%v) failed(%v)",
+	log.LogInfof("runOssAccelChangelogSync: vol(%v) changelogKey(%v) cursor %v->%v processed(%v) skipped(%v) failed(%v)",
 		vol, changelogKey, cursor, newCursor, processed, skipped, failed)
-	fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v->%v processed=%v skipped=%v failed=%v\n",
-		vol, changelogKey, cursor, newCursor, processed, skipped, failed)
+	return processed, skipped, failed, cursor, newCursor, nil
 }
 
 // ensureOssAccelParentDir walks key's path segments (all but the last) from

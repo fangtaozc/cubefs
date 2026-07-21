@@ -137,6 +137,11 @@ const (
 	OpLcNodeHeartbeat      uint8 = 0x55
 	OpLcNodeScan           uint8 = 0x56
 	OpLcNodeSnapshotVerDel uint8 = 0x5B
+	// OpLcNodeOssAccelChangelogSync: master-scheduled production automation
+	// for M2's changelog sync (replaces the manual-curl-only trigger from
+	// the first vertical slice). Dispatched via the same AdminTask/
+	// TaskManager mechanism as OpLcNodeScan, not a new HTTP call path.
+	OpLcNodeOssAccelChangelogSync uint8 = 0x5C
 
 	// backUp
 	OpBatchLockNormalExtent   uint8 = 0x57
@@ -751,6 +756,8 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpLcNodeHeartbeat"
 	case OpLcNodeScan:
 		m = "OpLcNodeScan"
+	case OpLcNodeOssAccelChangelogSync:
+		m = "OpLcNodeOssAccelChangelogSync"
 	case OpLcNodeSnapshotVerDel:
 		m = "OpLcNodeSnapshotVerDel"
 	case OpSyncNodeHeartbeat:

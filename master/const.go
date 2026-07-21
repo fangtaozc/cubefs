@@ -355,6 +355,13 @@ const (
 
 	opSyncAddFlashManualTask    uint32 = 0x72
 	opSyncDeleteFlashManualTask uint32 = 0x73
+
+	// M2 oss-accel changelog rule persistence (0x74-0x76 sit in an unused
+	// gap before the syncnode/syncRule/benchRule block at 0x80-0x88 — see
+	// master/oss_accel_changelog_rule_store.go).
+	opSyncAddOSSAccelChangelogRule    uint32 = 0x74
+	opSyncDeleteOSSAccelChangelogRule uint32 = 0x75
+	opSyncUpdateOSSAccelChangelogRule uint32 = 0x76
 )
 
 func init() {
@@ -425,6 +432,10 @@ func init() {
 
 		opSyncS3QosSet,
 		opSyncS3QosDelete,
+
+		opSyncAddOSSAccelChangelogRule,
+		opSyncDeleteOSSAccelChangelogRule,
+		opSyncUpdateOSSAccelChangelogRule,
 	} {
 		if _, in := set[op]; in {
 			panic(op)

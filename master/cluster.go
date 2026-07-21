@@ -226,6 +226,18 @@ type Cluster struct {
 	// Register/Unregister without nil checks).
 	syncRuleMgr *SyncRuleManager
 
+	// ossAccelChangelogRuleCache is the master's in-memory view of every
+	// persisted M2 oss-accel changelog rule (one per volume). Mirrors
+	// syncRuleCache's lifecycle: reads are lock-free, writes go through
+	// c.SetOSSAccelChangelogRule (raft) then update the cache. Reset on
+	// leader switch by master_manager's loadMetadata.
+	ossAccelChangelogRuleCache *OSSAccelChangelogRuleCache
+
+	// ossAccelChangelogRuleMgr is the master-side ticker + AdminTask
+	// dispatch engine for oss-accel changelog rules. Start/Stop driven by
+	// raft leader gain/loss in master_manager.go, mirroring syncRuleMgr.
+	ossAccelChangelogRuleMgr *OSSAccelChangelogRuleManager
+
 	// syncTaskLedger is the bounded LRU view of task ownership +
 	// terminal status, used by /syncTask/* and /syncNode/tasks (P2-4).
 	// Populated by Dispatch / DispatchN on send and by
@@ -547,6 +559,8 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.syncFanout = NewSyncFanout(c.syncDispatcher)
 	c.syncRuleCache = NewSyncRuleCache()
 	c.syncRuleMgr = NewSyncRuleManager(c)
+	c.ossAccelChangelogRuleCache = NewOSSAccelChangelogRuleCache()
+	c.ossAccelChangelogRuleMgr = NewOSSAccelChangelogRuleManager(c)
 	c.syncTaskLedger = NewSyncTaskLedger(SyncTaskLedgerCap)
 	c.benchRuleStore = NewBenchRuleStore()
 	c.benchRuleStore.BindCluster(c)

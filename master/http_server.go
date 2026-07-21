@@ -503,6 +503,19 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.AdminLcNode).
 		HandlerFunc(m.adminLcNode)
 
+	// M2 oss-accel changelog rule (one schedule per volume) — plain
+	// auth, no requireSyncAdminToken, matching SetBucketLifecycle's
+	// granularity/auth model above rather than SyncRule's.
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelChangelogRuleSet).
+		HandlerFunc(m.setOSSAccelChangelogRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelChangelogRuleGet).
+		HandlerFunc(m.getOSSAccelChangelogRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelChangelogRuleDelete).
+		HandlerFunc(m.deleteOSSAccelChangelogRule)
+
 	// syncnode management APIs — gated by the shared admin token
 	// middleware (SEC1). Empty token disables the check, preserving
 	// dev/test defaults.

@@ -274,6 +274,14 @@ const (
 	SyncRuleGet     = "/syncRule/get"     // GET  ?id=
 	SyncRuleTrigger = "/syncRule/trigger" // POST ?id=  — synchronous fire (ops + tests)
 
+	// OSSAccelChangelogRule: per-volume M2 changelog sync schedule (one
+	// rule per vol, mirrors SetBucketLifecycle's granularity — no
+	// separate ID/List/Pause/Resume surface). Body / query params
+	// documented in master/api_service_oss_accel_changelog_rule.go.
+	OSSAccelChangelogRuleSet    = "/ossAccelChangelogRule/set"    // POST body: proto.OSSAccelChangelogRule
+	OSSAccelChangelogRuleGet    = "/ossAccelChangelogRule/get"    // GET  ?name=<vol>
+	OSSAccelChangelogRuleDelete = "/ossAccelChangelogRule/delete" // POST ?name=<vol>
+
 	// SyncTask observability + lifecycle. Master-side ledger answers
 	// list / get; cancel + retry hit the dispatch layer.
 	SyncTaskList   = "/syncTask/list"   // GET  [?status=&ruleID=&owner=]

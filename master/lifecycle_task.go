@@ -52,6 +52,9 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 	case proto.OpLcNodeSnapshotVerDel:
 		response := task.Response.(*proto.SnapshotVerDelTaskResponse)
 		err = c.handleLcNodeSnapshotScanResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelChangelogSync:
+		response := task.Response.(*proto.OSSAccelChangelogSyncTaskResponse)
+		err = c.handleLcNodeOssAccelChangelogSyncResp(task.OperatorAddr, response)
 	default:
 		err = fmt.Errorf(fmt.Sprintf("lc unknown operate code %v", task.OpCode))
 		goto errHandler
@@ -64,6 +67,37 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 
 errHandler:
 	log.LogWarnf("lc handleLcNodeTaskResponse failed, task: %v, err: %v", task.ToString(), err)
+}
+
+// handleLcNodeOssAccelChangelogSyncResp records the real outcome of a
+// dispatched changelog sync task, overwriting the optimistic LastRunAt
+// stamp fireRule set at dispatch time (oss_accel_changelog_rule_manager.go)
+// with the actual result. A rule that's been deleted/disabled between
+// dispatch and response is a normal race, not an error — just drop the
+// report.
+func (c *Cluster) handleLcNodeOssAccelChangelogSyncResp(nodeAddr string, resp *proto.OSSAccelChangelogSyncTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelChangelogRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelChangelogSyncResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: processed=%v skipped=%v failed=%v cursor=%v", resp.Processed, resp.Skipped, resp.Failed, resp.Cursor)
+	}
+	if err := c.syncUpdateOSSAccelChangelogRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelChangelogSyncResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelChangelogRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelChangelogSyncResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
 }
 
 func (c *Cluster) handleLcNodeHeartbeatResp(nodeAddr string, resp *proto.LcNodeHeartbeatResponse) (err error) {

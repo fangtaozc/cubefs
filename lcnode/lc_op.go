@@ -189,6 +189,63 @@ func (l *LcNode) opSnapshotVerDel(conn net.Conn, p *proto.Packet) (err error) {
 	return
 }
 
+// opOssAccelChangelogSync handles OpLcNodeOssAccelChangelogSync — the
+// master-scheduled AdminTask counterpart to the manual
+// GET /ossAccelChangelogSync debug endpoint (M2 production automation,
+// see docs/plan/cubefs-oss-accel-m2-design.md and
+// master/oss_accel_changelog_rule_manager.go). Unlike opLcScan's
+// long-running, cancellable LcScanner, a changelog sync task completes in a
+// single call (one Range GET + a handful of Create_ll calls) — no scanner
+// registry needed, just run it synchronously in the ack goroutine and
+// respond, mirroring opLcScan's outer envelope only.
+func (l *LcNode) opOssAccelChangelogSync(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelChangelogSyncTaskRequest{}
+			resp      = &proto.OSSAccelChangelogSyncTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelChangelogSyncTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		processed, skipped, failed, _, cursor, runErr := l.runOssAccelChangelogSync(request.VolName, request.Prefix, request.ChangelogKey)
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.Processed = processed
+		resp.Skipped = skipped
+		resp.Failed = failed
+		resp.Cursor = cursor
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
 func responseAckOKToMaster(conn net.Conn, p *proto.Packet) {
 	go func() {
 		p.PacketOkReply()

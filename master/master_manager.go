@@ -90,6 +90,9 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.syncRuleMgr != nil {
 			m.cluster.syncRuleMgr.Start()
 		}
+		if m.cluster.ossAccelChangelogRuleMgr != nil {
+			m.cluster.ossAccelChangelogRuleMgr.Start()
+		}
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
@@ -109,6 +112,10 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.syncRuleMgr != nil {
 			m.cluster.syncRuleMgr.Stop()
 			m.cluster.syncRuleMgr = NewSyncRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelChangelogRuleMgr != nil {
+			m.cluster.ossAccelChangelogRuleMgr.Stop()
+			m.cluster.ossAccelChangelogRuleMgr = NewOSSAccelChangelogRuleManager(m.cluster)
 		}
 		m.metaReady = false
 		m.cluster.metaReady = false
@@ -318,6 +325,15 @@ func (m *Server) loadMetadata() {
 		panic(err)
 	}
 	log.LogInfof("action[loadSyncRules] end, loaded %d rule(s)", m.cluster.syncRuleCache.Len())
+
+	// M2: master owns the oss-accel changelog rule store (one rule per
+	// volume). Mirrors loadSyncRules' cold-start/leader-switch lifecycle.
+	log.LogInfo("action[loadOSSAccelChangelogRules] begin")
+	m.cluster.ossAccelChangelogRuleCache = NewOSSAccelChangelogRuleCache()
+	if err = m.cluster.loadOSSAccelChangelogRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelChangelogRules] end")
 
 	// Phase 1: bench rule master raft persistence.
 	// See docs/plan/master/bench-rule-persistence.md. benchRuleStore is
