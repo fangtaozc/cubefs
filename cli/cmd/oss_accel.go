@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"strings"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/master"
@@ -55,8 +56,90 @@ func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
 		Aliases: []string{"ossaccel"},
 	}
 	proto.InitBufferPool(32768)
-	cmd.AddCommand(newOssAccelBackendCmd(client))
+	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client))
 	return cmd
+}
+
+// M2/M3 收尾阶段 S: a way to actually SET the pin xattr the shared sweep
+// walker (lcnode/oss_accel_walk.go) already respects — without this, pin
+// would be a mechanism nothing could ever engage.
+func newOssAccelPinCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "pin [COMMAND]",
+		Short: "Pin/unpin a file to exclude it from oss-accel background sweeps (TTL cleanup, coldest-first eviction)",
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelPinSetCmd(client), newOssAccelPinUnsetCmd(client))
+	return cmd
+}
+
+// ossAccelResolvePath walks path (leading "/" optional) from the volume
+// root one segment at a time via Lookup_ll — mirrors
+// lcnode/oss_accel.go's ensureOssAccelParentDir, but resolving the FULL
+// path (including the leaf) since cfs-cli operates on an existing file, not
+// a to-be-created one.
+func ossAccelResolvePath(mw *meta.MetaWrapper, path string) (ino uint64, err error) {
+	ino = proto.RootIno
+	for _, seg := range strings.Split(strings.Trim(path, "/"), "/") {
+		if seg == "" {
+			continue
+		}
+		if ino, _, err = mw.Lookup_ll(ino, seg); err != nil {
+			return 0, err
+		}
+	}
+	return ino, nil
+}
+
+func newOssAccelPinSetCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "set [volname] [path]",
+		Short: "pin a file — excluded from TTL cleanup and coldest-first eviction",
+		Args:  cobra.MinimumNArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			setOssAccelPin(client, args[0], args[1], true)
+		},
+	}
+	return cmd
+}
+
+func newOssAccelPinUnsetCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "unset [volname] [path]",
+		Short: "unpin a file — resumes participating in background sweeps",
+		Args:  cobra.MinimumNArgs(2),
+		Run: func(cmd *cobra.Command, args []string) {
+			setOssAccelPin(client, args[0], args[1], false)
+		},
+	}
+	return cmd
+}
+
+func setOssAccelPin(client *master.MasterClient, volName, path string, pin bool) {
+	mw, err := newOssAccelVolMetaWrapper(client, volName)
+	if err != nil {
+		stdout("NewMetaWrapper failed: %v\n", err)
+		return
+	}
+	defer mw.Close()
+	ino, err := ossAccelResolvePath(mw, path)
+	if err != nil {
+		stdout("resolve path %q failed: %v\n", path, err)
+		return
+	}
+	if pin {
+		if err = mw.XAttrSet_ll(ino, []byte(proto.XAttrKeyOSSAccelPin), []byte("true")); err != nil {
+			stdout("pin failed: %v\n", err)
+			return
+		}
+		stdout("vol[%v] path[%v] (ino %v) pinned — excluded from oss-accel background sweeps\n", volName, path, ino)
+		return
+	}
+	if err = mw.XAttrDel_ll(ino, proto.XAttrKeyOSSAccelPin); err != nil {
+		stdout("unpin failed: %v\n", err)
+		return
+	}
+	stdout("vol[%v] path[%v] (ino %v) unpinned\n", volName, path, ino)
 }
 
 func newOssAccelBackendCmd(client *master.MasterClient) *cobra.Command {
