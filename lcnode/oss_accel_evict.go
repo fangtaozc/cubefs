@@ -17,12 +17,25 @@ package lcnode
 import (
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util/log"
 )
+
+// ossAccelEvictionBatchConcurrency bounds how many commit-cold calls the
+// sweep issues at once (阶段 T — "回收扫描不抢占带宽", user-confirmed
+// scope: no interactive/normal/bulk tiers, just cap the sweep's own
+// concurrency so it never competes hard with a client's concurrent,
+// unthrottled /ossAccelRecall). A plain semaphore (buffered channel) rather
+// than util/concurrent.KeyConcurrentLimit — that utility's Acquire is
+// reject-immediately (returns ErrLimit over the cap), which would need an
+// awkward retry/spin loop to turn into a wait-for-a-slot worker pool; a
+// channel is the idiomatic Go primitive for exactly this "at most N
+// in-flight" shape and needs no extra dependency, new or otherwise.
+const ossAccelEvictionBatchConcurrency = 4
 
 // M3 容量治理 — coldest-first eviction sweep (阶段 R). Dispatched via
 // OpLcNodeOssAccelEvict (opOssAccelEvict, lcnode/lc_op.go), master-scheduled
@@ -95,19 +108,46 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 		return candidates[i].lastRecall.Before(candidates[j].lastRecall)
 	})
 
-	for _, c := range candidates {
+	// Batches of up to ossAccelEvictionBatchConcurrency run concurrently
+	// (bounded — see the constant's doc comment); usage ratio is
+	// re-checked BETWEEN batches, not after every single eviction, so a
+	// batch can mildly overshoot lowWatermarkRatio but concurrency stays
+	// capped and the stop condition still gets checked often enough to
+	// matter (batch size 4, not "all candidates at once").
+	for start := 0; start < len(candidates); start += ossAccelEvictionBatchConcurrency {
 		if usageRatioAfter <= lowWatermarkRatio {
 			break
 		}
-		path := "/" + c.name // best-effort for audit logging; full path not tracked by the walker
-		if _, _, _, cerr := runOssAccelCommitCold(mw, c.ino, path, 0); cerr != nil {
-			log.LogWarnf("runOssAccelEvictionSweep: vol(%v) commit-cold ino(%v) name(%v) err: %v", vol, c.ino, c.name, cerr)
-			continue // one stuck candidate (e.g. lease still valid) shouldn't abort the whole sweep
+		end := start + ossAccelEvictionBatchConcurrency
+		if end > len(candidates) {
+			end = len(candidates)
 		}
-		evicted++
+		batch := candidates[start:end]
+
+		var wg sync.WaitGroup
+		results := make([]bool, len(batch))
+		for i, c := range batch {
+			wg.Add(1)
+			go func(i int, c ossAccelEvictCandidate) {
+				defer wg.Done()
+				path := "/" + c.name // best-effort for audit logging; full path not tracked by the walker
+				if _, _, _, cerr := runOssAccelCommitCold(mw, c.ino, path, 0); cerr != nil {
+					log.LogWarnf("runOssAccelEvictionSweep: vol(%v) commit-cold ino(%v) name(%v) err: %v", vol, c.ino, c.name, cerr)
+					return // one stuck candidate (e.g. lease still valid) shouldn't abort the whole sweep
+				}
+				results[i] = true
+			}(i, c)
+		}
+		wg.Wait()
+
+		for i, ok := range results {
+			if ok {
+				evicted++
+				log.LogInfof("runOssAccelEvictionSweep: vol(%v) evicted ino(%v) name(%v) lastRecall(%v)",
+					vol, batch[i].ino, batch[i].name, batch[i].lastRecall)
+			}
+		}
 		usageRatioAfter = ossAccelVolUsageRatio(mw)
-		log.LogInfof("runOssAccelEvictionSweep: vol(%v) evicted ino(%v) name(%v) lastRecall(%v) usageRatioAfter(%.4f)",
-			vol, c.ino, c.name, c.lastRecall, usageRatioAfter)
 	}
 	return considered, evicted, usageRatioAfter, nil
 }
