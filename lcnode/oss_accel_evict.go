@@ -56,6 +56,7 @@ const ossAccelEvictionBatchConcurrency = 4
 
 type ossAccelEvictCandidate struct {
 	parentIno  uint64
+	path       string
 	name       string
 	ino        uint64
 	lastRecall time.Time // zero value sorts first, see doc comment above
@@ -77,7 +78,7 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 	usageRatioAfter = ossAccelVolUsageRatio(mw)
 
 	var candidates []ossAccelEvictCandidate
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		if xattrs[proto.XAttrKeyOSSAccelPin] == "true" {
 			return nil
 		}
@@ -93,7 +94,7 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 				lastRecall = parsed
 			}
 		}
-		candidates = append(candidates, ossAccelEvictCandidate{parentIno: parentIno, name: name, ino: info.Inode, lastRecall: lastRecall})
+		candidates = append(candidates, ossAccelEvictCandidate{parentIno: parentIno, path: path, name: name, ino: info.Inode, lastRecall: lastRecall})
 		return nil
 	})
 	if werr != nil {
@@ -130,8 +131,7 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 			wg.Add(1)
 			go func(i int, c ossAccelEvictCandidate) {
 				defer wg.Done()
-				path := "/" + c.name // best-effort for audit logging; full path not tracked by the walker
-				if _, _, _, cerr := runOssAccelCommitCold(mw, c.ino, path, 0); cerr != nil {
+				if _, _, _, cerr := runOssAccelCommitCold(mw, c.ino, c.path, 0); cerr != nil {
 					log.LogWarnf("runOssAccelEvictionSweep: vol(%v) commit-cold ino(%v) name(%v) err: %v", vol, c.ino, c.name, cerr)
 					return // one stuck candidate (e.g. lease still valid) shouldn't abort the whole sweep
 				}

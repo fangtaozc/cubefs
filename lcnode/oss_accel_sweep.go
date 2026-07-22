@@ -49,7 +49,7 @@ func (l *LcNode) runOssAccelPlaceholderSweep(vol string, ttlSeconds uint32) (swe
 	defer mw.Close()
 
 	deadline := time.Now().Add(-time.Duration(ttlSeconds) * time.Second)
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		if os.FileMode(info.Mode).IsDir() {
 			return nil
 		}
@@ -65,7 +65,6 @@ func (l *LcNode) runOssAccelPlaceholderSweep(vol string, ttlSeconds uint32) (swe
 		if info.CreateTime.After(deadline) {
 			return nil // not old enough yet
 		}
-		path := "/" + name // best-effort for audit logging; full path not tracked by the walker
 		if _, derr := mw.Delete_ll(parentIno, name, false, path); derr != nil {
 			log.LogErrorf("runOssAccelPlaceholderSweep: vol(%v) Delete_ll(%v,%v) err: %v", vol, parentIno, name, derr)
 			return nil // don't abort the whole sweep over one candidate

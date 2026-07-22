@@ -42,11 +42,14 @@ const ossAccelWalkPageSize = 1000
 
 // ossAccelWalkVisitor is called once per regular file encountered during the
 // walk, with its already-fetched xattrs (oss-accel-prefixed keys only — see
-// ossAccelWalkXAttrKeys). Returning a non-nil error aborts the walk entirely
-// (a single bad candidate shouldn't be allowed to silently swallow the rest
-// of the sweep, so callers should log-and-continue internally rather than
-// return an error for a single skippable candidate).
-type ossAccelWalkVisitor func(mw *meta.MetaWrapper, parentIno uint64, name string, info *proto.InodeInfo, xattrs map[string]string) error
+// ossAccelWalkXAttrKeys) and its full current path (e.g. "/ckpt/model.bin",
+// assembled from the walk's own directory recursion — cheap, since the walk
+// already knows every ancestor name it descended through). Returning a
+// non-nil error aborts the walk entirely (a single bad candidate shouldn't
+// be allowed to silently swallow the rest of the sweep, so callers should
+// log-and-continue internally rather than return an error for a single
+// skippable candidate).
+type ossAccelWalkVisitor func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error
 
 // ossAccelWalkXAttrKeys is the fixed set of xattrs fetched for every regular
 // file visited — covers every key any current or planned sweep consults
@@ -66,10 +69,10 @@ var ossAccelWalkXAttrKeys = []string{
 // sweep's own logging/counters see pinned files as "considered, excluded"
 // rather than the walker hiding them entirely).
 func walkOssAccelTree(mw *meta.MetaWrapper, visit ossAccelWalkVisitor) error {
-	return walkOssAccelDir(mw, proto.RootIno, visit)
+	return walkOssAccelDir(mw, proto.RootIno, "", visit)
 }
 
-func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, visit ossAccelWalkVisitor) error {
+func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, dirPath string, visit ossAccelWalkVisitor) error {
 	marker := ""
 	for {
 		children, err := mw.ReadDirLimit_ll(dirIno, marker, ossAccelWalkPageSize)
@@ -87,8 +90,9 @@ func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, visit ossAccelWalkVisi
 		}
 
 		for _, child := range children {
+			childPath := dirPath + "/" + child.Name
 			if os.FileMode(child.Type).IsDir() {
-				if werr := walkOssAccelDir(mw, child.Inode, visit); werr != nil {
+				if werr := walkOssAccelDir(mw, child.Inode, childPath, visit); werr != nil {
 					return werr
 				}
 				continue
@@ -102,7 +106,7 @@ func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, visit ossAccelWalkVisi
 			if xerr == nil && len(xattrs) > 0 {
 				attrs = xattrs[0].XAttrs
 			}
-			if verr := visit(mw, dirIno, child.Name, info, attrs); verr != nil {
+			if verr := visit(mw, dirIno, childPath, child.Name, info, attrs); verr != nil {
 				return verr
 			}
 		}

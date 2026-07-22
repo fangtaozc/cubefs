@@ -1029,31 +1029,44 @@ func (l *LcNode) httpServiceOssAccelRelocate(w http.ResponseWriter, r *http.Requ
 	}
 	defer s3Backend.Close()
 
-	ctx := context.Background()
-	// Fail-closed conflict check: refuse rather than silently overwriting
-	// whatever is already at newKey (could be an unrelated object from a
-	// different source, or a stale leftover from a previous relocate
-	// attempt for a DIFFERENT inode) — matches this project's standing
-	// discipline of never clobbering silently.
-	if _, _, _, herr := s3Backend.Head(ctx, newKey); herr == nil {
-		http.Error(w, fmt.Sprintf("relocate target key(%v) already exists in S3 — refusing to overwrite", newKey), http.StatusConflict)
-		return
-	} else if herr != backend.ErrKeyNotFound {
-		http.Error(w, fmt.Sprintf("s3 head newKey err: %v", herr), http.StatusInternalServerError)
-		return
-	}
-
-	if rerr := s3Backend.Rename(ctx, oldKey, newKey); rerr != nil {
-		http.Error(w, fmt.Sprintf("s3 rename %v -> %v err: %v", oldKey, newKey, rerr), http.StatusInternalServerError)
-		return
-	}
-	if serr := metaWrapper.BatchSetXAttr_ll(ino, map[string]string{proto.XAttrKeyOSSAccelS3Key: newKey}); serr != nil {
-		http.Error(w, fmt.Sprintf("s3 object relocated (%v -> %v) but xattr update failed: %v — needs manual xattr repair, object is NOT lost", oldKey, newKey, serr), http.StatusInternalServerError)
+	if rerr := runOssAccelRelocate(context.Background(), metaWrapper, s3Backend, ino, oldKey, newKey); rerr != nil {
+		if errors.Is(rerr, errOssAccelRelocateConflict) {
+			http.Error(w, rerr.Error(), http.StatusConflict)
+			return
+		}
+		http.Error(w, rerr.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	log.LogInfof("ossAccelRelocate success: vol(%v) ino(%v) %v -> %v", vol, ino, oldKey, newKey)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v relocated %v -> %v\n", vol, ino, oldKey, newKey)
+}
+
+// errOssAccelRelocateConflict indicates the target key already exists in S3 —
+// relocate refuses rather than silently overwriting whatever is already
+// there (could be an unrelated object from a different source, or a stale
+// leftover from a previous relocate attempt for a DIFFERENT inode).
+var errOssAccelRelocateConflict = errors.New("oss-accel: relocate target key already exists in S3")
+
+// runOssAccelRelocate moves the S3 object backing ino from oldKey to newKey
+// and updates the oss-accel.s3key xattr to match. Fail-closed (returns
+// errOssAccelRelocateConflict) rather than clobbering an existing object at
+// newKey. Shared by the manual /ossAccelRelocate endpoint and the audit's
+// Direction C rename-drift auto-detect (runOssAccelAudit).
+func runOssAccelRelocate(ctx context.Context, metaWrapper *meta.MetaWrapper, s3Backend backend.Backend, ino uint64, oldKey, newKey string) error {
+	if _, _, _, herr := s3Backend.Head(ctx, newKey); herr == nil {
+		return fmt.Errorf("%w: key(%v)", errOssAccelRelocateConflict, newKey)
+	} else if herr != backend.ErrKeyNotFound {
+		return fmt.Errorf("s3 head newKey err: %v", herr)
+	}
+
+	if rerr := s3Backend.Rename(ctx, oldKey, newKey); rerr != nil {
+		return fmt.Errorf("s3 rename %v -> %v err: %v", oldKey, newKey, rerr)
+	}
+	if serr := metaWrapper.BatchSetXAttr_ll(ino, map[string]string{proto.XAttrKeyOSSAccelS3Key: newKey}); serr != nil {
+		return fmt.Errorf("s3 object relocated (%v -> %v) but xattr update failed: %v — needs manual xattr repair, object is NOT lost", oldKey, newKey, serr)
+	}
+	return nil
 }
 
 // effectiveOssAccelChangelogKey applies the same "" -> default substitution
