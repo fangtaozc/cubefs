@@ -83,6 +83,7 @@ func NewRootCmd(client *master.MasterClient) *CubeFSCmd {
 		newFlashNodeCmd(client),
 		newFlashGroupCmd(client),
 		newBalanceCmd(client),
+		newOssAccelCmd(client),
 	)
 	return cmd
 }
