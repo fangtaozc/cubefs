@@ -383,6 +383,31 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	defer metaWrapper.Close()
 	defer extentClient.Close()
 
+	// Per-(vol,ino) gate: two overlapping recall attempts for the SAME
+	// inode on THIS lcnode both doing an isMigration write is a real
+	// data-corruption hazard, not just wasted work — real-machine testing
+	// found HasMigrationEk with expiredTime==0 can't distinguish
+	// "genuinely orphaned" from "a concurrent write still in progress" (see
+	// the discard-orphaned-slot comment below), so a second attempt's
+	// discard can land mid-write and corrupt the first attempt's
+	// swapped-in bytes. Acquire before any I/O; a loser waits for the
+	// winner via the same waitForConcurrentRecallWinner poll already used
+	// for post-error races below, rather than racing a second write. This
+	// is process-local (not the distributed lock the design doc
+	// deliberately avoids) — it only covers requests landing on this one
+	// lcnode.
+	recallKey := vol + "/" + strconv.FormatUint(ino, 10)
+	if aerr := l.ossAccelRecallLimit.Acquire(recallKey, 1); aerr != nil {
+		log.LogInfof("httpServiceOssAccelRecall: vol(%v) ino(%v) another recall already in flight on this lcnode — waiting for it instead of racing a second migration-write", vol, ino)
+		if waitForConcurrentRecallWinner(metaWrapper, ino, vsc) {
+			fmt.Fprintf(w, "ok: vol=%v ino=%v wasCold=true (joined in-progress recall on this lcnode, no new write issued)\n", vol, ino)
+			return
+		}
+		http.Error(w, fmt.Sprintf("ino(%v) recall already in progress on this lcnode and did not reach storageClass(%v) within %v; retry", ino, vsc, concurrentRecallWaitBound), http.StatusTooEarly)
+		return
+	}
+	defer l.ossAccelRecallLimit.Release(recallKey)
+
 	// Per-vol backend override lives on this vol's own root inode, so the S3
 	// config can only be resolved once metaWrapper (above) exists.
 	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)

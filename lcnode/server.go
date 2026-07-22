@@ -31,6 +31,7 @@ import (
 	"github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/concurrent"
 	"github.com/cubefs/cubefs/util/config"
 	"github.com/cubefs/cubefs/util/errors"
 	"github.com/cubefs/cubefs/util/exporter"
@@ -55,12 +56,28 @@ type LcNode struct {
 	control          common.Control
 	lcScanners       map[string]*LcScanner
 	snapshotScanners map[string]*SnapshotScanner
+
+	// ossAccelRecallLimit: per-(vol,ino) limit=1 gate around the critical
+	// section of httpServiceOssAccelRecall (oss_accel.go). Two overlapping
+	// recall attempts for the SAME inode on THIS lcnode process both doing
+	// an isMigration write is a real data-corruption hazard, not just a
+	// wasted-retry one — real-machine testing found HasMigrationEk with
+	// expiredTime==0 can't distinguish "genuinely orphaned" from "a
+	// concurrent write still in progress", so a second attempt's discard
+	// can land mid-write and corrupt the first attempt's swapped-in bytes.
+	// This does NOT introduce the distributed lock the design doc
+	// deliberately avoids (see design doc) — it's process-local, only
+	// covers requests landing on this one lcnode, and a loser still falls
+	// back to the existing waitForConcurrentRecallWinner poll rather than
+	// blocking indefinitely.
+	ossAccelRecallLimit *concurrent.KeyConcurrentLimit
 }
 
 func NewServer() *LcNode {
 	return &LcNode{
-		lcScanners:       make(map[string]*LcScanner),
-		snapshotScanners: make(map[string]*SnapshotScanner),
+		lcScanners:          make(map[string]*LcScanner),
+		snapshotScanners:    make(map[string]*SnapshotScanner),
+		ossAccelRecallLimit: concurrent.NewLimit(),
 	}
 }
 
