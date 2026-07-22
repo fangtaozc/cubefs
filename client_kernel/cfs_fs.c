@@ -282,11 +282,19 @@ static int cfs_inode_refresh(struct cfs_inode *ci)
 	 * invalidate_mapping_pages 只清非 dirty page,本地未回写 dirty 不丢。 */
 	{
 		struct timespec64 cur_mtime = inode_get_mtime(inode);
+		u32 old_storage_class = ci->storage_class;
 
+		/* recall(冷热翻转)在 metanode 侧不更新 mtime/generation(对比
+		 * fsmAppendExtents 会更新),故 mtime/size 判据对 recall 永远判 false
+		 * ——漏判会导致同节点 rename+recall 后立即读命中 stale page cache。
+		 * storage_class 翻转是 recall 唯一必然变化的字段,补上作为第三个判据。
+		 * 必须在 cfs_inode_refresh_unlock 无条件覆盖 ci->storage_class 之前
+		 * 取旧值,否则这里永远读到"新值"、判据形同虚设。 */
 		data_changed = S_ISREG(inode->i_mode) &&
 			       (timespec64_compare(&cur_mtime,
 						   &iinfo->modify_time) != 0 ||
-				i_size_read(inode) != (loff_t)iinfo->size);
+				i_size_read(inode) != (loff_t)iinfo->size ||
+				old_storage_class != iinfo->storage_class);
 	}
 	cfs_inode_refresh_unlock(ci, iinfo);
 	update_iattr_cache(ci);
