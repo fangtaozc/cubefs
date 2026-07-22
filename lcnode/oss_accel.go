@@ -569,6 +569,22 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	isCold := before.StorageClass == proto.StorageClass_BlobStore
+	if isCold {
+		// AUDIT-1 marks a confirmed-dangling s3key ColdStateError before this
+		// handler ever runs. Without this check the code below still tries
+		// the recall: S3 Get fails fast, but then — because it can't tell
+		// "genuinely broken" apart from "lost a race with a concurrent
+		// winner" — it falls into waitForConcurrentRecallWinner and burns the
+		// full concurrentRecallWaitBound (4 minutes) before finally
+		// surfacing the same error. That defeats the "distinguishable
+		// errno, not a hang" contract ColdStateError exists for, so a
+		// confirmed-dangling reference must fail immediately, before any of
+		// that machinery runs.
+		if stateAttr, serr := metaWrapper.XAttrGet_ll(ino, proto.XAttrKeyOSSAccelState); serr == nil && stateAttr.XAttrs[proto.XAttrKeyOSSAccelState] == proto.ColdStateError {
+			http.Error(w, fmt.Sprintf("ino(%v) cold data confirmed unrecoverable by a prior audit (dangling S3 reference) — not retryable without manual repair", ino), http.StatusGone)
+			return
+		}
+	}
 	if isCold && before.HasMigrationEk {
 		if before.MigrationExtentKeyExpiredTime.After(time.Now()) {
 			// Legitimate staged old-data still within its grace period (commit-cold's

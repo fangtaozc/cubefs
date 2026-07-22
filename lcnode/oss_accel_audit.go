@@ -95,22 +95,29 @@ func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request
 	}
 	defer s3Backend.Close()
 
-	danglingCount, orphanCount, quarantinedCount, err := runOssAccelAudit(metaWrapper, s3Backend, prefix, time.Duration(graceHours)*time.Hour)
+	result, err := runOssAccelAudit(metaWrapper, s3Backend, prefix, time.Duration(graceHours)*time.Hour)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v orphansConsidered=%v quarantined=%v\n",
-		vol, prefix, danglingCount, orphanCount, quarantinedCount)
+	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v orphansConsidered=%v quarantined=%v\ndanglingKeys=%v\nquarantinedKeys=%v\n",
+		vol, prefix, len(result.DanglingKeys), len(result.OrphanCandidateKeys), len(result.QuarantinedKeys),
+		result.DanglingKeys, result.QuarantinedKeys)
+}
+
+// ossAccelAuditResult carries not just counts but the actual affected keys —
+// an operator (or a caller cleaning up after a mis-scoped run, as real-
+// machine testing needed to do once) needs to know WHICH files, not just
+// how many.
+type ossAccelAuditResult struct {
+	DanglingKeys        []string
+	OrphanCandidateKeys []string
+	QuarantinedKeys     []string
 }
 
 // runOssAccelAudit does the single tree-walk + single bucket-list pass
-// described in the package doc comment above. Returns counts for both
-// directions: dangling references found+marked, orphan candidates
-// considered (i.e. past the grace period), and how many of those were
-// actually quarantined (a candidate can fail to quarantine — e.g. a
-// concurrent relocate already moved it — without aborting the whole audit).
-func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix string, orphanGrace time.Duration) (dangling, orphanCandidates, quarantined int, err error) {
+// described in the package doc comment above.
+func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix string, orphanGrace time.Duration) (result ossAccelAuditResult, err error) {
 	knownKeys := make(map[string]struct{})
 	// inode/name pairs whose s3key needs an existence check — collected
 	// during the walk, resolved against s3Keys after the bucket listing
@@ -123,7 +130,15 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 
 	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]
-		if s3key == "" {
+		if s3key == "" || !strings.HasPrefix(s3key, prefix) {
+			// The prefix scopes BOTH sides of the diff — a file whose
+			// s3key falls outside prefix is invisible to the S3 List call
+			// below too, so it must also be excluded here. Checking only
+			// the List side while walking the WHOLE tree regardless of
+			// prefix would make every cold file outside prefix look
+			// "missing" (its real key is never enumerated) — real-machine
+			// testing caught exactly this as a mass false-positive on the
+			// first version of this function.
 			return nil
 		}
 		knownKeys[s3key] = struct{}{}
@@ -133,18 +148,18 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 		return nil
 	})
 	if werr != nil {
-		return 0, 0, 0, fmt.Errorf("tree walk err: %v", werr)
+		return result, fmt.Errorf("tree walk err: %v", werr)
 	}
 
 	ctx := context.Background()
 	ch, lerr := s3Backend.List(ctx, prefix, true)
 	if lerr != nil {
-		return 0, 0, 0, fmt.Errorf("s3 list err: %v", lerr)
+		return result, fmt.Errorf("s3 list err: %v", lerr)
 	}
 	s3Keys := make(map[string]time.Time)
 	for entry := range ch {
 		if entry.Err != nil {
-			return 0, 0, 0, fmt.Errorf("s3 list entry err: %v", entry.Err)
+			return result, fmt.Errorf("s3 list entry err: %v", entry.Err)
 		}
 		if entry.IsDir || strings.HasPrefix(entry.Key, ossAccelTrashPrefix) || entry.Key == defaultOssAccelChangelogKey {
 			continue
@@ -157,7 +172,7 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 		if _, ok := s3Keys[c.s3key]; ok {
 			continue
 		}
-		dangling++
+		result.DanglingKeys = append(result.DanglingKeys, c.s3key)
 		log.LogErrorf("runOssAccelAudit: dangling reference ino(%v) s3key(%v) — object missing in S3, marking ColdStateError", c.ino, c.s3key)
 		if serr := mw.BatchSetXAttr_ll(c.ino, map[string]string{proto.XAttrKeyOSSAccelState: proto.ColdStateError}); serr != nil {
 			log.LogWarnf("runOssAccelAudit: ino(%v) failed to mark ColdStateError: %v", c.ino, serr)
@@ -173,15 +188,15 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 		if now.Sub(mtime) < orphanGrace {
 			continue // too fresh — may just not be consumed via changelog yet
 		}
-		orphanCandidates++
+		result.OrphanCandidateKeys = append(result.OrphanCandidateKeys, key)
 		trashKey := ossAccelTrashPrefix + key
 		if rerr := s3Backend.Rename(ctx, key, trashKey); rerr != nil {
 			log.LogWarnf("runOssAccelAudit: failed to quarantine orphan key(%v) -> %v: %v", key, trashKey, rerr)
 			continue
 		}
-		quarantined++
+		result.QuarantinedKeys = append(result.QuarantinedKeys, key)
 		log.LogWarnf("runOssAccelAudit: quarantined orphan key(%v) -> %v (age %v, no CubeFS reference)", key, trashKey, now.Sub(mtime))
 	}
 
-	return dangling, orphanCandidates, quarantined, nil
+	return result, nil
 }
