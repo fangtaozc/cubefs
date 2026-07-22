@@ -1159,7 +1159,22 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 	}
 	// wal logs for UpdateExtentKeyAfterMigration is persisted, but return no leader later,
 	// and request is send to meta node by retry
-	if inoParm.StorageClass == req.StorageClass {
+	//
+	// oss-accel changelog overwrite refresh (M2 收尾阶段 L) is the one
+	// legitimate same-class request: re-committing an ALREADY-cold
+	// external reference with a new ExternalSize (the object at this
+	// path-key was overwritten with different content) targets the SAME
+	// BlobStore class it's already in, by design — that's not staleness,
+	// it's the intended shape of a refresh. Gated strictly on
+	// ColdBackendExternal (only ever set by oss-accel's own opcode, never
+	// the native migration path) + target==BlobStore, so this bypass can't
+	// affect the native "same class = stale retry" rejection this guard
+	// exists for. The FSM layer (fsmUpdateExtentKeyAfterMigrationImpl)
+	// further gates what actually happens once past this point — it only
+	// ever refreshes Size for this exact case, never touches real extent
+	// data.
+	sameClassOssAccelRefresh := req.ColdBackendExternal && proto.IsStorageClassBlobStore(req.StorageClass)
+	if inoParm.StorageClass == req.StorageClass && !sameClassOssAccelRefresh {
 		msg := fmt.Sprintf("mp(%v) inode(%v) storageClass(%v) is same with req, may be migrated before",
 			mp.config.PartitionId, inoParm.Inode, inoParm.StorageClass)
 		log.LogWarnf("action[UpdateExtentKeyAfterMigration] %v", msg)

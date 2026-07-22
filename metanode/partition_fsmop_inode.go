@@ -1050,6 +1050,34 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 	coldExternalToCold := allowEmptyColdTarget && proto.IsStorageClassBlobStore(inoParam.HybridCloudExtentsMigration.storageClass)
 	coldExternalFromCold := allowEmptyColdTarget && proto.IsStorageClassBlobStore(i.StorageClass)
 
+	// oss-accel M2 收尾阶段 L (changelog overwrite refresh): `i` is ALREADY
+	// the class this request targets (BlobStore), and both sides are, by
+	// construction, empty ObjExtents (external S3 backend — no real
+	// migration is happening here, just a Size bump for content that was
+	// overwritten at the same external path-key). Handled as an isolated,
+	// minimal update — Size only — and returns immediately, BEFORE any of
+	// the invariant checks or the swap logic below.
+	//
+	// This must NOT fall through into the generic swap logic: real-machine
+	// testing found that running the full swap for a no-op class
+	// transition (i.StorageClass == target) leaves
+	// HybridCloudExtentsMigration/mp.freeHybridList bookkeeping in a state
+	// that isn't itself wrong for THIS request, but corrupts what a
+	// SUBSEQUENT recall of the same inode expects — that recall's
+	// migration-write AppendExtentKey started failing with
+	// OpMismatchStorageClass every time, confirmed by direct
+	// reproduction. Isolating this to a pure Size assignment sidesteps the
+	// whole migration-slot state machine rather than trying to make the
+	// swap path tolerate a case it was never designed for.
+	if coldExternalToCold && proto.IsStorageClassBlobStore(i.StorageClass) {
+		if inoParam.Size > 0 && inoParam.Size != i.Size {
+			log.LogInfof("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) coldExternalToCold same-class size refresh %v->%v (external content overwritten, no real migration)",
+				mp.config.PartitionId, i.Inode, i.Size, inoParam.Size)
+			i.Size = inoParam.Size
+		}
+		return
+	}
+
 	// for empty file, HybridCloudExtents.sortedEks is nil and StorageClass_Unspecified
 	// but HybridCloudExtentsMigration.sortedEks for inoParam is always not nil.
 	// coldExternalFromCold hits this same shape (i is BlobStore => EmptyHybridExtents
@@ -1114,22 +1142,17 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 			inoObjExt := i.HybridCloudExtents.sortedEks.(*SortedObjExtents)
 			mObjExt := inoParam.HybridCloudExtentsMigration.sortedEks.(*SortedObjExtents)
 			if inoObjExt.Equals(mObjExt) {
-				// oss-accel M2 changelog overwrite: both sides are empty ObjExtents
-				// (external S3 backend, no native extent keys either way) so the
-				// generic "nothing changed" fast path below would normally apply —
-				// but the caller may be re-committing the SAME already-cold inode
-				// with a NEW ExternalSize (an external object at this path-key was
-				// overwritten with different-sized content). Guarded to
-				// coldExternalToCold (only ever set by oss-accel's own opcode) so
-				// this can't affect the native migration path or any real
-				// (non-empty) extent set — those still take the plain "same,
-				// no-op" return just below.
-				if coldExternalToCold && inoParam.Size > 0 && inoParam.Size != i.Size {
-					log.LogInfof("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) coldExternalToCold size refresh %v->%v (objExtents unchanged, external content overwritten)",
-						mp.config.PartitionId, i.Inode, i.Size, inoParam.Size)
-					i.Size = inoParam.Size
-					return
-				}
+				// NOTE: real-machine testing showed a same-class oss-accel
+				// overwrite refresh does NOT reach this branch in practice —
+				// inoParam is reconstructed from the wire-marshaled request,
+				// and an empty SortedObjExtents round-trips back as a nil
+				// interface, so the outer "sortedEks != nil" guard on this
+				// whole if-block is false for that case and control falls
+				// through to the swap logic below instead (which is where
+				// the actual coldExternalToCold Size-refresh guard lives —
+				// see its comment for the full explanation). Left as a
+				// harmless, correctly-scoped no-op here in case that
+				// marshal round-trip behavior ever changes.
 				log.LogInfof("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) and objExtents same with req",
 					mp.config.PartitionId, i.Inode, i.StorageClass)
 				return
@@ -1157,6 +1180,13 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 	// written to; it can never overwrite the size of a real, previously-written
 	// file (which always already has the correct size by the time it reaches
 	// this swap, same as every other oss-accel/native migration caller).
+	//
+	// A SAME-CLASS oss-accel re-commit (changelog overwrite refresh, M2 收尾
+	// 阶段 L) never reaches this swap at all — it's handled by an isolated,
+	// dedicated early-return higher up in this function precisely so it
+	// never touches this swap's migration-slot bookkeeping (real-machine
+	// testing found running this full swap for a no-op class transition
+	// corrupts state a SUBSEQUENT recall depends on).
 	if coldExternalToCold && i.Size == 0 && inoParam.Size > 0 {
 		i.Size = inoParam.Size
 	}
