@@ -741,6 +741,19 @@ func (mp *metaPartition) doBatchDeleteObjExtentsInEBS(allInodes []*Inode, isMigr
 }
 
 func (mp *metaPartition) deleteObjExtents(oeks []proto.ObjExtentKey) (err error) {
+	// oss-accel materializes StorageClass_BlobStore inodes with real
+	// ObjExtents always empty (the bytes live in an external S3 backend,
+	// not native EBS) on vols that were never provisioned for native
+	// BlobStore support — mp.blobClientWrapper is only initialized in
+	// onStart when the vol IS so provisioned (metanode/partition.go), so
+	// it's nil on an oss-accel-only vol. Nothing to delete either way when
+	// oeks is empty, so skip touching the (possibly nil) wrapper — this
+	// was previously an unconditional nil-pointer panic in
+	// getBlobStoreClient() that crash-looped every metanode processing
+	// oss-accel's free-list entries.
+	if len(oeks) == 0 {
+		return nil
+	}
 	var blobClient *blobstore.BlobStoreClient
 	var blobCreate bool
 	blobClient, blobCreate, err = mp.blobClientWrapper.getBlobStoreClient()
