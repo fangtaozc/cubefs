@@ -412,6 +412,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelAudit").
 		HandlerFunc(l.httpServiceOssAccelAudit)
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelTrashPurge").
+		HandlerFunc(l.httpServiceOssAccelTrashPurge)
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{
