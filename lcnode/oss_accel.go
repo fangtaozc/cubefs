@@ -719,7 +719,7 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 	prefix := r.FormValue("prefix")
 	changelogKey := r.FormValue("changelogKey")
 
-	processed, skipped, failed, cursor, newCursor, err := l.runOssAccelChangelogSync(vol, prefix, changelogKey)
+	processed, skipped, failed, cursor, newCursor, err := l.runOssAccelChangelogSync(vol, prefix, changelogKey, 0, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -751,7 +751,17 @@ func effectiveOssAccelChangelogKey(changelogKey string) string {
 // A trailing incomplete line is left unconsumed; a failing line halts
 // cursor advancement (not processing of later lines) — see the design
 // doc's §3 step 5d / §5 for the accepted tradeoffs.
-func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string) (processed, skipped, failed int, cursor, newCursor uint64, err error) {
+//
+// skipAfterFailures/consecutiveFailures implement the dead-letter/skip
+// mechanism (M2 收尾阶段 M): if skipAfterFailures>0 and
+// consecutiveFailures+1 >= skipAfterFailures, the first failing line this
+// run advances the cursor past itself instead of blocking it (logged
+// clearly) — the caller (master's OSSAccelChangelogRuleManager) is
+// responsible for tracking consecutiveFailures across runs (increment
+// when Failed>0, reset to 0 on a clean run) and passing the current value
+// back in. 0/0 (the manual HTTP endpoint's fixed arguments) preserves the
+// original never-skip behavior exactly.
+func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string, skipAfterFailures, consecutiveFailures uint32) (processed, skipped, failed int, cursor, newCursor uint64, err error) {
 	changelogKey = effectiveOssAccelChangelogKey(changelogKey)
 
 	metaWrapper, err := l.buildVolMetaWrapper(vol)
@@ -792,6 +802,14 @@ func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string) (pro
 		return 0, 0, 0, cursor, cursor, fmt.Errorf("read changelog body err: %v", readErr)
 	}
 
+	// deadLetterSkip: this volume's cursor has already been stuck on the
+	// same line for skipAfterFailures-1 prior runs — if THIS run's first
+	// failure lands on it too, advance past it instead of blocking again
+	// (M2 收尾阶段 M dead-letter/skip). Only ever applies to the first
+	// failure encountered this run (the one actually at the cursor);
+	// skipAfterFailures==0 (default) keeps this permanently false, so the
+	// original "never skip" behavior is unchanged byte-for-byte.
+	deadLetterSkip := skipAfterFailures > 0 && consecutiveFailures+1 >= skipAfterFailures
 	firstFailureOffset := -1 // -1 = no failure yet; else byte offset (within raw) of the first failing line
 	lineStart := 0
 	for i, b := range raw {
@@ -811,11 +829,17 @@ func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string) (pro
 		}
 		var ev ossAccelChangelogEvent
 		if jerr := json.Unmarshal(line, &ev); jerr != nil {
-			log.LogErrorf("runOssAccelChangelogSync: vol(%v) bad changelog line at byte(%v): %v", vol, cursor+uint64(thisLineStart), jerr)
 			failed++
 			if firstFailureOffset < 0 {
 				firstFailureOffset = thisLineStart
+				if deadLetterSkip {
+					log.LogErrorf("runOssAccelChangelogSync: vol(%v) SKIPPING persistently-failing changelog line at byte(%v) after %v consecutive failures: %v",
+						vol, cursor+uint64(thisLineStart), consecutiveFailures, jerr)
+					newCursor = cursor + uint64(lineEnd)
+					continue
+				}
 			}
+			log.LogErrorf("runOssAccelChangelogSync: vol(%v) bad changelog line at byte(%v): %v", vol, cursor+uint64(thisLineStart), jerr)
 			continue
 		}
 		if prefix != "" && !strings.HasPrefix(ev.Key, prefix) {
@@ -826,11 +850,17 @@ func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string) (pro
 		}
 		created, merr := materializeOssAccelChangelogEvent(metaWrapper, ev)
 		if merr != nil {
-			log.LogErrorf("runOssAccelChangelogSync: vol(%v) key(%v) materialize err: %v", vol, ev.Key, merr)
 			failed++
 			if firstFailureOffset < 0 {
 				firstFailureOffset = thisLineStart
+				if deadLetterSkip {
+					log.LogErrorf("runOssAccelChangelogSync: vol(%v) SKIPPING persistently-failing changelog line (key=%v) at byte(%v) after %v consecutive failures: %v",
+						vol, ev.Key, cursor+uint64(thisLineStart), consecutiveFailures, merr)
+					newCursor = cursor + uint64(lineEnd)
+					continue
+				}
 			}
+			log.LogErrorf("runOssAccelChangelogSync: vol(%v) key(%v) materialize err: %v", vol, ev.Key, merr)
 			continue
 		}
 		if created {
@@ -926,8 +956,8 @@ func materializeOssAccelChangelogEvent(mw *meta.MetaWrapper, ev ossAccelChangelo
 	if derr != nil {
 		return false, fmt.Errorf("ensureOssAccelParentDir err: %v", derr)
 	}
-	if _, _, lerr := mw.Lookup_ll(parentIno, leaf); lerr == nil {
-		return false, nil
+	if existingIno, _, lerr := mw.Lookup_ll(parentIno, leaf); lerr == nil {
+		return refreshOssAccelChangelogOverwrite(mw, existingIno, ev)
 	}
 
 	info, cerr := mw.Create_ll(parentIno, leaf, 0o644, 0, 0, nil, "/"+ev.Key, false)
@@ -952,6 +982,54 @@ func materializeOssAccelChangelogEvent(mw *meta.MetaWrapper, ev ossAccelChangelo
 	}
 	if serr := mw.BatchSetXAttr_ll(ino, attrs); serr != nil {
 		return false, fmt.Errorf("set oss-accel xattr err: %v (ino %v already flipped cold but missing xattr — needs manual xattr repair, not a leaked inode)", serr, ino)
+	}
+	return true, nil
+}
+
+// refreshOssAccelChangelogOverwrite handles a changelog event whose key
+// already has a materialized dentry (existingIno) — either a true idempotent
+// replay (checksum unchanged, no-op) or an external overwrite (the object at
+// this path-key was PUT again with different content) that needs its cold
+// reference (checksum/size) refreshed in place.
+//
+// Only refreshes when the existing inode is CURRENTLY an oss-accel cold
+// reference (StorageClass==BlobStore) — a changelog event whose key collides
+// with an unrelated hot/native file is left alone rather than stomped, since
+// the collision means something outside this sync's control already owns
+// that path.
+func refreshOssAccelChangelogOverwrite(mw *meta.MetaWrapper, existingIno uint64, ev ossAccelChangelogEvent) (created bool, err error) {
+	info, gerr := mw.InodeGet_ll(existingIno)
+	if gerr != nil || info == nil {
+		return false, fmt.Errorf("InodeGet_ll err: %v", gerr)
+	}
+	if info.StorageClass != proto.StorageClass_BlobStore {
+		return false, nil // not ours to touch — leave the existing file alone
+	}
+
+	newChecksum := ev.Checksum
+	if newChecksum != "" && !strings.HasPrefix(newChecksum, proto.ChecksumPrefixSHA256) {
+		newChecksum = proto.ChecksumPrefixSHA256 + newChecksum
+	}
+	xattrs, xerr := mw.BatchGetXAttr([]uint64{existingIno}, []string{proto.XAttrKeyOSSAccelChecksum})
+	if xerr == nil && len(xattrs) > 0 && xattrs[0].XAttrs[proto.XAttrKeyOSSAccelChecksum] == newChecksum {
+		return false, nil // idempotent replay — content unchanged since last sync
+	}
+
+	// Content changed (external overwrite): re-commit the same cold reference
+	// with the new size. Extents stay empty either way (external S3 backend);
+	// the metanode FSM's "already BlobStore, objExtents unchanged" fast path
+	// still refreshes Size when coldExternalToCold is set and Size differs
+	// (metanode/partition_fsmop_inode.go) — that's the only state this call
+	// actually needs to change here.
+	if uerr := mw.UpdateExtentKeyAfterMigration(existingIno, proto.StorageClass_BlobStore, nil, info.LeaseExpireTime, 0, "/"+ev.Key, true, ev.Size); uerr != nil {
+		return false, fmt.Errorf("UpdateExtentKeyAfterMigration (overwrite refresh) err: %v", uerr)
+	}
+	attrs := map[string]string{
+		proto.XAttrKeyOSSAccelChecksum: newChecksum,
+		proto.XAttrKeyOSSAccelSize:     strconv.FormatUint(ev.Size, 10),
+	}
+	if serr := mw.BatchSetXAttr_ll(existingIno, attrs); serr != nil {
+		return false, fmt.Errorf("set oss-accel xattr err (overwrite refresh): %v", serr)
 	}
 	return true, nil
 }

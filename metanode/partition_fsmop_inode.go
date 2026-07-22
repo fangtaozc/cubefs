@@ -1114,6 +1114,22 @@ func (mp *metaPartition) fsmUpdateExtentKeyAfterMigrationImpl(inoParam *Inode, a
 			inoObjExt := i.HybridCloudExtents.sortedEks.(*SortedObjExtents)
 			mObjExt := inoParam.HybridCloudExtentsMigration.sortedEks.(*SortedObjExtents)
 			if inoObjExt.Equals(mObjExt) {
+				// oss-accel M2 changelog overwrite: both sides are empty ObjExtents
+				// (external S3 backend, no native extent keys either way) so the
+				// generic "nothing changed" fast path below would normally apply —
+				// but the caller may be re-committing the SAME already-cold inode
+				// with a NEW ExternalSize (an external object at this path-key was
+				// overwritten with different-sized content). Guarded to
+				// coldExternalToCold (only ever set by oss-accel's own opcode) so
+				// this can't affect the native migration path or any real
+				// (non-empty) extent set — those still take the plain "same,
+				// no-op" return just below.
+				if coldExternalToCold && inoParam.Size > 0 && inoParam.Size != i.Size {
+					log.LogInfof("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) coldExternalToCold size refresh %v->%v (objExtents unchanged, external content overwritten)",
+						mp.config.PartitionId, i.Inode, i.Size, inoParam.Size)
+					i.Size = inoParam.Size
+					return
+				}
 				log.LogInfof("[fsmUpdateExtentKeyAfterMigration] mp(%v) inode(%v) storageClass(%v) and objExtents same with req",
 					mp.config.PartitionId, i.Inode, i.StorageClass)
 				return

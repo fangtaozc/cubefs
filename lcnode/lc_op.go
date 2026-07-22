@@ -227,7 +227,7 @@ func (l *LcNode) opOssAccelChangelogSync(conn net.Conn, p *proto.Packet) (err er
 		resp.LcNode = l.localServerAddr
 		resp.StartTime = &start
 
-		processed, skipped, failed, _, cursor, runErr := l.runOssAccelChangelogSync(request.VolName, request.Prefix, request.ChangelogKey)
+		processed, skipped, failed, _, cursor, runErr := l.runOssAccelChangelogSync(request.VolName, request.Prefix, request.ChangelogKey, request.SkipAfterFailures, request.ConsecutiveFailures)
 		end := time.Now()
 		resp.EndTime = &end
 		resp.Done = true

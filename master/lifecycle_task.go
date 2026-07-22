@@ -91,6 +91,16 @@ func (c *Cluster) handleLcNodeOssAccelChangelogSyncResp(nodeAddr string, resp *p
 	} else {
 		updated.LastRunResult = fmt.Sprintf("ok: processed=%v skipped=%v failed=%v cursor=%v", resp.Processed, resp.Skipped, resp.Failed, resp.Cursor)
 	}
+	// Dead-letter/skip bookkeeping (M2 收尾阶段 M): a clean run resets the
+	// streak; any failure (whether or not lcnode ended up skipping it this
+	// time — see runOssAccelChangelogSync) extends it, so the NEXT
+	// dispatch's ConsecutiveFailures correctly reflects "how many runs in a
+	// row has whatever's currently stuck at the cursor failed."
+	if resp.Failed > 0 {
+		updated.ConsecutiveFailures++
+	} else {
+		updated.ConsecutiveFailures = 0
+	}
 	if err := c.syncUpdateOSSAccelChangelogRule(&updated); err != nil {
 		log.LogWarnf("handleLcNodeOssAccelChangelogSyncResp: vol(%v) persist result err: %v", resp.VolName, err)
 		return err

@@ -78,8 +78,10 @@ func (m *Server) setOSSAccelChangelogRule(w http.ResponseWriter, r *http.Request
 		rule.CreatedAt = existing.CreatedAt
 		rule.LastRunAt = existing.LastRunAt
 		rule.LastRunResult = existing.LastRunResult
+		rule.ConsecutiveFailures = existing.ConsecutiveFailures
 	} else {
 		rule.CreatedAt = now
+		rule.ConsecutiveFailures = 0
 	}
 
 	if err = m.cluster.SetOSSAccelChangelogRule(rule); err != nil {

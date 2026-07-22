@@ -40,6 +40,17 @@ type OSSAccelChangelogRule struct {
 	UpdatedAt       time.Time `json:"updatedAt"`
 	LastRunAt       time.Time `json:"lastRunAt,omitempty"`
 	LastRunResult   string    `json:"lastRunResult,omitempty"`
+
+	// SkipAfterFailures: once the SAME stuck-at-cursor changelog line has
+	// failed this many consecutive sync runs, lcnode logs it and advances
+	// the cursor past it rather than blocking the volume's sync
+	// indefinitely (design doc §5's documented limitation). 0 (default)
+	// preserves the original behavior — never skip, wait for a manual fix.
+	SkipAfterFailures uint32 `json:"skipAfterFailures,omitempty"`
+	// ConsecutiveFailures is server-maintained: incremented whenever a run
+	// reports Failed>0, reset to 0 on a clean run. Not caller-settable via
+	// /set (silently preserved from the existing record, like LastRunAt).
+	ConsecutiveFailures uint32 `json:"consecutiveFailures,omitempty"`
 }
 
 // OSSAccelChangelogSyncTaskRequest is the AdminTask payload master sends to
@@ -48,11 +59,13 @@ type OSSAccelChangelogRule struct {
 // proto.RuleTask/proto.Rule — those model S3 lifecycle expiration policies,
 // a completely different shape.
 type OSSAccelChangelogSyncTaskRequest struct {
-	MasterAddr   string
-	LcNodeAddr   string
-	VolName      string
-	Prefix       string
-	ChangelogKey string
+	MasterAddr          string
+	LcNodeAddr          string
+	VolName             string
+	Prefix              string
+	ChangelogKey        string
+	SkipAfterFailures   uint32
+	ConsecutiveFailures uint32
 }
 
 // OSSAccelChangelogSyncTaskResponse is what lcnode reports back after
