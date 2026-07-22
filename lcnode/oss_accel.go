@@ -908,6 +908,113 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 		vol, effectiveOssAccelChangelogKey(changelogKey), cursor, newCursor, processed, skipped, failed, swept)
 }
 
+// httpServiceOssAccelRelocate handles GET /ossAccelRelocate?vol=&ino=&newPath=
+// M4 续 (relocate): a POSIX rename/mv on a cold (already tiered-out) file is a
+// pure CubeFS dentry-tree operation (sdk/meta Rename_ll) — it never touches
+// the inode's oss-accel xattrs, so the S3 object stays at the OLD path-key
+// while oss-accel.s3key/the actual POSIX path diverge. This is a manual
+// trigger (mirrors M1's httpServiceOssAccelFlush and M2's
+// httpServiceOssAccelChangelogSync, both manual-first before any scheduler
+// was layered on top) — automatic detection of "this cold file got renamed"
+// is a separate scanner (same class of work as the bidirectional consistency
+// audit), not built here.
+func (l *LcNode) httpServiceOssAccelRelocate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, fmt.Sprintf("ParseForm err: %v", err), http.StatusBadRequest)
+		return
+	}
+	vol := r.FormValue("vol")
+	newPath := r.FormValue("newPath")
+	if vol == "" || newPath == "" {
+		http.Error(w, "missing required form value: vol and newPath", http.StatusBadRequest)
+		return
+	}
+	var ino uint64
+	var err error
+	if ino, err = strconv.ParseUint(r.FormValue("ino"), 10, 64); err != nil {
+		http.Error(w, fmt.Sprintf("ParseUint ino err: %v", err), http.StatusBadRequest)
+		return
+	}
+	newKey := normalizeOssAccelKey(newPath)
+
+	metaWrapper, err := l.buildVolMetaWrapper(vol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer metaWrapper.Close()
+
+	info, gerr := metaWrapper.InodeGet_ll(ino)
+	if gerr != nil || info == nil {
+		http.Error(w, fmt.Sprintf("InodeGet_ll err: %v", gerr), http.StatusInternalServerError)
+		return
+	}
+	if info.StorageClass != proto.StorageClass_BlobStore {
+		// Hot file: never tiered out, nothing in S3 to relocate. CubeFS's
+		// native rename already fully handled this — no-op, not an error,
+		// so a caller doesn't need to pre-check cold/hot status itself.
+		fmt.Fprintf(w, "ok: vol=%v ino=%v not cold (StorageClass=%v) — nothing to relocate\n", vol, ino, info.StorageClass)
+		return
+	}
+	xattrs, xerr := metaWrapper.BatchGetXAttr([]uint64{ino}, []string{proto.XAttrKeyOSSAccelS3Key})
+	if xerr != nil || len(xattrs) == 0 {
+		http.Error(w, fmt.Sprintf("BatchGetXAttr err: %v", xerr), http.StatusInternalServerError)
+		return
+	}
+	oldKey := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelS3Key]
+	if oldKey == "" {
+		// Cold (BlobStore) but no s3key xattr recorded shouldn't happen in
+		// practice (every path that flips StorageClass to BlobStore also
+		// writes this xattr) — treat defensively as "nothing to relocate"
+		// rather than guessing at a key, matching the no-op-not-error
+		// stance above.
+		fmt.Fprintf(w, "ok: vol=%v ino=%v is cold but has no oss-accel.s3key xattr — nothing to relocate\n", vol, ino)
+		return
+	}
+	if oldKey == newKey {
+		fmt.Fprintf(w, "ok: vol=%v ino=%v oss-accel.s3key already %v — nothing to relocate\n", vol, ino, newKey)
+		return
+	}
+
+	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	s3Backend, err := s3.New(s3Cfg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer s3Backend.Close()
+
+	ctx := context.Background()
+	// Fail-closed conflict check: refuse rather than silently overwriting
+	// whatever is already at newKey (could be an unrelated object from a
+	// different source, or a stale leftover from a previous relocate
+	// attempt for a DIFFERENT inode) — matches this project's standing
+	// discipline of never clobbering silently.
+	if _, _, _, herr := s3Backend.Head(ctx, newKey); herr == nil {
+		http.Error(w, fmt.Sprintf("relocate target key(%v) already exists in S3 — refusing to overwrite", newKey), http.StatusConflict)
+		return
+	} else if herr != backend.ErrKeyNotFound {
+		http.Error(w, fmt.Sprintf("s3 head newKey err: %v", herr), http.StatusInternalServerError)
+		return
+	}
+
+	if rerr := s3Backend.Rename(ctx, oldKey, newKey); rerr != nil {
+		http.Error(w, fmt.Sprintf("s3 rename %v -> %v err: %v", oldKey, newKey, rerr), http.StatusInternalServerError)
+		return
+	}
+	if serr := metaWrapper.BatchSetXAttr_ll(ino, map[string]string{proto.XAttrKeyOSSAccelS3Key: newKey}); serr != nil {
+		http.Error(w, fmt.Sprintf("s3 object relocated (%v -> %v) but xattr update failed: %v — needs manual xattr repair, object is NOT lost", oldKey, newKey, serr), http.StatusInternalServerError)
+		return
+	}
+
+	log.LogInfof("ossAccelRelocate success: vol(%v) ino(%v) %v -> %v", vol, ino, oldKey, newKey)
+	fmt.Fprintf(w, "ok: vol=%v ino=%v relocated %v -> %v\n", vol, ino, oldKey, newKey)
+}
+
 // effectiveOssAccelChangelogKey applies the same "" -> default substitution
 // runOssAccelChangelogSync does internally, purely so callers that already
 // have the resolved value for logging/response purposes don't have to
