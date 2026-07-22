@@ -516,6 +516,18 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.OSSAccelChangelogRuleDelete).
 		HandlerFunc(m.deleteOSSAccelChangelogRule)
 
+	// M3 oss-accel eviction rule (one water-level schedule per volume) —
+	// same plain auth model as the changelog rule block above.
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelEvictionRuleSet).
+		HandlerFunc(m.setOSSAccelEvictionRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelEvictionRuleGet).
+		HandlerFunc(m.getOSSAccelEvictionRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelEvictionRuleDelete).
+		HandlerFunc(m.deleteOSSAccelEvictionRule)
+
 	// syncnode management APIs — gated by the shared admin token
 	// middleware (SEC1). Empty token disables the check, preserving
 	// dev/test defaults.

@@ -238,6 +238,11 @@ type Cluster struct {
 	// raft leader gain/loss in master_manager.go, mirroring syncRuleMgr.
 	ossAccelChangelogRuleMgr *OSSAccelChangelogRuleManager
 
+	// ossAccelEvictionRuleCache / ossAccelEvictionRuleMgr: M3 water-level
+	// eviction, same cache/manager split as the changelog rule pair above.
+	ossAccelEvictionRuleCache *OSSAccelEvictionRuleCache
+	ossAccelEvictionRuleMgr   *OSSAccelEvictionRuleManager
+
 	// syncTaskLedger is the bounded LRU view of task ownership +
 	// terminal status, used by /syncTask/* and /syncNode/tasks (P2-4).
 	// Populated by Dispatch / DispatchN on send and by
@@ -561,6 +566,8 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.syncRuleMgr = NewSyncRuleManager(c)
 	c.ossAccelChangelogRuleCache = NewOSSAccelChangelogRuleCache()
 	c.ossAccelChangelogRuleMgr = NewOSSAccelChangelogRuleManager(c)
+	c.ossAccelEvictionRuleCache = NewOSSAccelEvictionRuleCache()
+	c.ossAccelEvictionRuleMgr = NewOSSAccelEvictionRuleManager(c)
 	c.syncTaskLedger = NewSyncTaskLedger(SyncTaskLedgerCap)
 	c.benchRuleStore = NewBenchRuleStore()
 	c.benchRuleStore.BindCluster(c)

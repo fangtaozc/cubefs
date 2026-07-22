@@ -282,6 +282,13 @@ const (
 	OSSAccelChangelogRuleGet    = "/ossAccelChangelogRule/get"    // GET  ?name=<vol>
 	OSSAccelChangelogRuleDelete = "/ossAccelChangelogRule/delete" // POST ?name=<vol>
 
+	// OSSAccelEvictionRule: per-volume M3 water-level eviction schedule (one
+	// rule per vol, same granularity/auth model as OSSAccelChangelogRule).
+	// Body / query params documented in master/api_service_oss_accel_eviction_rule.go.
+	OSSAccelEvictionRuleSet    = "/ossAccelEvictionRule/set"    // POST body: proto.OSSAccelEvictionRule
+	OSSAccelEvictionRuleGet    = "/ossAccelEvictionRule/get"    // GET  ?name=<vol>
+	OSSAccelEvictionRuleDelete = "/ossAccelEvictionRule/delete" // POST ?name=<vol>
+
 	// SyncTask observability + lifecycle. Master-side ledger answers
 	// list / get; cancel + retry hit the dispatch layer.
 	SyncTaskList   = "/syncTask/list"   // GET  [?status=&ruleID=&owner=]

@@ -362,6 +362,12 @@ const (
 	opSyncAddOSSAccelChangelogRule    uint32 = 0x74
 	opSyncDeleteOSSAccelChangelogRule uint32 = 0x75
 	opSyncUpdateOSSAccelChangelogRule uint32 = 0x76
+
+	// M3 oss-accel eviction rule persistence (0x77-0x79, immediately after
+	// the changelog rule block above — see master/oss_accel_eviction_rule_store.go).
+	opSyncAddOSSAccelEvictionRule    uint32 = 0x77
+	opSyncDeleteOSSAccelEvictionRule uint32 = 0x78
+	opSyncUpdateOSSAccelEvictionRule uint32 = 0x79
 )
 
 func init() {
@@ -436,6 +442,10 @@ func init() {
 		opSyncAddOSSAccelChangelogRule,
 		opSyncDeleteOSSAccelChangelogRule,
 		opSyncUpdateOSSAccelChangelogRule,
+
+		opSyncAddOSSAccelEvictionRule,
+		opSyncDeleteOSSAccelEvictionRule,
+		opSyncUpdateOSSAccelEvictionRule,
 	} {
 		if _, in := set[op]; in {
 			panic(op)

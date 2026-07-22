@@ -76,6 +76,60 @@ type OSSAccelChangelogSyncTaskRequest struct {
 	PlaceholderTTLSeconds uint32
 }
 
+// M3 容量治理: master-persisted per-volume water-level eviction schedule.
+// Mirrors OSSAccelChangelogRule's shape/lifecycle exactly (one rule per
+// volume, same store/CRUD/manager pattern) — see
+// master/oss_accel_eviction_rule_store.go /
+// master/oss_accel_eviction_rule_manager.go.
+
+// OSSAccelEvictionRule is the master-persisted, per-volume coldest-first
+// eviction schedule. Trigger is a usage-ratio watermark crossing, not a
+// fixed interval (unlike OSSAccelChangelogRule) — see
+// OSSAccelEvictionRuleManager.
+type OSSAccelEvictionRule struct {
+	VolName            string    `json:"volName"`
+	HighWatermarkRatio float64   `json:"highWatermarkRatio"`
+	LowWatermarkRatio  float64   `json:"lowWatermarkRatio"`
+	Enabled            bool      `json:"enabled"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+	LastRunAt          time.Time `json:"lastRunAt,omitempty"`
+	LastRunResult      string    `json:"lastRunResult,omitempty"`
+	// EvictionInFlight is server-maintained: true from the moment a sweep
+	// is dispatched until its response lands, so the manager's tick doesn't
+	// pile up a second dispatch for a sweep that's still running (mirrors
+	// OSSAccelChangelogRuleManager's optimistic-LastRunAt throttle, but
+	// water-level triggering needs an explicit flag too since "usage still
+	// over the high watermark" would otherwise look identical to "haven't
+	// dispatched yet" on every tick). Not caller-settable via /set.
+	EvictionInFlight bool `json:"evictionInFlight,omitempty"`
+}
+
+// OSSAccelEvictionTaskRequest is the AdminTask payload for a dispatched
+// eviction sweep (OpLcNodeOssAccelEvict).
+type OSSAccelEvictionTaskRequest struct {
+	MasterAddr        string
+	LcNodeAddr        string
+	VolName           string
+	LowWatermarkRatio float64
+}
+
+// OSSAccelEvictionTaskResponse is what lcnode reports back after running an
+// eviction sweep — includes enough for master to decide whether another
+// round is needed (UsageRatioAfter) or whether reclamation is stuck
+// (CandidatesConsidered>0 but Evicted==0, e.g. everything pinned).
+type OSSAccelEvictionTaskResponse struct {
+	VolName              string
+	LcNode               string
+	StartTime            *time.Time
+	EndTime              *time.Time
+	Done                 bool
+	StartErr             string
+	CandidatesConsidered int
+	Evicted              int
+	UsageRatioAfter      float64
+}
+
 // OSSAccelChangelogSyncTaskResponse is what lcnode reports back after
 // running the task (mirrors LcNodeRuleTaskResponse's ack shape,
 // proto/lifecycle.go).

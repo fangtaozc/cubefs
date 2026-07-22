@@ -55,6 +55,9 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 	case proto.OpLcNodeOssAccelChangelogSync:
 		response := task.Response.(*proto.OSSAccelChangelogSyncTaskResponse)
 		err = c.handleLcNodeOssAccelChangelogSyncResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelEvict:
+		response := task.Response.(*proto.OSSAccelEvictionTaskResponse)
+		err = c.handleLcNodeOssAccelEvictResp(task.OperatorAddr, response)
 	default:
 		err = fmt.Errorf(fmt.Sprintf("lc unknown operate code %v", task.OpCode))
 		goto errHandler
@@ -107,6 +110,38 @@ func (c *Cluster) handleLcNodeOssAccelChangelogSyncResp(nodeAddr string, resp *p
 	}
 	c.ossAccelChangelogRuleCache.Put(&updated)
 	log.LogInfof("handleLcNodeOssAccelChangelogSyncResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
+}
+
+// handleLcNodeOssAccelEvictResp records the outcome of a dispatched
+// eviction sweep and clears EvictionInFlight so the next tick can dispatch
+// again if usage is still over the high watermark (mirrors
+// handleLcNodeOssAccelChangelogSyncResp's "rule deleted mid-flight is a
+// normal race, not an error" handling).
+func (c *Cluster) handleLcNodeOssAccelEvictResp(nodeAddr string, resp *proto.OSSAccelEvictionTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelEvictionRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelEvictResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.EvictionInFlight = false
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: considered=%v evicted=%v usageRatioAfter=%.4f",
+			resp.CandidatesConsidered, resp.Evicted, resp.UsageRatioAfter)
+	}
+	if err := c.syncUpdateOSSAccelEvictionRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelEvictResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelEvictionRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelEvictResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
 

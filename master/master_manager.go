@@ -93,6 +93,9 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelChangelogRuleMgr != nil {
 			m.cluster.ossAccelChangelogRuleMgr.Start()
 		}
+		if m.cluster.ossAccelEvictionRuleMgr != nil {
+			m.cluster.ossAccelEvictionRuleMgr.Start()
+		}
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
@@ -116,6 +119,10 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelChangelogRuleMgr != nil {
 			m.cluster.ossAccelChangelogRuleMgr.Stop()
 			m.cluster.ossAccelChangelogRuleMgr = NewOSSAccelChangelogRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelEvictionRuleMgr != nil {
+			m.cluster.ossAccelEvictionRuleMgr.Stop()
+			m.cluster.ossAccelEvictionRuleMgr = NewOSSAccelEvictionRuleManager(m.cluster)
 		}
 		m.metaReady = false
 		m.cluster.metaReady = false
@@ -334,6 +341,15 @@ func (m *Server) loadMetadata() {
 		panic(err)
 	}
 	log.LogInfo("action[loadOSSAccelChangelogRules] end")
+
+	// M3: master owns the oss-accel eviction rule store (one rule per
+	// volume). Mirrors loadOSSAccelChangelogRules' lifecycle.
+	log.LogInfo("action[loadOSSAccelEvictionRules] begin")
+	m.cluster.ossAccelEvictionRuleCache = NewOSSAccelEvictionRuleCache()
+	if err = m.cluster.loadOSSAccelEvictionRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelEvictionRules] end")
 
 	// Phase 1: bench rule master raft persistence.
 	// See docs/plan/master/bench-rule-persistence.md. benchRuleStore is

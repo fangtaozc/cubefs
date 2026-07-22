@@ -142,6 +142,10 @@ const (
 	// the first vertical slice). Dispatched via the same AdminTask/
 	// TaskManager mechanism as OpLcNodeScan, not a new HTTP call path.
 	OpLcNodeOssAccelChangelogSync uint8 = 0x5C
+	// OpLcNodeOssAccelEvict: master-scheduled M3 water-level coldest-first
+	// eviction sweep. Same AdminTask dispatch mechanism as
+	// OpLcNodeOssAccelChangelogSync, triggered by OSSAccelEvictionRuleManager.
+	OpLcNodeOssAccelEvict uint8 = 0x5D
 
 	// backUp
 	OpBatchLockNormalExtent   uint8 = 0x57
@@ -758,6 +762,8 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpLcNodeScan"
 	case OpLcNodeOssAccelChangelogSync:
 		m = "OpLcNodeOssAccelChangelogSync"
+	case OpLcNodeOssAccelEvict:
+		m = "OpLcNodeOssAccelEvict"
 	case OpLcNodeSnapshotVerDel:
 		m = "OpLcNodeSnapshotVerDel"
 	case OpSyncNodeHeartbeat:

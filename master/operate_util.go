@@ -141,6 +141,8 @@ func unmarshalTaskResponse(task *proto.AdminTask) (err error) {
 		response = &proto.SnapshotVerDelTaskResponse{}
 	case proto.OpLcNodeOssAccelChangelogSync:
 		response = &proto.OSSAccelChangelogSyncTaskResponse{}
+	case proto.OpLcNodeOssAccelEvict:
+		response = &proto.OSSAccelEvictionTaskResponse{}
 	case proto.OpFlashNodeHeartbeat:
 		response = &proto.FlashNodeHeartbeatResponse{}
 	case proto.OpFlashNodeScan:
