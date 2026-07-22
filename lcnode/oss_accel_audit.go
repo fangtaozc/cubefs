@@ -37,6 +37,7 @@ package lcnode
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -61,6 +62,31 @@ const ossAccelTrashPrefix = ".trash/"
 // audit (mirrors M1 flush / M2 changelog-sync / M4 relocate all being
 // manual-first), not a scheduled job with its own config surface yet.
 const ossAccelDefaultOrphanGraceHours = 24
+
+// ossAccelReservedS3Prefixes are S3 key prefixes known to belong to OTHER
+// systems sharing this bucket, never to oss-accel — Direction B's orphan
+// scan must never treat them as candidates. "No CubeFS inode references
+// this key" is true of literally everything outside oss-accel's own
+// namespace, not just genuine leaks; without this list, an audit call whose
+// prefix ends up too broad (or empty) can't tell the difference.
+//
+// Real-machine incident (2026-07-22): an unscoped audit run (prefix="")
+// quarantined 74 Terraform/OpenTofu remote-state files
+// (envs/<env>/<component>/terraform.tfstate) that share this bucket with
+// oss-accel's test data — restored by hand, but the underlying gap (no
+// notion of "this key belongs to someone else") needed closing here.
+var ossAccelReservedS3Prefixes = []string{
+	"envs/", // this repo's own Terraform/OpenTofu S3 remote-state layout (see cubefs-deploy/root.hcl)
+}
+
+func isOssAccelReservedS3Key(key string) bool {
+	for _, p := range ossAccelReservedS3Prefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // httpServiceOssAccelAudit handles GET /ossAccelAudit?vol=&prefix=&orphanGraceHours=
 func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request) {
@@ -100,9 +126,9 @@ func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v orphansConsidered=%v quarantined=%v\ndanglingKeys=%v\nquarantinedKeys=%v\n",
-		vol, prefix, len(result.DanglingKeys), len(result.OrphanCandidateKeys), len(result.QuarantinedKeys),
-		result.DanglingKeys, result.QuarantinedKeys)
+	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v orphansConsidered=%v quarantined=%v relocated=%v driftConflicts=%v\ndanglingKeys=%v\nquarantinedKeys=%v\nrelocatedKeys=%v\ndriftConflictKeys=%v\n",
+		vol, prefix, len(result.DanglingKeys), len(result.OrphanCandidateKeys), len(result.QuarantinedKeys), len(result.RelocatedKeys), len(result.DriftConflictKeys),
+		result.DanglingKeys, result.QuarantinedKeys, result.RelocatedKeys, result.DriftConflictKeys)
 }
 
 // ossAccelAuditResult carries not just counts but the actual affected keys —
@@ -113,11 +139,19 @@ type ossAccelAuditResult struct {
 	DanglingKeys        []string
 	OrphanCandidateKeys []string
 	QuarantinedKeys     []string
+	RelocatedKeys       []string
+	DriftConflictKeys   []string
 }
 
 // runOssAccelAudit does the single tree-walk + single bucket-list pass
-// described in the package doc comment above.
+// described in the package doc comment above. It also folds in a third
+// direction (Direction C) during the same tree-walk: a cold file's current
+// path no longer matching its oss-accel.s3key xattr means a POSIX rename
+// happened without going through the manual /ossAccelRelocate endpoint —
+// see runOssAccelRelocate's doc comment for why auto-fixing this is safe
+// (fail-closed conflict check, never overwrites).
 func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix string, orphanGrace time.Duration) (result ossAccelAuditResult, err error) {
+	ctx := context.Background()
 	knownKeys := make(map[string]struct{})
 	// inode/name pairs whose s3key needs an existence check — collected
 	// during the walk, resolved against s3Keys after the bucket listing
@@ -128,7 +162,7 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 	}
 	var toCheck []danglingCandidate
 
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]
 		if s3key == "" || !strings.HasPrefix(s3key, prefix) {
 			// The prefix scopes BOTH sides of the diff — a file whose
@@ -141,17 +175,52 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 			// first version of this function.
 			return nil
 		}
-		knownKeys[s3key] = struct{}{}
-		if info.StorageClass == proto.StorageClass_BlobStore {
-			toCheck = append(toCheck, danglingCandidate{ino: info.Inode, s3key: s3key})
+		if info.StorageClass != proto.StorageClass_BlobStore {
+			// Hot file, possibly carrying a stale s3key xattr from a prior
+			// cold period (now recalled) — still counts for Direction B's
+			// "is this key referenced by anything" check, but Direction C
+			// (rename-drift) only matters for currently-cold files: nothing
+			// reads via a hot file's xattr, so relocating it serves no
+			// purpose.
+			knownKeys[s3key] = struct{}{}
+			return nil
 		}
+
+		// Direction C: rename-drift auto-fix. Only within prefix on BOTH
+		// ends — a file renamed from inside prefix to outside it is out of
+		// this call's jurisdiction; leave it for whichever audit call
+		// covers the destination, don't let a side effect escape the
+		// caller-declared scope.
+		if expectedKey := normalizeOssAccelKey(path); expectedKey != s3key && strings.HasPrefix(expectedKey, prefix) {
+			switch rerr := runOssAccelRelocate(ctx, mw, s3Backend, info.Inode, s3key, expectedKey); {
+			case rerr == nil:
+				log.LogInfof("runOssAccelAudit: auto-relocated drifted key ino(%v) %v -> %v (path=%v)", info.Inode, s3key, expectedKey, path)
+				result.RelocatedKeys = append(result.RelocatedKeys, expectedKey)
+				// The old key no longer exists (Rename moved it) — Direction
+				// A's dangling-check below must use the NEW key for this
+				// candidate, or it would find the old key "missing" and
+				// wrongly flag a file this audit call just fixed.
+				s3key = expectedKey
+			case errors.Is(rerr, errOssAccelRelocateConflict):
+				result.DriftConflictKeys = append(result.DriftConflictKeys, s3key)
+				log.LogWarnf("runOssAccelAudit: drift target already occupied, not relocating ino(%v) %v -> %v: %v", info.Inode, s3key, expectedKey, rerr)
+			default:
+				// e.g. transient S3/network error, or oldKey itself already
+				// missing (genuinely dangling, not just drifted) — leave
+				// s3key unchanged and let Direction A's own existence check
+				// below make the call.
+				log.LogWarnf("runOssAccelAudit: drift relocate attempt failed ino(%v) %v -> %v: %v", info.Inode, s3key, expectedKey, rerr)
+			}
+		}
+
+		knownKeys[s3key] = struct{}{}
+		toCheck = append(toCheck, danglingCandidate{ino: info.Inode, s3key: s3key})
 		return nil
 	})
 	if werr != nil {
 		return result, fmt.Errorf("tree walk err: %v", werr)
 	}
 
-	ctx := context.Background()
 	ch, lerr := s3Backend.List(ctx, prefix, true)
 	if lerr != nil {
 		return result, fmt.Errorf("s3 list err: %v", lerr)
@@ -161,7 +230,7 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 		if entry.Err != nil {
 			return result, fmt.Errorf("s3 list entry err: %v", entry.Err)
 		}
-		if entry.IsDir || strings.HasPrefix(entry.Key, ossAccelTrashPrefix) || entry.Key == defaultOssAccelChangelogKey {
+		if entry.IsDir || strings.HasPrefix(entry.Key, ossAccelTrashPrefix) || entry.Key == defaultOssAccelChangelogKey || isOssAccelReservedS3Key(entry.Key) {
 			continue
 		}
 		s3Keys[entry.Key] = entry.Mtime
