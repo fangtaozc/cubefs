@@ -114,6 +114,16 @@ func (m *OSSAccelEvictionRuleManager) tick() {
 }
 
 // fireRule dispatches one eviction sweep for r's volume to a live lcnode.
+//
+// EvictionInFlight is flipped in the LOCAL CACHE first, before any dispatch
+// I/O — real-machine testing found the original order (dispatch, then
+// persist+cache) left a window where a sweep taking longer than one 10s
+// tick let a LATER tick still read EvictionInFlight=false (raft persist
+// hadn't landed / cache hadn't been updated yet) and fire a SECOND
+// dispatch to a different round-robin lcnode for the SAME rule, both
+// running the same sweep concurrently. The cache write is synchronous and
+// in-memory, so it's visible to the very next tick() regardless of how
+// long the raft persist or the dispatch call take.
 func (m *OSSAccelEvictionRuleManager) fireRule(r *proto.OSSAccelEvictionRule, usageRatio float64) {
 	nodeAddr := m.pickActiveLcNode()
 	if nodeAddr == "" {
@@ -125,6 +135,15 @@ func (m *OSSAccelEvictionRuleManager) fireRule(r *proto.OSSAccelEvictionRule, us
 		log.LogWarnf("OSSAccelEvictionRuleManager.fireRule: vol(%v) lcNode(%v) lookup err: %v", r.VolName, nodeAddr, err)
 		return
 	}
+
+	updated := *r
+	updated.EvictionInFlight = true
+	updated.LastRunAt = time.Now()
+	m.cluster.ossAccelEvictionRuleCache.Put(&updated)
+	if perr := m.cluster.syncUpdateOSSAccelEvictionRule(&updated); perr != nil {
+		log.LogWarnf("OSSAccelEvictionRuleManager.fireRule: vol(%v) persist EvictionInFlight err: %v", r.VolName, perr)
+	}
+
 	req := &proto.OSSAccelEvictionTaskRequest{
 		MasterAddr:        m.cluster.masterAddr(),
 		LcNodeAddr:        lcNode.Addr,
@@ -133,14 +152,6 @@ func (m *OSSAccelEvictionRuleManager) fireRule(r *proto.OSSAccelEvictionRule, us
 	}
 	task := proto.NewAdminTaskEx(proto.OpLcNodeOssAccelEvict, lcNode.Addr, req, r.VolName)
 	m.cluster.addLcNodeTasks([]*proto.AdminTask{task})
-
-	updated := *r
-	updated.EvictionInFlight = true
-	updated.LastRunAt = time.Now()
-	if perr := m.cluster.syncUpdateOSSAccelEvictionRule(&updated); perr != nil {
-		log.LogWarnf("OSSAccelEvictionRuleManager.fireRule: vol(%v) persist EvictionInFlight err: %v", r.VolName, perr)
-	}
-	m.cluster.ossAccelEvictionRuleCache.Put(&updated)
 	log.LogInfof("OSSAccelEvictionRuleManager.fireRule: vol(%v) usageRatio(%.4f) >= high(%.4f), dispatched to lcnode(%v)",
 		r.VolName, usageRatio, r.HighWatermarkRatio, nodeAddr)
 }
