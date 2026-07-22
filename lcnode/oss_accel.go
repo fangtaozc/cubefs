@@ -31,6 +31,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -501,6 +502,18 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// M3 coldest-first eviction recency signal (oss_accel_evict.go) — stamped
+	// on every successful recall regardless of wasCold (the isolated-recall
+	// test path targets an already-Replica inode, but stamping there too is
+	// harmless and keeps this a single unconditional line rather than two).
+	// Best-effort: a failed stamp doesn't fail the recall itself, since the
+	// bytes are already correctly in place by this point.
+	if serr := metaWrapper.BatchSetXAttr_ll(ino, map[string]string{
+		proto.XAttrKeyOSSAccelLastRecallTime: time.Now().Format(time.RFC3339),
+	}); serr != nil {
+		log.LogWarnf("ossAccelRecall: vol(%v) ino(%v) failed to stamp lastRecallTime: %v", vol, ino, serr)
+	}
+
 	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
 		vol, ino, off, s3key, got, isCold)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v wasCold=%v\n", vol, ino, off, s3key, got, isCold)
@@ -614,54 +627,71 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 		http.Error(w, fmt.Sprintf("ParseUint ino err: %v", err), http.StatusBadRequest)
 		return
 	}
-	_, vsc, asc, err := parseStorageClassForm(r)
-	if err != nil {
+	// sc/vsc/asc accepted (and validated) for URL-contract consistency with
+	// flush/recall, but not otherwise used: commit-cold's target class is
+	// always BlobStore (hardcoded below) — runOssAccelCommitCold needs only
+	// a MetaWrapper, no vsc/extentClient.
+	if _, _, _, err = parseStorageClassForm(r); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	delayDelMinute := parseUintForm(r, "delayDelMinute", 0)
 
-	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
+	metaWrapper, err := l.buildVolMetaWrapper(vol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	defer metaWrapper.Close()
-	defer extentClient.Close()
 
-	before, gerr := metaWrapper.InodeGet_ll(ino)
-	if gerr != nil || before == nil {
-		http.Error(w, fmt.Sprintf("InodeGet_ll err: %v", gerr), http.StatusInternalServerError)
+	beforeSC, afterSC, afterSize, cerr := runOssAccelCommitCold(metaWrapper, ino, path, delayDelMinute)
+	if cerr != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(cerr, errOssAccelLeaseNotExpired) {
+			status = http.StatusConflict
+		}
+		http.Error(w, cerr.Error(), status)
 		return
 	}
+
+	log.LogInfof("ossAccelCommitCold: vol(%v) ino(%v) storageClass %v->%v size(%v) grace(%vmin)",
+		vol, ino, beforeSC, afterSC, afterSize, delayDelMinute)
+	fmt.Fprintf(w, "ok: vol=%v ino=%v storageClass=%v->%v size=%v graceMinute=%v\n",
+		vol, ino, beforeSC, afterSC, afterSize, delayDelMinute)
+}
+
+// errOssAccelLeaseNotExpired distinguishes the "retry-able, file written
+// recently" case from a genuine internal error, so callers (the HTTP
+// handler above, the eviction sweep below) can map it to the right
+// response/behavior instead of treating every failure the same.
+var errOssAccelLeaseNotExpired = errors.New("migration lease not expired")
+
+// runOssAccelCommitCold flips ino to the cold (BlobStore) tier — the shared
+// core behind httpServiceOssAccelCommitCold and the M3 eviction sweep
+// (oss_accel_evict.go). vsc/extentClient are NOT needed here (unlike
+// flush/recall): commit-cold is a pure metadata operation
+// (UpdateExtentKeyAfterMigration), so this only needs a MetaWrapper.
+func runOssAccelCommitCold(mw *meta.MetaWrapper, ino uint64, path string, delayDelMinute uint64) (beforeSC, afterSC uint32, afterSize uint64, err error) {
+	before, gerr := mw.InodeGet_ll(ino)
+	if gerr != nil || before == nil {
+		return 0, 0, 0, fmt.Errorf("InodeGet_ll err: %v", gerr)
+	}
+	beforeSC = before.StorageClass
 	// Migration is forbidden while the write-migration lease is still valid (a file
-	// written within ForbiddenMigrationRenewalSeonds=3600s carries a lease). Refuse
-	// early with a clear message rather than a raw metanode 500, and pass the inode's
-	// current lease generation so the metanode generation check matches.
+	// written within ForbiddenMigrationRenewalSeonds=3600s carries a lease).
 	now := uint64(time.Now().Unix())
 	if before.LeaseExpireTime >= now {
-		http.Error(w, fmt.Sprintf("migration lease not expired: inode(%v) leaseExpireTime(%v) >= now(%v); file written recently, retry after ~%vs",
-			ino, before.LeaseExpireTime, now, before.LeaseExpireTime-now), http.StatusConflict)
-		return
+		return beforeSC, beforeSC, before.Size, fmt.Errorf("%w: inode(%v) leaseExpireTime(%v) >= now(%v); file written recently, retry after ~%vs",
+			errOssAccelLeaseNotExpired, ino, before.LeaseExpireTime, now, before.LeaseExpireTime-now)
 	}
-	if err = metaWrapper.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path, true, 0); err != nil {
-		http.Error(w, fmt.Sprintf("UpdateExtentKeyAfterMigration err: %v", err), http.StatusInternalServerError)
-		return
+	if uerr := mw.UpdateExtentKeyAfterMigration(ino, proto.StorageClass_BlobStore, nil, before.LeaseExpireTime, delayDelMinute, path, true, 0); uerr != nil {
+		return beforeSC, beforeSC, before.Size, fmt.Errorf("UpdateExtentKeyAfterMigration err: %v", uerr)
 	}
-	after, aerr := metaWrapper.InodeGet_ll(ino)
-
-	var beforeSC, afterSC, afterMig uint32
-	var afterSize uint64
-	if before != nil {
-		beforeSC = before.StorageClass
+	after, aerr := mw.InodeGet_ll(ino)
+	if aerr != nil || after == nil {
+		return beforeSC, proto.StorageClass_BlobStore, before.Size, nil // commit succeeded; post-read is best-effort
 	}
-	if aerr == nil && after != nil {
-		afterSC, afterMig, afterSize = after.StorageClass, after.MigrationStorageClass, after.Size
-	}
-	log.LogInfof("ossAccelCommitCold: vol(%v) ino(%v) storageClass %v->%v migrationSC(%v) size(%v) grace(%vmin)",
-		vol, ino, beforeSC, afterSC, afterMig, afterSize, delayDelMinute)
-	fmt.Fprintf(w, "ok: vol=%v ino=%v storageClass=%v->%v migrationStorageClass=%v size=%v graceMinute=%v\n",
-		vol, ino, beforeSC, afterSC, afterMig, afterSize, delayDelMinute)
+	return beforeSC, after.StorageClass, after.Size, nil
 }
 
 // defaultOssAccelChangelogKey is the well-known changelog object key used

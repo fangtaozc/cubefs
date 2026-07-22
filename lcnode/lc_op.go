@@ -257,6 +257,60 @@ func (l *LcNode) opOssAccelChangelogSync(conn net.Conn, p *proto.Packet) (err er
 	return
 }
 
+// opOssAccelEvict handles OpLcNodeOssAccelEvict — the M3 water-level
+// coldest-first eviction sweep AdminTask (see
+// master/oss_accel_eviction_rule_manager.go and
+// lcnode/oss_accel_evict.go runOssAccelEvictionSweep). Same envelope
+// shape as opOssAccelChangelogSync: synchronous, single-goroutine, no
+// scanner registry (a sweep completes in one call, no need for opLcScan's
+// long-running task tracking).
+func (l *LcNode) opOssAccelEvict(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelEvictionTaskRequest{}
+			resp      = &proto.OSSAccelEvictionTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelEvictionTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		considered, evicted, usageRatioAfter, runErr := l.runOssAccelEvictionSweep(request.VolName, request.LowWatermarkRatio)
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.CandidatesConsidered = considered
+		resp.Evicted = evicted
+		resp.UsageRatioAfter = usageRatioAfter
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
 func responseAckOKToMaster(conn net.Conn, p *proto.Packet) {
 	go func() {
 		p.PacketOkReply()
