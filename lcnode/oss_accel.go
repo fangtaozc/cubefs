@@ -358,20 +358,15 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 // read-modify-write on the SAME changelog object can lose one append. Not
 // serialized/locked in this round; revisit if it causes real data loss
 // rather than just a delayed/missed propagation.
-func appendOssAccelChangelogEvent(ctx context.Context, s3Backend backend.Backend, changelogKey, key string, size uint64, checksum string) error {
-	var existing []byte
-	body, gerr := s3Backend.Get(ctx, changelogKey, 0, 0)
-	if gerr == nil {
-		var rerr error
-		existing, rerr = io.ReadAll(body)
-		body.Close()
-		if rerr != nil {
-			return fmt.Errorf("read existing changelog err: %v", rerr)
-		}
-	} else if gerr != backend.ErrKeyNotFound {
-		return fmt.Errorf("get existing changelog err: %v", gerr)
-	}
+// appendOssAccelChangelogEventMaxRetries bounds the read-modify-write retry
+// loop below. Each retry means a genuinely concurrent writer won the race
+// (backend.ErrPreconditionFailed) — a normal, expected outcome under real
+// concurrent flushes, not a sign of a stuck/broken backend. Exhausting this
+// many retries means either pathological write contention or a backend
+// that's misbehaving; either way, surfacing an error beats retrying forever.
+const appendOssAccelChangelogEventMaxRetries = 5
 
+func appendOssAccelChangelogEvent(ctx context.Context, s3Backend backend.Backend, changelogKey, key string, size uint64, checksum string) error {
 	ev := ossAccelChangelogEvent{
 		Key:       key,
 		Size:      size,
@@ -382,11 +377,41 @@ func appendOssAccelChangelogEvent(ctx context.Context, s3Backend backend.Backend
 	if merr != nil {
 		return fmt.Errorf("marshal changelog event err: %v", merr)
 	}
-	newContent := append(existing, append(line, '\n')...)
-	if _, perr := s3Backend.Put(ctx, changelogKey, bytes.NewReader(newContent), int64(len(newContent)), backend.PutOptions{}); perr != nil {
-		return fmt.Errorf("put changelog err: %v", perr)
+
+	for attempt := 0; attempt < appendOssAccelChangelogEventMaxRetries; attempt++ {
+		var existing []byte
+		var putOpts backend.PutOptions
+		_, etag, _, headErr := s3Backend.Head(ctx, changelogKey)
+		switch {
+		case headErr == nil:
+			putOpts.IfMatch = etag
+			body, gerr := s3Backend.Get(ctx, changelogKey, 0, 0)
+			if gerr != nil {
+				return fmt.Errorf("get existing changelog err: %v", gerr)
+			}
+			existing, gerr = io.ReadAll(body)
+			body.Close()
+			if gerr != nil {
+				return fmt.Errorf("read existing changelog err: %v", gerr)
+			}
+		case headErr == backend.ErrKeyNotFound:
+			putOpts.IfNoneMatch = "*"
+		default:
+			return fmt.Errorf("head existing changelog err: %v", headErr)
+		}
+
+		newContent := append(existing, append(line, '\n')...)
+		if _, perr := s3Backend.Put(ctx, changelogKey, bytes.NewReader(newContent), int64(len(newContent)), putOpts); perr != nil {
+			if errors.Is(perr, backend.ErrPreconditionFailed) {
+				// Lost the race to a concurrent appender — retry from
+				// scratch; the next Head/Get sees the winner's content.
+				continue
+			}
+			return fmt.Errorf("put changelog err: %v", perr)
+		}
+		return nil
 	}
-	return nil
+	return fmt.Errorf("append changelog event: exhausted %d retries due to concurrent writers", appendOssAccelChangelogEventMaxRetries)
 }
 
 // buildVolMetaWrapper constructs a bare meta client for a volume, for

@@ -409,6 +409,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelRelocate").
 		HandlerFunc(l.httpServiceOssAccelRelocate)
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelAudit").
+		HandlerFunc(l.httpServiceOssAccelAudit)
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

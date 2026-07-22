@@ -108,7 +108,7 @@ type Backend interface {
 //   - local: syscall.Lstat + listxattr/getxattr
 //   - cfs:   mw.InodeGet + mw.XAttrList_ll/XAttrGet_ll
 //   - s3:    HeadObject → parse `x-amz-meta-syncnode-*` (with
-//            `x-amz-meta-*` rclone-naked fallback)
+//     `x-amz-meta-*` rclone-naked fallback)
 type Stater interface {
 	// Stat returns full metadata for key. Backends that don't natively
 	// support a field leave it at zero/nil; callers must tolerate
@@ -175,6 +175,18 @@ type PutOptions struct {
 	// and return it in PutResult. Object stores additionally persist it as user
 	// metadata (`x-amz-meta-syncnode-sha256`); POSIX backends just return the value.
 	ComputeChecksum bool
+
+	// IfMatch, when non-empty, makes the write conditional on the target
+	// key's CURRENT ETag matching this value (S3 `If-Match`) — the write
+	// fails (see IsPreconditionFailed) if the object changed since the
+	// caller last read it. IfNoneMatch, when set to "*", makes the write
+	// conditional on the key NOT EXISTING yet (S3 `If-None-Match: *`).
+	// Setting both is a caller error; leaving both empty (default)
+	// preserves unconditional-write behavior for every existing caller.
+	// Only s3 currently honors these (local/cfs backends ignore them —
+	// no known caller needs conditional writes there yet).
+	IfMatch     string
+	IfNoneMatch string
 
 	// Mtime, when non-nil, instructs the backend to persist this modification
 	// time on the written object so that subsequent List/Head returns the
@@ -345,6 +357,15 @@ var (
 	// ErrConfigInvalid is returned by a Backend constructor when the
 	// provided BackendConfig fails validation specific to that backend.
 	ErrConfigInvalid = errors.New("backend: invalid config")
+
+	// ErrPreconditionFailed is returned by Put when PutOptions.IfMatch or
+	// IfNoneMatch was set and the target key's current state didn't satisfy
+	// it (S3: HTTP 412) — i.e. a concurrent writer won the race. Callers
+	// that need atomic read-modify-write (e.g. oss-accel's changelog
+	// append, lcnode/oss_accel.go appendOssAccelChangelogEvent) retry the
+	// whole read-modify-write cycle on this error rather than treating it
+	// as a hard failure.
+	ErrPreconditionFailed = errors.New("backend: precondition failed")
 
 	// ErrMetadataTooLarge is returned by Put when the requested
 	// PutOptions.Metadata + PutOptions.Mtime/Mode/UID/GID/Xattrs encoding

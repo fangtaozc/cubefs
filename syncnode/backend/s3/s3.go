@@ -547,6 +547,12 @@ func (b *Backend) Put(ctx context.Context, key string, body io.Reader, size int6
 			Key:    aws.String(key),
 			Body:   bytes.NewReader(buf),
 		}
+		if opts.IfMatch != "" {
+			input.IfMatch = aws.String(opts.IfMatch)
+		}
+		if opts.IfNoneMatch != "" {
+			input.IfNoneMatch = aws.String(opts.IfNoneMatch)
+		}
 		if storageClass != "" {
 			input.StorageClass = s3types.StorageClass(storageClass)
 		}
@@ -567,6 +573,9 @@ func (b *Backend) Put(ctx context.Context, key string, body io.Reader, size int6
 		}
 		out, err := b.client.PutObject(ctx, input)
 		if err != nil {
+			if (opts.IfMatch != "" || opts.IfNoneMatch != "") && isPreconditionFailed(err) {
+				return backend.PutResult{}, fmt.Errorf("s3 PutObject %s/%s: %v: %w", b.bucket, key, err, backend.ErrPreconditionFailed)
+			}
 			return backend.PutResult{}, fmt.Errorf("s3 PutObject %s/%s: %w", b.bucket, key, err)
 		}
 		res := backend.PutResult{
@@ -1136,6 +1145,22 @@ func isNotFound(err error) bool {
 	}
 	var httpErr *smithyhttp.ResponseError
 	if errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusNotFound {
+		return true
+	}
+	return false
+}
+
+// isPreconditionFailed recognises a conditional-write rejection (IfMatch/
+// IfNoneMatch not satisfied). S3 returns this as plain HTTP 412 — there's no
+// typed SDK error for it the way NoSuchKey/NotFound exist for 404, so this
+// only has the generic smithyhttp.ResponseError status-code check (mirrors
+// isNotFound's fallback branch, same reasoning).
+func isPreconditionFailed(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *smithyhttp.ResponseError
+	if errors.As(err, &httpErr) && httpErr.HTTPStatusCode() == http.StatusPreconditionFailed {
 		return true
 	}
 	return false
