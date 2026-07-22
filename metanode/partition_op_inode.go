@@ -1187,18 +1187,27 @@ func (mp *metaPartition) UpdateExtentKeyAfterMigration(req *proto.UpdateExtentKe
 
 	if req.StorageClass == proto.StorageClass_BlobStore {
 		inoParm.HybridCloudExtentsMigration.sortedEks = NewSortedObjExtentsFromObjEks(req.NewObjExtentKeys)
-	} else if req.StorageClass == proto.StorageClass_Replica_HDD {
+	} else if proto.IsStorageClassReplica(req.StorageClass) {
+		// M4: generalized from a Replica_HDD-only check to any replica class
+		// (Replica_HDD or Replica_SSD) — an SSD-only cluster (e.g. test-hb)
+		// could never recall/migrate to its own native class before this,
+		// since req.StorageClass was compared against a hardcoded HDD
+		// constant rather than the actually-requested target class. Pre-
+		// existing gap in the native HybridCloud migration dispatch, found
+		// while testing M4's cross-cluster propagation against an SSD-only
+		// cluster — unrelated to oss-accel specifically, so fixed here at
+		// the root rather than worked around.
 		if oldIno.HybridCloudExtentsMigration.sortedEks == nil &&
 			oldIno.HybridCloudExtentsMigration.storageClass == proto.StorageClass_Unspecified {
 			log.LogDebugf("action[UpdateExtentKeyAfterMigration] inoParm %v has no migration data", inoParm.Inode)
 			inoParm.HybridCloudExtentsMigration.sortedEks = NewSortedExtents()
 		} else {
-			if oldIno.HybridCloudExtentsMigration.storageClass != proto.StorageClass_Replica_HDD {
+			if oldIno.HybridCloudExtentsMigration.storageClass != req.StorageClass {
 				err = fmt.Errorf("mp(%v) inode(%v) storageClass(%v) migrateStorageClass(%v): inode is migrating or migrated from (%v), can not migrate to %v",
 					mp.config.PartitionId, inoParm.Inode, proto.StorageClassString(inoParm.StorageClass),
 					proto.StorageClassString(oldIno.HybridCloudExtentsMigration.storageClass),
 					proto.StorageClassString(oldIno.HybridCloudExtentsMigration.storageClass),
-					proto.StorageClassString(proto.StorageClass_Replica_HDD))
+					proto.StorageClassString(req.StorageClass))
 				log.LogErrorf("action[UpdateExtentKeyAfterMigration] %v", err)
 				p.PacketErrorWithBody(proto.OpArgMismatchErr, []byte(err.Error()))
 				return
