@@ -239,6 +239,17 @@ func (l *LcNode) opOssAccelChangelogSync(conn net.Conn, p *proto.Packet) (err er
 			resp.StartErr = runErr.Error()
 		}
 
+		// Placeholder TTL sweep (M2 收尾阶段 N) piggybacks on this same
+		// dispatch rather than getting its own lcnode ticker — see
+		// runOssAccelPlaceholderSweep's doc comment. Runs regardless of
+		// runErr above (an unrelated changelog-sync failure shouldn't block
+		// reclaiming already-expired placeholders from earlier syncs).
+		if swept, sweepErr := l.runOssAccelPlaceholderSweep(request.VolName, request.PlaceholderTTLSeconds); sweepErr != nil {
+			log.LogErrorf("opOssAccelChangelogSync: vol(%v) placeholder sweep err: %v", request.VolName, sweepErr)
+		} else {
+			resp.Swept = swept
+		}
+
 		adminTask.Response = resp
 		l.respondToMaster(adminTask)
 	}()

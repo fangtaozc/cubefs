@@ -89,7 +89,7 @@ func (c *Cluster) handleLcNodeOssAccelChangelogSyncResp(nodeAddr string, resp *p
 	if resp.StartErr != "" {
 		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
 	} else {
-		updated.LastRunResult = fmt.Sprintf("ok: processed=%v skipped=%v failed=%v cursor=%v", resp.Processed, resp.Skipped, resp.Failed, resp.Cursor)
+		updated.LastRunResult = fmt.Sprintf("ok: processed=%v skipped=%v failed=%v cursor=%v swept=%v", resp.Processed, resp.Skipped, resp.Failed, resp.Cursor, resp.Swept)
 	}
 	// Dead-letter/skip bookkeeping (M2 收尾阶段 M): a clean run resets the
 	// streak; any failure (whether or not lcnode ended up skipping it this

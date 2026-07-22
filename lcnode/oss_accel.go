@@ -718,14 +718,23 @@ func (l *LcNode) httpServiceOssAccelChangelogSync(w http.ResponseWriter, r *http
 	}
 	prefix := r.FormValue("prefix")
 	changelogKey := r.FormValue("changelogKey")
+	// placeholderTTLSeconds: manual-trigger debug/ops convenience only —
+	// the production path is OSSAccelChangelogRule.PlaceholderTTLSeconds via
+	// the master-scheduled AdminTask (opOssAccelChangelogSync). Omitted (0)
+	// by default so hitting this endpoint never reclaims anything by surprise.
+	placeholderTTLSeconds := uint32(parseUintForm(r, "placeholderTTLSeconds", 0))
 
 	processed, skipped, failed, cursor, newCursor, err := l.runOssAccelChangelogSync(vol, prefix, changelogKey, 0, 0)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v->%v processed=%v skipped=%v failed=%v\n",
-		vol, effectiveOssAccelChangelogKey(changelogKey), cursor, newCursor, processed, skipped, failed)
+	swept, sweepErr := l.runOssAccelPlaceholderSweep(vol, placeholderTTLSeconds)
+	if sweepErr != nil {
+		log.LogErrorf("httpServiceOssAccelChangelogSync: vol(%v) placeholder sweep err: %v", vol, sweepErr)
+	}
+	fmt.Fprintf(w, "ok: vol=%v changelogKey=%v cursor=%v->%v processed=%v skipped=%v failed=%v swept=%v\n",
+		vol, effectiveOssAccelChangelogKey(changelogKey), cursor, newCursor, processed, skipped, failed, swept)
 }
 
 // effectiveOssAccelChangelogKey applies the same "" -> default substitution
@@ -978,7 +987,7 @@ func materializeOssAccelChangelogEvent(mw *meta.MetaWrapper, ev ossAccelChangelo
 		proto.XAttrKeyOSSAccelS3Key:    normalizeOssAccelKey(ev.Key),
 		proto.XAttrKeyOSSAccelChecksum: checksum,
 		proto.XAttrKeyOSSAccelSize:     strconv.FormatUint(ev.Size, 10),
-		proto.XAttrKeyOSSAccelState:    proto.ColdStateClean,
+		proto.XAttrKeyOSSAccelState:    proto.ColdStateMaterialized,
 	}
 	if serr := mw.BatchSetXAttr_ll(ino, attrs); serr != nil {
 		return false, fmt.Errorf("set oss-accel xattr err: %v (ino %v already flipped cold but missing xattr — needs manual xattr repair, not a leaked inode)", serr, ino)

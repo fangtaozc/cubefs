@@ -134,13 +134,14 @@ func (m *OSSAccelChangelogRuleManager) fireRule(r *proto.OSSAccelChangelogRule) 
 		return
 	}
 	req := &proto.OSSAccelChangelogSyncTaskRequest{
-		MasterAddr:          m.cluster.masterAddr(),
-		LcNodeAddr:          lcNode.Addr,
-		VolName:             r.VolName,
-		Prefix:              r.Prefix,
-		ChangelogKey:        r.ChangelogKey,
-		SkipAfterFailures:   r.SkipAfterFailures,
-		ConsecutiveFailures: r.ConsecutiveFailures,
+		MasterAddr:            m.cluster.masterAddr(),
+		LcNodeAddr:            lcNode.Addr,
+		VolName:               r.VolName,
+		Prefix:                r.Prefix,
+		ChangelogKey:          r.ChangelogKey,
+		SkipAfterFailures:     r.SkipAfterFailures,
+		ConsecutiveFailures:   r.ConsecutiveFailures,
+		PlaceholderTTLSeconds: r.PlaceholderTTLSeconds,
 	}
 	task := proto.NewAdminTaskEx(proto.OpLcNodeOssAccelChangelogSync, lcNode.Addr, req, r.VolName)
 	m.cluster.addLcNodeTasks([]*proto.AdminTask{task})

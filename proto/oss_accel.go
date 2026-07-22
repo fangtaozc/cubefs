@@ -117,4 +117,31 @@ const (
 	// ColdStateError: last recall failed; readers must return a distinguishable
 	// errno rather than zero-filled data.
 	ColdStateError = "error"
+	// ColdStateMaterialized: created by M2 changelog sync
+	// (lcnode/oss_accel.go materializeOssAccelChangelogEvent) as a
+	// never-written placeholder — distinct from ColdStateClean (M1's
+	// tier-out of a real, previously-hot file) so the M2 收尾 TTL sweep
+	// (lcnode/oss_accel_walk.go) can tell "unread placeholder, safe to
+	// reclaim" apart from "legitimately cold, native-tiered file" using the
+	// SAME xattr the mover already writes — no extra bookkeeping needed. A
+	// successful recall flips StorageClass away from BlobStore (M1's
+	// existing commit-hot path) without touching this xattr, so a
+	// materialized placeholder that HAS been read is excluded from the
+	// sweep automatically (its StorageClass no longer matches the sweep's
+	// filter) — it is never relabeled ColdStateClean.
+	ColdStateMaterialized = "materialized"
 )
+
+// XAttrKeyOSSAccelPin marks a file as excluded from any oss-accel background
+// sweep (M2 收尾 TTL cleanup, M3 coldest-first eviction) — value "true".
+// Checked by the shared walker (lcnode/oss_accel_walk.go) so every sweep
+// respects it uniformly; absent or any other value = not pinned.
+const XAttrKeyOSSAccelPin = "oss-accel.pin"
+
+// XAttrKeyOSSAccelLastRecallTime (M3, RFC3339) is stamped on a successful
+// recall (lcnode/oss_accel.go, commit-hot path) — the coldest-first eviction
+// sweep's recency signal. Deliberately independent of metanode's native
+// AccessTime, which requires a per-volume opt-in (EnablePersistAccessTime)
+// that isn't guaranteed on every volume; oss-accel keeps its own always-on
+// signal instead of depending on a setting it doesn't control.
+const XAttrKeyOSSAccelLastRecallTime = "oss-accel.lastRecallTime"

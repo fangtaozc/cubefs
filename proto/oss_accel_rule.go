@@ -51,6 +51,13 @@ type OSSAccelChangelogRule struct {
 	// reports Failed>0, reset to 0 on a clean run. Not caller-settable via
 	// /set (silently preserved from the existing record, like LastRunAt).
 	ConsecutiveFailures uint32 `json:"consecutiveFailures,omitempty"`
+
+	// PlaceholderTTLSeconds: reclaim a materialized-but-never-read
+	// placeholder inode (proto.ColdStateMaterialized) once it's been sitting
+	// unread this long. 0 (default) disables reclamation entirely — a
+	// materialized placeholder lives forever until the FIRST successful
+	// recall, same as before this field existed.
+	PlaceholderTTLSeconds uint32 `json:"placeholderTTLSeconds,omitempty"`
 }
 
 // OSSAccelChangelogSyncTaskRequest is the AdminTask payload master sends to
@@ -59,13 +66,14 @@ type OSSAccelChangelogRule struct {
 // proto.RuleTask/proto.Rule — those model S3 lifecycle expiration policies,
 // a completely different shape.
 type OSSAccelChangelogSyncTaskRequest struct {
-	MasterAddr          string
-	LcNodeAddr          string
-	VolName             string
-	Prefix              string
-	ChangelogKey        string
-	SkipAfterFailures   uint32
-	ConsecutiveFailures uint32
+	MasterAddr            string
+	LcNodeAddr            string
+	VolName               string
+	Prefix                string
+	ChangelogKey          string
+	SkipAfterFailures     uint32
+	ConsecutiveFailures   uint32
+	PlaceholderTTLSeconds uint32
 }
 
 // OSSAccelChangelogSyncTaskResponse is what lcnode reports back after
@@ -82,4 +90,5 @@ type OSSAccelChangelogSyncTaskResponse struct {
 	Skipped   int
 	Failed    int
 	Cursor    uint64
+	Swept     int
 }

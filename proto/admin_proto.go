@@ -1131,9 +1131,9 @@ type SyncNodeInfo struct {
 //
 //   - Path  : container-side absolute path (matches cfg.Posix.allowedRoots)
 //   - FSType: lowercase fs type as reported by /proc/self/mountinfo
-//             (e.g. "fuse.cubefs", "ext4", "gpfs", "nfs"). Empty when the
-//             path was not found in mountinfo (e.g. allowedRoots entry
-//             that's a subdir of a container fs root).
+//     (e.g. "fuse.cubefs", "ext4", "gpfs", "nfs"). Empty when the
+//     path was not found in mountinfo (e.g. allowedRoots entry
+//     that's a subdir of a container fs root).
 type SyncNodeMountPoint struct {
 	Path   string `json:"path"`
 	FSType string `json:"fsType,omitempty"`
