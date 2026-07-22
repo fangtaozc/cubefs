@@ -46,6 +46,16 @@ const (
 	cmdOssAccelBackendDelUse   = "delete [volname]"
 	cmdOssAccelBackendDelShort = "remove the volume's per-vol override (falls back to the mover's global env config)"
 	cmdOssAccelBackendShort    = "Manage a volume's per-vol cold S3 backend override"
+
+	cmdOssAccelRoleUse = "role [COMMAND]"
+
+	cmdOssAccelRoleSetUse   = "set [volname]"
+	cmdOssAccelRoleSetShort = "set the volume's M4 write role (primary or secondary)"
+	cmdOssAccelRoleGetUse   = "get [volname]"
+	cmdOssAccelRoleGetShort = "show the volume's M4 write role, if configured"
+	cmdOssAccelRoleDelUse   = "delete [volname]"
+	cmdOssAccelRoleDelShort = "remove the volume's role config (falls back to unrestricted primary)"
+	cmdOssAccelRoleShort    = "Manage a volume's M4 multi-cluster write role (primary/secondary)"
 )
 
 func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
@@ -56,7 +66,7 @@ func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
 		Aliases: []string{"ossaccel"},
 	}
 	proto.InitBufferPool(32768)
-	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client))
+	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client), newOssAccelRoleCmd(client))
 	return cmd
 }
 
@@ -273,6 +283,120 @@ func newOssAccelBackendDeleteCmd(client *master.MasterClient) *cobra.Command {
 				return
 			}
 			stdout("vol[%v] oss-accel backend override removed — falls back to the mover's global env config\n", volName)
+		},
+	}
+	return cmd
+}
+
+// M4 第一纵切片: an admin entry point for oss-accel's per-volume write role
+// (proto.OSSAccelRoleConfig, lcnode/oss_accel.go loadOssAccelRoleConfig) —
+// same VOLUME ROOT xattr mechanism as newOssAccelBackendCmd above, mirrored
+// structurally.
+func newOssAccelRoleCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelRoleUse,
+		Short: cmdOssAccelRoleShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(
+		newOssAccelRoleSetCmd(client),
+		newOssAccelRoleGetCmd(client),
+		newOssAccelRoleDeleteCmd(client),
+	)
+	return cmd
+}
+
+func newOssAccelRoleSetCmd(client *master.MasterClient) *cobra.Command {
+	var (
+		role          string
+		ownedPrefixes []string
+	)
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelRoleSetUse,
+		Short: cmdOssAccelRoleSetShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			if role != proto.OSSAccelRolePrimary && role != proto.OSSAccelRoleSecondary {
+				stdout("set oss-accel role failed: --role must be %q or %q\n", proto.OSSAccelRolePrimary, proto.OSSAccelRoleSecondary)
+				return
+			}
+			cfg := proto.OSSAccelRoleConfig{Role: role, OwnedPrefixes: ownedPrefixes}
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				stdout("marshal oss-accel role config failed: %v\n", err)
+				return
+			}
+			mw, err := newOssAccelVolMetaWrapper(client, volName)
+			if err != nil {
+				stdout("NewMetaWrapper failed: %v\n", err)
+				return
+			}
+			defer mw.Close()
+			if err = mw.XAttrSet_ll(proto.RootIno, []byte(proto.XAttrKeyOSSAccelRoleConfig), raw); err != nil {
+				stdout("set oss-accel role config failed: %v\n", err)
+				return
+			}
+			stdout("vol[%v] oss-accel role set:\n%v\n", volName, string(raw))
+		},
+	}
+	cmd.Flags().StringVar(&role, "role", "", "primary or secondary (required)")
+	cmd.Flags().StringSliceVar(&ownedPrefixes, "owned-prefix", nil, "path prefix this cluster may still write for despite role=secondary (repeatable); ignored for role=primary")
+	return cmd
+}
+
+func newOssAccelRoleGetCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelRoleGetUse,
+		Short: cmdOssAccelRoleGetShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			mw, err := newOssAccelVolMetaWrapper(client, volName)
+			if err != nil {
+				stdout("NewMetaWrapper failed: %v\n", err)
+				return
+			}
+			defer mw.Close()
+			info, err := mw.XAttrGet_ll(proto.RootIno, proto.XAttrKeyOSSAccelRoleConfig)
+			if err != nil {
+				stdout("get oss-accel role config failed: %v\n", err)
+				return
+			}
+			raw := info.Get(proto.XAttrKeyOSSAccelRoleConfig)
+			if len(raw) == 0 {
+				stdout("vol[%v] has no oss-accel role config — defaults to unrestricted %q\n", volName, proto.OSSAccelRolePrimary)
+				return
+			}
+			var cfg proto.OSSAccelRoleConfig
+			if err = json.Unmarshal(raw, &cfg); err != nil {
+				stdout("vol[%v] oss-accel role config is not valid JSON: %v\nraw: %v\n", volName, err, string(raw))
+				return
+			}
+			stdout("vol[%v] oss-accel role:\n%v\n", volName, string(raw))
+		},
+	}
+	return cmd
+}
+
+func newOssAccelRoleDeleteCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelRoleDelUse,
+		Short: cmdOssAccelRoleDelShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			mw, err := newOssAccelVolMetaWrapper(client, volName)
+			if err != nil {
+				stdout("NewMetaWrapper failed: %v\n", err)
+				return
+			}
+			defer mw.Close()
+			if err = mw.XAttrDel_ll(proto.RootIno, proto.XAttrKeyOSSAccelRoleConfig); err != nil {
+				stdout("delete oss-accel role config failed: %v\n", err)
+				return
+			}
+			stdout("vol[%v] oss-accel role config removed — falls back to unrestricted %q\n", volName, proto.OSSAccelRolePrimary)
 		},
 	}
 	return cmd

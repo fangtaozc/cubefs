@@ -27,6 +27,7 @@
 package lcnode
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -150,6 +151,52 @@ func loadOssAccelS3ConfigFromEnv() (*s3.Config, error) {
 	}, nil
 }
 
+// loadOssAccelRoleConfig returns this volume's M4 write role. Absent
+// xattr (the normal, pre-M4 case) returns OSSAccelRolePrimary with no
+// OwnedPrefixes — unrestricted, matching every volume's behavior before this
+// xattr existed. Returns a non-nil error only when the xattr is present but
+// malformed — callers must NOT fall back silently in that case (same
+// discipline as loadOssAccelS3ConfigFromVol: a broken config should be loud,
+// not quietly ignored).
+func loadOssAccelRoleConfig(mw *meta.MetaWrapper) (*proto.OSSAccelRoleConfig, error) {
+	def := &proto.OSSAccelRoleConfig{Role: proto.OSSAccelRolePrimary}
+	xattrs, err := mw.BatchGetXAttr([]uint64{proto.RootIno}, []string{proto.XAttrKeyOSSAccelRoleConfig})
+	if err != nil || len(xattrs) == 0 {
+		return def, nil
+	}
+	raw := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelRoleConfig]
+	if raw == "" {
+		return def, nil
+	}
+	var cfg proto.OSSAccelRoleConfig
+	if jerr := json.Unmarshal([]byte(raw), &cfg); jerr != nil {
+		return nil, fmt.Errorf("oss-accel per-vol role config on root inode is not valid JSON: %v", jerr)
+	}
+	if cfg.Role != proto.OSSAccelRolePrimary && cfg.Role != proto.OSSAccelRoleSecondary {
+		return nil, fmt.Errorf("oss-accel per-vol role config has invalid role %q (want %q or %q)",
+			cfg.Role, proto.OSSAccelRolePrimary, proto.OSSAccelRoleSecondary)
+	}
+	return &cfg, nil
+}
+
+// ossAccelWriteAllowed reports whether this volume's role config permits
+// writing/tiering-out the given S3 key. Primary is always allowed; secondary
+// is allowed only under one of its delegated OwnedPrefixes (see
+// proto.OSSAccelRoleConfig doc comment) — same strings.HasPrefix idiom
+// already used for changelog rule prefix matching (below,
+// runOssAccelChangelogSync).
+func ossAccelWriteAllowed(cfg *proto.OSSAccelRoleConfig, s3key string) bool {
+	if cfg.Role != proto.OSSAccelRoleSecondary {
+		return true
+	}
+	for _, p := range cfg.OwnedPrefixes {
+		if strings.HasPrefix(s3key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // normalizeOssAccelKey maps a POSIX path to the S3 object key. The key equals
 // the path with the leading slash stripped, matching the objectnode key
 // convention (bucket-relative, forward slashes) so the three views (POSIX /
@@ -189,6 +236,7 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s3key := normalizeOssAccelKey(path)
 
 	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
 	if err != nil {
@@ -197,6 +245,19 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	}
 	defer metaWrapper.Close()
 	defer extentClient.Close()
+
+	// M4 write role gate — checked before touching S3 or reading any hot-layer
+	// bytes (fail-fast: a rejected secondary write leaves no trace, not a
+	// write-then-reject). See proto.OSSAccelRoleConfig doc comment.
+	roleCfg, err := loadOssAccelRoleConfig(metaWrapper)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if !ossAccelWriteAllowed(roleCfg, s3key) {
+		http.Error(w, fmt.Sprintf("vol(%v) is role=%v and s3key(%v) is not under any OwnedPrefixes — write rejected", vol, roleCfg.Role, s3key), http.StatusForbidden)
+		return
+	}
 
 	// Per-vol backend override lives on this vol's own root inode, so the S3
 	// config can only be resolved once metaWrapper (above) exists.
@@ -220,7 +281,6 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 
 	t := &TransitionMgr{ec: extentClient, ecForW: extentClient}
 	e := &proto.ScanDentry{Size: size, Inode: ino, StorageClass: sc}
-	s3key := normalizeOssAccelKey(path)
 
 	// Stream hot-layer bytes → S3. The backend computes the whole-file sha256
 	// alongside the upload (ComputeChecksum) and handles multipart internally.
@@ -268,9 +328,65 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// M4: announce this write on the shared changelog so other clusters
+	// tailing the SAME bucket (M2's existing httpServiceOssAccelChangelogSync,
+	// unchanged) can discover it. Reaching this point already means the role
+	// gate above allowed the write for this scope, regardless of whether this
+	// volume's OWN role is literally "primary" or a secondary's delegated
+	// OwnedPrefixes — either way this cluster is the authority for this key
+	// right now. Best-effort: the flush itself already fully succeeded (bytes
+	// durable in S3, xattr recorded) by this point, so a changelog-append
+	// failure is logged, not surfaced as a request failure — matches the
+	// existing best-effort discipline for the lastRecallTime xattr stamp in
+	// httpServiceOssAccelRecall.
+	if aerr := appendOssAccelChangelogEvent(ctx, s3Backend, defaultOssAccelChangelogKey, s3key, size, checksum); aerr != nil {
+		log.LogWarnf("ossAccelFlush: vol(%v) ino(%v) s3key(%v) failed to append changelog event: %v", vol, ino, s3key, aerr)
+	}
+
 	log.LogInfof("ossAccelFlush success: vol(%v) ino(%v) size(%v) s3key(%v) checksum(%v)",
 		vol, ino, size, s3key, checksum)
 	fmt.Fprintf(w, "ok: vol=%v ino=%v size=%v s3key=%v checksum=%v\n", vol, ino, size, s3key, checksum)
+}
+
+// appendOssAccelChangelogEvent appends one NDJSON line to the shared
+// changelog object (M4: primary-side write, mirroring the exact line shape
+// M2's runOssAccelChangelogSync already parses — see ossAccelChangelogEvent).
+// Read-modify-write: Get the current object (missing = empty), append the
+// new line, Put the whole thing back. Known limitation, accepted for this
+// slice (see plan doc "不做" — matches M2's already-accepted "changelog
+// doesn't roll" simplification): two concurrent flushes racing this
+// read-modify-write on the SAME changelog object can lose one append. Not
+// serialized/locked in this round; revisit if it causes real data loss
+// rather than just a delayed/missed propagation.
+func appendOssAccelChangelogEvent(ctx context.Context, s3Backend backend.Backend, changelogKey, key string, size uint64, checksum string) error {
+	var existing []byte
+	body, gerr := s3Backend.Get(ctx, changelogKey, 0, 0)
+	if gerr == nil {
+		var rerr error
+		existing, rerr = io.ReadAll(body)
+		body.Close()
+		if rerr != nil {
+			return fmt.Errorf("read existing changelog err: %v", rerr)
+		}
+	} else if gerr != backend.ErrKeyNotFound {
+		return fmt.Errorf("get existing changelog err: %v", gerr)
+	}
+
+	ev := ossAccelChangelogEvent{
+		Key:       key,
+		Size:      size,
+		Checksum:  checksum,
+		EventTime: time.Now().UTC().Format(time.RFC3339),
+	}
+	line, merr := json.Marshal(ev)
+	if merr != nil {
+		return fmt.Errorf("marshal changelog event err: %v", merr)
+	}
+	newContent := append(existing, append(line, '\n')...)
+	if _, perr := s3Backend.Put(ctx, changelogKey, bytes.NewReader(newContent), int64(len(newContent)), backend.PutOptions{}); perr != nil {
+		return fmt.Errorf("put changelog err: %v", perr)
+	}
+	return nil
 }
 
 // buildVolMetaWrapper constructs a bare meta client for a volume, for

@@ -145,3 +145,40 @@ const XAttrKeyOSSAccelPin = "oss-accel.pin"
 // that isn't guaranteed on every volume; oss-accel keeps its own always-on
 // signal instead of depending on a setting it doesn't control.
 const XAttrKeyOSSAccelLastRecallTime = "oss-accel.lastRecallTime"
+
+// XAttrKeyOSSAccelRoleConfig is the M4 (multi-cluster) per-volume write role,
+// stored on the VOLUME ROOT inode alongside XAttrKeyOSSAccelBackendConfig —
+// same storage mechanism, same reasoning: a role is a deployment-level
+// setting about THIS cluster's relationship to the shared bucket, not a
+// per-file cold reference. Absent on a volume = OSSAccelRolePrimary with no
+// restriction, i.e. zero behavior change for every volume that predates M4
+// or never configures this (every M1/M2/M3 real-hardware test this session
+// ran against a volume with no role xattr at all).
+const XAttrKeyOSSAccelRoleConfig = "oss-accel.role"
+
+// OSSAccelRoleConfig is the JSON shape stored at XAttrKeyOSSAccelRoleConfig.
+//
+// OwnedPrefixes is only consulted when Role==OSSAccelRoleSecondary: paths
+// under one of these prefixes are still writable by THIS cluster (a
+// secondary can be the delegated primary for a sub-scope — e.g. the
+// project charter's own example, cluster B is secondary for /datasets but
+// primary for /ckpt). Empty OwnedPrefixes on a secondary blocks ALL writes
+// for this volume. OwnedPrefixes on a primary is meaningless and ignored
+// (a primary is already unrestricted) — kept unset rather than validated
+// away, since a future switch from primary to secondary can reuse whatever
+// was already configured.
+type OSSAccelRoleConfig struct {
+	Role          string   `json:"role"`
+	OwnedPrefixes []string `json:"ownedPrefixes,omitempty"`
+}
+
+// OSSAccelRole values for OSSAccelRoleConfig.Role.
+const (
+	// OSSAccelRolePrimary: unrestricted — may write/tier-out to the shared
+	// S3 backend for any path in this volume. Default when unconfigured.
+	OSSAccelRolePrimary = "primary"
+	// OSSAccelRoleSecondary: blocked from writing except under
+	// OSSAccelRoleConfig.OwnedPrefixes — consumes via changelog tailing
+	// (M2's existing httpServiceOssAccelChangelogSync, unchanged) instead.
+	OSSAccelRoleSecondary = "secondary"
+)
