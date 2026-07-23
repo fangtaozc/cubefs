@@ -691,6 +691,21 @@ cfs_packet_sattr_request_to_json(struct cfs_packet_sattr_request *req,
 }
 
 static int
+cfs_packet_renewal_forbidden_migration_request_to_json(
+	struct cfs_packet_renewal_forbidden_migration_request *req,
+	struct cfs_buffer *buffer)
+{
+	CHECK(cfs_buffer_write(buffer, "{"));
+	CHECK(cfs_buffer_write(buffer, "\"vol\":\"%s\",", req->vol_name));
+	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
+	CHECK(cfs_buffer_write(buffer, "\"ino\":%llu,", req->ino));
+	CHECK(cfs_buffer_write(buffer, "\"storageClass\":%u",
+			       req->storage_class));
+	CHECK(cfs_buffer_write(buffer, "}"));
+	return 0;
+}
+
+static int
 cfs_packet_sxattr_request_to_json(struct cfs_packet_sxattr_request *req,
 				  struct cfs_buffer *buffer)
 {
@@ -994,6 +1009,10 @@ int cfs_packet_request_data_to_json(struct cfs_packet *packet,
 	case CFS_OP_ATTR_SET:
 		return cfs_packet_sattr_request_to_json(
 			&packet->request.data.sattr, buffer);
+	case CFS_OP_RENEWAL_FORBIDDEN_MIGRATION:
+		return cfs_packet_renewal_forbidden_migration_request_to_json(
+			&packet->request.data.renewal_forbidden_migration,
+			buffer);
 	case CFS_OP_XATTR_SET:
 	case CFS_OP_XATTR_UPDATE:
 		return cfs_packet_sxattr_request_to_json(
@@ -1063,6 +1082,8 @@ int cfs_packet_reply_data_from_json(cfs_json_t *json, struct cfs_packet *packet)
 		return 0;
 	case CFS_OP_ATTR_SET:
 		return 0;
+	case CFS_OP_RENEWAL_FORBIDDEN_MIGRATION:
+		return 0;
 	case CFS_OP_XATTR_SET:
 	case CFS_OP_XATTR_UPDATE:
 		return 0;
@@ -1127,6 +1148,10 @@ void cfs_packet_request_data_clear(struct cfs_packet *packet)
 		break;
 	case CFS_OP_ATTR_SET:
 		cfs_packet_sattr_request_clear(&packet->request.data.sattr);
+		break;
+	case CFS_OP_RENEWAL_FORBIDDEN_MIGRATION:
+		cfs_packet_renewal_forbidden_migration_request_clear(
+			&packet->request.data.renewal_forbidden_migration);
 		break;
 	case CFS_OP_XATTR_SET:
 	case CFS_OP_XATTR_UPDATE:
@@ -1206,6 +1231,8 @@ void cfs_packet_reply_data_clear(struct cfs_packet *packet)
 	case CFS_OP_INODE_EVICT:
 		break;
 	case CFS_OP_ATTR_SET:
+		break;
+	case CFS_OP_RENEWAL_FORBIDDEN_MIGRATION:
 		break;
 	case CFS_OP_XATTR_GET:
 		cfs_packet_gxattr_reply_clear(&packet->reply.data.gxattr);

@@ -971,6 +971,21 @@ static int cfs_open(struct inode *inode, struct file *file)
 	if (S_ISREG(inode->i_mode) &&
 	    !is_iattr_cache_valid((struct cfs_inode *)inode))
 		cfs_inode_refresh((struct cfs_inode *)inode);
+	/* 写模式 open 续一次防误迁移租约(见 cfs_meta_renewal_forbidden_migration
+	 * 的详细说明)——FUSE/Go SDK 靠 stream 保持 open-for-write 期间的周期续租
+	 * 做到,内核客户端目前只在 open 这一刻续一次(够用不是最优:覆盖"打开-
+	 * 写-关闭"在1小时内完成的常见情况,不覆盖长期占着写句柄超过1小时的场
+	 * 景)。best-effort,失败不阻塞 open——宁可这次续租没生效,不要因为一个
+	 * 非致命的 RPC 失败拖垮正常的文件打开。 */
+	if (S_ISREG(inode->i_mode) && (file->f_mode & FMODE_WRITE)) {
+		int rfm_ret = cfs_meta_renewal_forbidden_migration(
+			cmi->meta, inode->i_ino,
+			((struct cfs_inode *)inode)->storage_class);
+		if (rfm_ret < 0)
+			cfs_log_warn(cmi->log,
+				     "renewal forbidden migration failed for ino(%lu), err(%d)\n",
+				     inode->i_ino, rfm_ret);
+	}
 	cfi = kzalloc(sizeof(*cfi), GFP_NOFS);
 	if (!cfi) {
 		ret = -ENOMEM;

@@ -52,6 +52,12 @@
 #define CFS_OP_QUOTA_INODE_CREATE       0x53
 #define CFS_OP_QUOTA_DENTRY_CREATE      0x54
 
+/* matches proto.OpMetaRenewalForbiddenMigration (proto/packet.go) — renews
+ * the anti-premature-migration lease on a just-written inode. See
+ * cfs_meta_renewal_forbidden_migration()'s doc comment for why the kernel
+ * client needs this call at all. */
+#define CFS_OP_RENEWAL_FORBIDDEN_MIGRATION 0x83
+
 #define CFS_OP_UNIQID_GET               0xAC
 
 /**
@@ -661,6 +667,22 @@ cfs_packet_sattr_request_clear(struct cfs_packet_sattr_request *request)
 	memset(request, 0, sizeof(*request));
 }
 
+struct cfs_packet_renewal_forbidden_migration_request {
+	const char *vol_name; /* json: vol */
+	u64 pid; /* json: pid */
+	u64 ino; /* json: ino */
+	u32 storage_class; /* json: storageClass */
+};
+
+static inline void
+cfs_packet_renewal_forbidden_migration_request_clear(
+	struct cfs_packet_renewal_forbidden_migration_request *request)
+{
+	if (!request)
+		return;
+	memset(request, 0, sizeof(*request));
+}
+
 struct cfs_packet_sxattr_request {
 	const char *vol_name; /* json: vol */
 	u64 pid; /* json: pid */
@@ -898,6 +920,8 @@ struct cfs_packet {
 			struct cfs_packet_iunlink_request iunlink;
 			struct cfs_packet_ievict_request ievict;
 			struct cfs_packet_sattr_request sattr;
+			struct cfs_packet_renewal_forbidden_migration_request
+				renewal_forbidden_migration;
 			struct cfs_packet_sxattr_request sxattr;
 			struct cfs_packet_gxattr_request gxattr;
 			struct cfs_packet_rxattr_request rxattr;

@@ -1004,6 +1004,42 @@ out:
 /**
  * @return 0 on success, < 0 on client request failed, > 0 on server reply failed
  */
+static int cfs_meta_renewal_forbidden_migration_internal(
+	struct cfs_meta_client *mc, struct cfs_meta_partition *mp, u64 ino,
+	u32 storage_class)
+{
+	u8 op = CFS_OP_RENEWAL_FORBIDDEN_MIGRATION;
+	struct cfs_packet *packet;
+	struct cfs_packet_renewal_forbidden_migration_request *request_data;
+	int ret;
+
+	packet = cfs_packet_new(op, mp->id, NULL, NULL);
+	if (!packet)
+		return -ENOMEM;
+
+	request_data = &packet->request.data.renewal_forbidden_migration;
+	request_data->vol_name = mc->volume;
+	request_data->pid = mp->id;
+	request_data->ino = ino;
+	request_data->storage_class = storage_class;
+
+	ret = do_meta_request(mc, mp, packet);
+	if (ret < 0) {
+		cfs_log_error(mc->log, "do_meta_request() error %d\n", ret);
+		goto out;
+	}
+	ret = cfs_parse_status(packet->reply.hdr.result_code);
+	if (ret > 0) {
+		cfs_log_error(mc->log, "server return error 0x%x\n",
+			      packet->reply.hdr.result_code);
+		goto out;
+	}
+
+out:
+	cfs_packet_release(packet);
+	return ret;
+}
+
 static int cfs_meta_set_xattr_internal(struct cfs_meta_client *mc,
 				       struct cfs_meta_partition *mp, u64 ino,
 				       const char *name, const char *value,
@@ -1727,6 +1763,56 @@ int cfs_meta_set_attr(struct cfs_meta_client *mc, u64 ino, struct iattr *attr)
 		goto unlock;
 	}
 	ret = cfs_meta_set_attr_internal(mc, mp, ino, attr);
+	if (ret != 0) {
+		ret = ret < 0 ? ret : -ret;
+		goto unlock;
+	}
+
+unlock:
+	up_read(&mc->lock);
+	return ret;
+}
+
+/**
+ * Renews the anti-premature-migration lease on ino for another
+ * proto.ForbiddenMigrationRenewalSeonds (1h server-side). Metanode's
+ * commit-cold / M3 watermark eviction refuse to migrate an inode whose
+ * lease hasn't expired (see runOssAccelCommitCold's LeaseExpireTime check,
+ * lcnode/oss_accel.go) — the intent is "don't tier out a file that might
+ * still be being actively written to". The FUSE client (and the Go SDK
+ * generally, via sdk/data/stream.ExtentClient's periodic renewal timer
+ * while a stream is open-for-write) already does this; the kernel client
+ * never called this RPC at all, meaning a file written through the kernel
+ * mount had ZERO such protection — eviction/commit-cold could migrate it
+ * to cold immediately after (or, in the worst case, concurrently with) a
+ * kernel-client write completing. Discovered via the M5 cross-client
+ * consistency scenarios (envs/test-vm01/client/oss-accel-consistency/ in
+ * cubefs-deploy), not a report against any specific corrupted file.
+ *
+ * Minimal fix, not a full port of the Go SDK's periodic-while-open timer:
+ * called once from cfs_open() on a write-mode open (see cfs_fs.c). This
+ * covers the common case (open, write, close well within an hour) without
+ * adding new kernel-side timer/workqueue machinery; a write session held
+ * open-for-write longer than the 1h lease window would need the periodic
+ * renewal this does NOT implement — accepted gap, matches this project's
+ * "够用不是最优" standard, revisit if that scenario turns out to matter.
+ *
+ * @return 0 on success, < 0 on failed
+ */
+int cfs_meta_renewal_forbidden_migration(struct cfs_meta_client *mc, u64 ino,
+					 u32 storage_class)
+{
+	struct cfs_meta_partition *mp;
+	int ret;
+
+	down_read(&mc->lock);
+	mp = cfs_meta_get_partition_by_inode(mc, ino);
+	if (!mp) {
+		ret = -ENOENT;
+		goto unlock;
+	}
+	ret = cfs_meta_renewal_forbidden_migration_internal(mc, mp, ino,
+							    storage_class);
 	if (ret != 0) {
 		ret = ret < 0 ? ret : -ret;
 		goto unlock;

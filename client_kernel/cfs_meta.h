@@ -154,6 +154,8 @@ int cfs_meta_readdir(struct cfs_meta_client *mc, u64 parent_ino,
 		     const char *from, u64 limit,
 		     struct cfs_packet_dentry_array *dentries);
 int cfs_meta_set_attr(struct cfs_meta_client *mc, u64 ino, struct iattr *attr);
+int cfs_meta_renewal_forbidden_migration(struct cfs_meta_client *mc, u64 ino,
+					 u32 storage_class);
 int cfs_meta_set_xattr(struct cfs_meta_client *mc, u64 ino, const char *name,
 		       const void *value, size_t len, int flags);
 ssize_t cfs_meta_get_xattr(struct cfs_meta_client *mc, u64 ino,
