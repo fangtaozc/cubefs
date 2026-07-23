@@ -15,6 +15,7 @@
 package master
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,17 @@ type OSSAccelEvictionRuleManager struct {
 // per rule — cheap enough to check often; watermark crossings don't need
 // sub-10s reaction time for this to be useful.
 const ossAccelEvictionRuleTickInterval = 10 * time.Second
+
+// ossAccelEvictionDispatchStaleTimeout: EvictionInFlight 卡在 true 超过这个
+// 时长仍未收到响应,视为 lcnode 崩溃/任务丢失(而不是"还在正常跑"),自动清
+// 除标志位让水位判断继续生效——否则唯一能清除它的两条路径(收到真实响应/
+// master 重启换主)都不会自然发生,规则会永久退出水位管理且不报错(真机验
+// 证坐实过:网络分区掉线的 lcnode 收到派发后,EvictionInFlight 卡死数分钟
+// 不会自愈)。10 分钟是保守估计,远大于 AdminTask 自身派发超时(100s)和节
+// 点心跳超时(18s),不会跟"派发刚发出、响应还没回来"的正常窗口打架;没有
+// 真实生产扫描耗时数据支撑这个数字(M3 设计文档已记录的 DEBT-3 缺口),如
+// 果真出现扫描持续超过这个时长导致误判,需要现场调大,不是硬性约束。
+const ossAccelEvictionDispatchStaleTimeout = 10 * time.Minute
 
 func NewOSSAccelEvictionRuleManager(cluster *Cluster) *OSSAccelEvictionRuleManager {
 	return &OSSAccelEvictionRuleManager{cluster: cluster}
@@ -93,8 +105,29 @@ func (m *OSSAccelEvictionRuleManager) run(stopCh chan struct{}) {
 
 func (m *OSSAccelEvictionRuleManager) tick() {
 	for _, r := range m.cluster.ossAccelEvictionRuleCache.List() {
-		if !r.Enabled || r.EvictionInFlight {
-			continue // a sweep is already running for this vol — don't pile up a second dispatch
+		if !r.Enabled {
+			continue
+		}
+		if r.EvictionInFlight {
+			if time.Since(r.LastRunAt) < ossAccelEvictionDispatchStaleTimeout {
+				continue // a sweep is already running for this vol — don't pile up a second dispatch
+			}
+			// Dispatched longer ago than any plausible legitimate sweep —
+			// the lcnode it went to crashed or the task was lost in
+			// transit (both leave EvictionInFlight stuck forever otherwise,
+			// since a response is the only thing that clears it). Unstick
+			// it and fall through to re-evaluate the watermark THIS tick,
+			// not next — no need to wait another ossAccelEvictionRuleTickInterval.
+			log.LogWarnf("OSSAccelEvictionRuleManager.tick: vol(%v) EvictionInFlight stuck true for over %v (dispatched at %v) with no lcnode response — treating as lost/crashed, auto-clearing",
+				r.VolName, ossAccelEvictionDispatchStaleTimeout, r.LastRunAt)
+			stale := *r
+			stale.EvictionInFlight = false
+			stale.LastRunResult = fmt.Sprintf("stale: no lcnode response within %v of dispatch — auto-cleared by watchdog", ossAccelEvictionDispatchStaleTimeout)
+			m.cluster.ossAccelEvictionRuleCache.Put(&stale)
+			if perr := m.cluster.syncUpdateOSSAccelEvictionRule(&stale); perr != nil {
+				log.LogWarnf("OSSAccelEvictionRuleManager.tick: vol(%v) persist stale-clear err: %v", r.VolName, perr)
+			}
+			r = &stale
 		}
 		vol, err := m.cluster.getVol(r.VolName)
 		if err != nil {
