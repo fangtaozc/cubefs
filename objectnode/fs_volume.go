@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
 	"os"
 	"reflect"
 	"sort"
@@ -38,6 +39,8 @@ import (
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/sdk/ossaccel"
+	"github.com/cubefs/cubefs/syncnode/backend/s3"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/buf"
 	"github.com/cubefs/cubefs/util/exporter"
@@ -213,6 +216,16 @@ func (v *Volume) loadOSSMeta() {
 	}
 	v.metaLoader.storeObjectLock(objectlock)
 	v.metaLoader.setSynced()
+
+	// Independent of the policy/ACL/CORS/lock chain above: a misconfigured
+	// or unreachable oss-accel backend must not block those refreshing (and
+	// vice versa), so failures here are logged and simply leave the
+	// previous cached value in place — the next tick retries.
+	if cred, cerr := v.loadOssAccelBackendCredentialFresh(); cerr != nil {
+		log.LogWarnf("loadOSSMeta: refresh oss-accel backend credential failed: volume(%s) err(%v)", v.name, cerr)
+	} else {
+		v.metaLoader.storeOssAccelBackendCredential(cred)
+	}
 }
 
 func (v *Volume) Name() string {
@@ -289,6 +302,48 @@ func (v *Volume) loadObjectLock() (configuration *ObjectLockConfig, err error) {
 		return
 	}
 	return configuration, nil
+}
+
+// loadOssAccelBackendCredentialFresh resolves this volume's oss-accel S3
+// backend AK/SK for the ObjectNode auth bridge
+// (proto.OSSAccelBackendConfig.AllowBackendCredentialAuth). Unlike
+// loadBucketPolicy/ACL/CORS/lock, "not configured" or "not opted in" is not
+// an error — it is the normal, cacheable result for every volume that
+// hasn't turned this on.
+func (v *Volume) loadOssAccelBackendCredentialFresh() (*ossAccelBackendCredential, error) {
+	cfg, err := ossaccel.LoadBackendConfig(v.mw)
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil || !cfg.AllowBackendCredentialAuth {
+		return &ossAccelBackendCredential{}, nil
+	}
+	ak, sk, err := s3.ResolveCredentials(context.Background(), &s3.Config{
+		Region:       cfg.Region,
+		AccessKeyEnv: cfg.AccessKeyEnv,
+		SecretKeyEnv: cfg.SecretKeyEnv,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ossAccelBackendCredential{Allowed: true, AK: ak, SK: sk}, nil
+}
+
+// OSSAccelBackendCredential returns this volume's oss-accel backend AK/SK
+// and whether ObjectNode should accept S3 requests signed with them (see
+// proto.OSSAccelBackendConfig.AllowBackendCredentialAuth) — cached via
+// v.metaLoader the same way as bucket policy/ACL/CORS/lock, so the auth hot
+// path never makes a metanode round trip. Errors resolving the credential
+// are logged and treated as "not allowed" rather than propagated — a
+// broken oss-accel backend config must not turn into an auth-path error
+// that an unauthenticated caller can trigger.
+func (v *Volume) OSSAccelBackendCredential() (ak, sk string, allowed bool) {
+	cred, err := v.metaLoader.loadOssAccelBackendCredential()
+	if err != nil {
+		log.LogWarnf("OSSAccelBackendCredential: volume(%v) err(%v)", v.name, err)
+		return "", "", false
+	}
+	return cred.AK, cred.SK, cred.Allowed
 }
 
 func (v *Volume) getInodeFromPath(path string) (inode uint64, err error) {
@@ -1556,7 +1611,77 @@ func (v *Volume) loadUserDefinedMetadata(inode uint64) (metadata map[string]stri
 	return
 }
 
+// ossAccelHTTPClient mirrors client/fs/oss_accel.go's package-level client:
+// a 5-minute timeout bounding the mover's response commitment, not the
+// full recall transfer.
+var ossAccelHTTPClient = &http.Client{Timeout: 5 * time.Minute}
+
+// ossAccelColdReadGate recalls inode's oss-accel-cold data back to the hot
+// tier before ObjectNode reads it — same wire protocol as the kernel/FUSE
+// clients' cold-read gate (client/fs/oss_accel.go's ossAccelColdReadGate),
+// so lcnode's /ossAccelRecall handler doesn't need to know which client
+// triggered it. Unlike those clients, ObjectNode has no local inode/extent
+// cache to invalidate on success — the caller just continues straight into
+// the normal hot read.
+func (v *Volume) ossAccelColdReadGate(inode uint64) error {
+	if ossAccelMoverAddr == "" {
+		return nil
+	}
+
+	xattrs, gerr := v.mw.BatchGetXAttr([]uint64{inode}, []string{
+		proto.XAttrKeyOSSAccelS3Key, proto.XAttrKeyOSSAccelChecksum, proto.XAttrKeyOSSAccelSize,
+	})
+	if gerr != nil || len(xattrs) == 0 {
+		log.LogWarnf("ossAccelColdReadGate: BatchGetXAttr volume(%v) inode(%v) err(%v)", v.name, inode, gerr)
+		return nil
+	}
+	s3key := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelS3Key]
+	if s3key == "" {
+		return nil
+	}
+	checksum := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelChecksum]
+	sizeStr := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelSize]
+
+	url := fmt.Sprintf("http://%s/ossAccelRecall?vol=%s&ino=%d&size=%s&sc=%d&vsc=%d&asc=%d&path=%s&checksum=%s",
+		ossAccelMoverAddr, v.name, inode, sizeStr,
+		proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD,
+		s3key, checksum)
+
+	resp, herr := ossAccelHTTPClient.Get(url)
+	if herr != nil {
+		log.LogErrorf("ossAccelColdReadGate: volume(%v) inode(%v) s3key(%v) mover request err: %v", v.name, inode, s3key, herr)
+		return syscall.EIO
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		log.LogInfof("ossAccelColdReadGate: recall success volume(%v) inode(%v) s3key(%v) resp(%v)", v.name, inode, s3key, string(body))
+		return nil
+	case http.StatusTooEarly:
+		log.LogWarnf("ossAccelColdReadGate: recall not yet safe volume(%v) inode(%v) s3key(%v): %v", v.name, inode, s3key, string(body))
+		return syscall.EAGAIN
+	default:
+		log.LogErrorf("ossAccelColdReadGate: recall failed volume(%v) inode(%v) s3key(%v) status(%v): %v", v.name, inode, s3key, resp.StatusCode, string(body))
+		return syscall.EIO
+	}
+}
+
 func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, storageClass uint32) (err error) {
+	// oss-accel cold-read gate: v.volType being Hot already routes
+	// BlobStore-storage-class files below to v.read() (the native cold-vol
+	// readEbs() path is a different mechanism, gated on volType Cold, not
+	// on a single file's storage class) — but v.read() only works once the
+	// recall has actually happened and extents are back in the hot tier.
+	// Trigger that here, same protocol as the kernel/FUSE clients'
+	// ossAccelColdReadGate, before falling into the normal dispatch below.
+	if !proto.IsCold(v.volType) && proto.IsStorageClassBlobStore(storageClass) {
+		if rerr := v.ossAccelColdReadGate(inode); rerr != nil {
+			return rerr
+		}
+		storageClass = proto.StorageClass_Replica_HDD // recall always restores a replica copy; exact flavor doesn't affect the dispatch below
+	}
 	isCache := false
 	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(storageClass) {
 		isCache = true

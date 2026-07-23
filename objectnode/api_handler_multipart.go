@@ -77,7 +77,7 @@ func (o *ObjectNode) createMultipleUploadHandler(w http.ResponseWriter, r *http.
 	defer rateLimit.ReleaseLimitResource(vol.owner, param.apiName)
 
 	var userInfo *proto.UserInfo
-	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey()); err != nil {
+	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket()); err != nil {
 		log.LogErrorf("createMultipleUploadHandler: get user info fail: requestID(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.AccessKey(), err)
 		return

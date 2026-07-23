@@ -1390,3 +1390,80 @@ func TestPut_MetadataTooLarge(t *testing.T) {
 		t.Errorf("bloat.bin was written despite ErrMetadataTooLarge")
 	}
 }
+
+func TestResolveCredentials_EnvVar(t *testing.T) {
+	akEnv := "SYNCNODE_S3_TEST_AK_" + randomID()
+	skEnv := "SYNCNODE_S3_TEST_SK_" + randomID()
+	if err := os.Setenv(akEnv, "resolved-access-key"); err != nil {
+		t.Fatalf("setenv: %v", err)
+	}
+	if err := os.Setenv(skEnv, "resolved-secret-key"); err != nil {
+		t.Fatalf("setenv: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Unsetenv(akEnv)
+		_ = os.Unsetenv(skEnv)
+	})
+
+	ak, sk, err := ResolveCredentials(context.Background(), &Config{
+		Region:       "us-east-1",
+		AccessKeyEnv: akEnv,
+		SecretKeyEnv: skEnv,
+	})
+	if err != nil {
+		t.Fatalf("ResolveCredentials: %v", err)
+	}
+	if ak != "resolved-access-key" || sk != "resolved-secret-key" {
+		t.Errorf("got ak=%q sk=%q, want the env var values", ak, sk)
+	}
+}
+
+func TestResolveCredentials_InlineTakesPrecedence(t *testing.T) {
+	akEnv := "SYNCNODE_S3_TEST_AK_" + randomID()
+	skEnv := "SYNCNODE_S3_TEST_SK_" + randomID()
+	if err := os.Setenv(akEnv, "env-access-key"); err != nil {
+		t.Fatalf("setenv: %v", err)
+	}
+	if err := os.Setenv(skEnv, "env-secret-key"); err != nil {
+		t.Fatalf("setenv: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Unsetenv(akEnv)
+		_ = os.Unsetenv(skEnv)
+	})
+
+	ak, sk, err := ResolveCredentials(context.Background(), &Config{
+		Region:       "us-east-1",
+		AccessKey:    "inline-access-key",
+		SecretKey:    "inline-secret-key",
+		AccessKeyEnv: akEnv,
+		SecretKeyEnv: skEnv,
+	})
+	if err != nil {
+		t.Fatalf("ResolveCredentials: %v", err)
+	}
+	if ak != "inline-access-key" || sk != "inline-secret-key" {
+		t.Errorf("got ak=%q sk=%q, want the inline values (should win over env vars present)", ak, sk)
+	}
+}
+
+func TestResolveCredentials_NoneConfiguredFallsToDefaultChain(t *testing.T) {
+	// Isolate from whatever AWS_* credential env vars might happen to be
+	// set on the machine running the test, so this deterministically hits
+	// an empty default chain and errors, rather than flaking based on the
+	// environment.
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE"} {
+		old, had := os.LookupEnv(name)
+		_ = os.Unsetenv(name)
+		t.Cleanup(func() {
+			if had {
+				_ = os.Setenv(name, old)
+			}
+		})
+	}
+
+	_, _, err := ResolveCredentials(context.Background(), &Config{Region: "us-east-1"})
+	if err == nil {
+		t.Fatal("expected an error resolving credentials with no source configured, got nil")
+	}
+}

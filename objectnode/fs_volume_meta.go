@@ -26,11 +26,24 @@ type ossMetaLoader interface {
 	loadACL() (p *AccessControlPolicy, err error)
 	loadCORS() (cors *CORSConfiguration, err error)
 	loadObjectLock() (config *ObjectLockConfig, err error)
+	loadOssAccelBackendCredential() (cred *ossAccelBackendCredential, err error)
 	storePolicy(p *Policy)
 	storeACL(p *AccessControlPolicy)
 	storeCORS(cors *CORSConfiguration)
 	storeObjectLock(config *ObjectLockConfig)
+	storeOssAccelBackendCredential(cred *ossAccelBackendCredential)
 	setSynced()
+}
+
+// ossAccelBackendCredential is the cached result of resolving a volume's
+// oss-accel S3 backend AK/SK for the ObjectNode auth bridge (see
+// Volume.OSSAccelBackendCredential). Never nil once loaded — Allowed=false
+// is itself a meaningful cached result (not configured / not opted in),
+// distinct from "not loaded yet" (a nil *ossAccelBackendCredential).
+type ossAccelBackendCredential struct {
+	Allowed bool
+	AK      string
+	SK      string
 }
 
 type strictMetaLoader struct {
@@ -46,14 +59,16 @@ type cacheMetaLoader struct {
 
 // OSSMeta is bucket policy and ACL metadata.
 type OSSMeta struct {
-	policy     *Policy
-	acl        *AccessControlPolicy
-	corsConfig *CORSConfiguration
-	lockConfig *ObjectLockConfig
-	policyLock sync.RWMutex
-	aclLock    sync.RWMutex
-	corsLock   sync.RWMutex
-	objectLock sync.RWMutex
+	policy               *Policy
+	acl                  *AccessControlPolicy
+	corsConfig           *CORSConfiguration
+	lockConfig           *ObjectLockConfig
+	ossAccelBackendCred  *ossAccelBackendCredential
+	policyLock           sync.RWMutex
+	aclLock              sync.RWMutex
+	corsLock             sync.RWMutex
+	objectLock           sync.RWMutex
+	ossAccelBackendMutex sync.RWMutex
 }
 
 func (c *cacheMetaLoader) loadPolicy() (p *Policy, err error) {
@@ -152,6 +167,29 @@ func (c *cacheMetaLoader) storeObjectLock(config *ObjectLockConfig) {
 	c.om.objectLock.Unlock()
 }
 
+func (c *cacheMetaLoader) loadOssAccelBackendCredential() (cred *ossAccelBackendCredential, err error) {
+	c.om.ossAccelBackendMutex.RLock()
+	cred = c.om.ossAccelBackendCred
+	c.om.ossAccelBackendMutex.RUnlock()
+	if cred == nil && atomic.LoadInt32(c.synced) == 0 {
+		ret, err, _ := c.sf.Do("ossAccelBackendCredential", func() (interface{}, error) {
+			return c.sml.loadOssAccelBackendCredential()
+		})
+		if err != nil {
+			return nil, err
+		}
+		cred = ret.(*ossAccelBackendCredential)
+		c.storeOssAccelBackendCredential(cred)
+	}
+	return
+}
+
+func (c *cacheMetaLoader) storeOssAccelBackendCredential(cred *ossAccelBackendCredential) {
+	c.om.ossAccelBackendMutex.Lock()
+	c.om.ossAccelBackendCred = cred
+	c.om.ossAccelBackendMutex.Unlock()
+}
+
 func (c *cacheMetaLoader) setSynced() {
 	atomic.StoreInt32(c.synced, 1)
 }
@@ -185,6 +223,14 @@ func (s *strictMetaLoader) loadObjectLock() (o *ObjectLockConfig, err error) {
 }
 
 func (s *strictMetaLoader) storeObjectLock(cors *ObjectLockConfig) {
+	// do nothing
+}
+
+func (s *strictMetaLoader) loadOssAccelBackendCredential() (*ossAccelBackendCredential, error) {
+	return s.v.loadOssAccelBackendCredentialFresh()
+}
+
+func (s *strictMetaLoader) storeOssAccelBackendCredential(cred *ossAccelBackendCredential) {
 	// do nothing
 }
 

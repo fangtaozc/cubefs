@@ -45,6 +45,7 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/stream"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/sdk/ossaccel"
 	"github.com/cubefs/cubefs/syncnode/backend"
 	"github.com/cubefs/cubefs/syncnode/backend/s3"
 	"github.com/cubefs/cubefs/util/log"
@@ -88,40 +89,21 @@ func loadOssAccelS3Config(mw *meta.MetaWrapper, vol string) (*s3.Config, error) 
 // case — caller falls back to global env). Returns (nil, non-nil error) when
 // an override is present but malformed/incomplete — caller must NOT fall
 // back in that case. Returns (non-nil, nil) on a valid override.
+//
+// The xattr read + parse + defaulting itself lives in sdk/ossaccel (shared
+// with objectnode's backend-credential auth bridge, which needs the same
+// per-vol override without importing this package).
 func loadOssAccelS3ConfigFromVol(mw *meta.MetaWrapper) (*s3.Config, error) {
-	xattrs, err := mw.BatchGetXAttr([]uint64{proto.RootIno}, []string{proto.XAttrKeyOSSAccelBackendConfig})
-	if err != nil || len(xattrs) == 0 {
-		return nil, nil
-	}
-	raw := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelBackendConfig]
-	if raw == "" {
-		return nil, nil
-	}
-	var cfg proto.OSSAccelBackendConfig
-	if jerr := json.Unmarshal([]byte(raw), &cfg); jerr != nil {
-		return nil, fmt.Errorf("oss-accel per-vol backend override on root inode is not valid JSON: %v", jerr)
-	}
-	if cfg.Endpoint == "" || cfg.Bucket == "" {
-		return nil, fmt.Errorf("oss-accel per-vol backend override missing required field(s): endpoint=%q bucket=%q", cfg.Endpoint, cfg.Bucket)
-	}
-	region := cfg.Region
-	if region == "" {
-		region = "us-east-1"
-	}
-	accessKeyEnv := cfg.AccessKeyEnv
-	if accessKeyEnv == "" {
-		accessKeyEnv = envNameOssAccelS3AK
-	}
-	secretKeyEnv := cfg.SecretKeyEnv
-	if secretKeyEnv == "" {
-		secretKeyEnv = envNameOssAccelS3SK
+	cfg, err := ossaccel.LoadBackendConfig(mw)
+	if cfg == nil || err != nil {
+		return nil, err
 	}
 	return &s3.Config{
 		Endpoint:           cfg.Endpoint,
-		Region:             region,
+		Region:             cfg.Region,
 		Bucket:             cfg.Bucket,
-		AccessKeyEnv:       accessKeyEnv,
-		SecretKeyEnv:       secretKeyEnv,
+		AccessKeyEnv:       cfg.AccessKeyEnv,
+		SecretKeyEnv:       cfg.SecretKeyEnv,
 		UsePathStyle:       cfg.PathStyle,
 		InsecureSkipVerify: cfg.SkipTLSVerify,
 	}, nil

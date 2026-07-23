@@ -154,6 +154,15 @@ const (
 
 	// s3 QoS config refresh interval
 	s3QoSRefreshIntervalSec = "s3QoSRefreshIntervalSec"
+
+	// String type configuration item, the lcnode HTTP address ObjectNode
+	// calls to recall oss-accel-cold data on demand (see
+	// Volume.ossAccelColdReadGate). Empty/absent disables the recall gate.
+	// Example:
+	//		{
+	//			"ossAccelMoverAddr": "10.54.120.80:17511"
+	//		}
+	configOssAccelMoverAddr = "ossAccelMoverAddr"
 )
 
 // Default of configuration value
@@ -178,6 +187,12 @@ var (
 	writeThreads     = 4
 	readThreads      = 4
 	enableBlockcache bool
+	// ossAccelMoverAddr is the lcnode HTTP address Volume.ossAccelColdReadGate
+	// calls to recall oss-accel-cold data on demand. Empty (the default —
+	// most deployments don't run oss-accel) disables the gate; read
+	// directly by fs_volume.go rather than threaded through VolumeConfig,
+	// same pattern as blockCache above.
+	ossAccelMoverAddr string
 )
 
 type ObjectNode struct {
@@ -324,6 +339,11 @@ func (o *ObjectNode) loadConfig(cfg *config.Config) (err error) {
 	enableBlockcache = cfg.GetBool(enableBcache)
 	if enableBlockcache {
 		blockCache = bcache.NewBcacheClient()
+	}
+
+	ossAccelMoverAddr = cfg.GetString(configOssAccelMoverAddr)
+	if ossAccelMoverAddr != "" {
+		log.LogInfof("loadConfig: setup config: %v(%v)", configOssAccelMoverAddr, ossAccelMoverAddr)
 	}
 
 	return

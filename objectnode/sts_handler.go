@@ -70,7 +70,7 @@ func (o *ObjectNode) getFederationTokenHandler(w http.ResponseWriter, r *http.Re
 		durationSeconds = 43200
 	}
 	param := ParseRequestParam(r)
-	user, err := o.getUserInfoByAccessKeyV2(param.AccessKey())
+	user, err := o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket())
 	if err != nil {
 		log.LogErrorf("getFederationTokenHandler: get user info fail: requestID(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.AccessKey(), err)

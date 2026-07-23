@@ -75,7 +75,7 @@ func (o *ObjectNode) createBucketHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	var userInfo *proto.UserInfo
-	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey()); err != nil {
+	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket()); err != nil {
 		log.LogErrorf("createBucketHandler: get user info from master fail: requestID(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.AccessKey(), err)
 		return
@@ -168,7 +168,7 @@ func (o *ObjectNode) deleteBucketHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	var userInfo *proto.UserInfo
-	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey()); err != nil {
+	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket()); err != nil {
 		log.LogErrorf("deleteBucketHandler: get user info fail: requestID(%v) volume(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), bucket, param.AccessKey(), err)
 		return
@@ -225,7 +225,7 @@ func (o *ObjectNode) listBucketsHandler(w http.ResponseWriter, r *http.Request) 
 
 	param := ParseRequestParam(r)
 	var userInfo *proto.UserInfo
-	if userInfo, err = o.getUserInfoByAccessKeyV2(param.accessKey); err != nil {
+	if userInfo, err = o.getUserInfoByAccessKeyV2(param.accessKey, ""); err != nil {
 		log.LogErrorf("listBucketsHandler: get user info fail: requestID(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.AccessKey(), err)
 		return
@@ -590,9 +590,29 @@ func (o *ObjectNode) getObjectLockConfigurationHandler(w http.ResponseWriter, r 
 	writeSuccessResponseXML(w, data)
 }
 
-func (o *ObjectNode) getUserInfoByAccessKeyV2(accessKey string) (userInfo *proto.UserInfo, err error) {
+// getUserInfoByAccessKeyV2 resolves accessKey to a CubeFS user. bucket
+// enables the oss-accel backend-credential bridge fallback (see
+// objectnode/auth.go's matching check in getUidSecretKeyWithCheckVol,
+// which already accepted this same ak/sk pair for signature verification —
+// every one of this function's ~9 callers does its own independent
+// accessKey→user lookup for ACL/ownership purposes downstream of that, and
+// needs the same bridge or a validly-signed bridged request fails here
+// with "user not exists" despite having passed signature verification).
+// Pass an empty bucket to skip the fallback (e.g. account-level APIs with
+// no single target bucket, or the STS token flow, which is out of scope
+// for this bridge).
+func (o *ObjectNode) getUserInfoByAccessKeyV2(accessKey, bucket string) (userInfo *proto.UserInfo, err error) {
 	userInfo, err = o.userStore.LoadUser(accessKey)
 	if err == proto.ErrUserNotExists || err == proto.ErrAccessKeyNotExists || err == proto.ErrParamError {
+		if bucket != "" {
+			if vol, verr := o.getVol(bucket); verr == nil {
+				// uid MUST be the real owner string — see the matching
+				// comment in auth.go's getUidSecretKeyWithCheckVol for why.
+				if backendAk, _, allowed := vol.OSSAccelBackendCredential(); allowed && backendAk == accessKey {
+					return &proto.UserInfo{UserID: vol.GetOwner(), AccessKey: accessKey}, nil
+				}
+			}
+		}
 		err = InvalidAccessKeyId
 	}
 	return

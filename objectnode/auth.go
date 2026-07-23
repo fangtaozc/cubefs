@@ -194,7 +194,9 @@ func (o *ObjectNode) validateAuthInfo(r *http.Request, auth Auther) (err error) 
 			return err
 		}
 	} else {
-		stsInfo, err = DecodeFedSessionToken(reqAK, token, o.getUserInfoByAccessKeyV2)
+		stsInfo, err = DecodeFedSessionToken(reqAK, token, func(ak string) (*proto.UserInfo, error) {
+			return o.getUserInfoByAccessKeyV2(ak, param.Bucket())
+		})
 		if err != nil {
 			log.LogErrorf("validateAuthInfo: decode session token fail: requestID(%v) ak(%v) token(%v) err(%v)",
 				GetRequestID(r), reqAK, token, err)
@@ -290,6 +292,25 @@ func (o *ObjectNode) getUidSecretKeyWithCheckVol(r *http.Request, ak string, ck 
 			}
 			if ossAk, ossSk := vol.OSSSecure(); ossAk == ak {
 				uid, sk = vol.GetOwner(), ossSk
+				return
+			}
+			// oss-accel backend-credential bridge: a volume that has
+			// explicitly opted in (proto.OSSAccelBackendConfig.
+			// AllowBackendCredentialAuth) accepts S3 requests signed with
+			// the SAME ak/sk used to reach its external cold backend, as
+			// a full-permission identity mapped to the volume owner. The
+			// "oss-accel-backend:" uid prefix is for audit/log
+			// distinguishability only — it does not affect what the
+			// returned sk authorizes.
+			if backendAk, backendSk, allowed := vol.OSSAccelBackendCredential(); allowed && backendAk == ak {
+				// uid MUST be the real owner string, not a distinguishing
+				// synthetic value: downstream ownership checks (e.g.
+				// objectnode/api_handler_object.go's ParseACL call compares
+				// userInfo.UserID against vol.GetOwner() to decide whether
+				// non-owner ACL restrictions apply) rely on exact equality
+				// to grant the "读写对等" full owner-equivalent access this
+				// bridge is supposed to provide.
+				uid, sk = vol.GetOwner(), backendSk
 				return
 			}
 		}

@@ -174,8 +174,9 @@ func (o *ObjectNode) policyCheck(f http.HandlerFunc) http.HandlerFunc {
 			allowed = false
 			return
 		}
+		var vol *Volume
 		if bucket := mux.Vars(r)[ContextKeyBucket]; len(bucket) > 0 {
-			if _, err = o.getVol(bucket); err != nil {
+			if vol, err = o.getVol(bucket); err != nil {
 				allowed = false
 				return
 			}
@@ -197,6 +198,24 @@ func (o *ObjectNode) policyCheck(f http.HandlerFunc) http.HandlerFunc {
 		}
 		userInfo, err = o.getUserInfoByAccessKey(param.AccessKey())
 		if err != nil {
+			// oss-accel backend-credential bridge: signature verification
+			// (objectnode/auth.go's getUidSecretKeyWithCheckVol) already
+			// accepted this ak/sk via the SAME check — this is a separate
+			// downstream authorization step with its own independent
+			// accessKey→user lookup, which fails for a bridged request
+			// (its ak is never a registered CubeFS user) unless checked
+			// here too. Full owner-equivalent access, matching the
+			// "读写对等" decision — no narrower policy to apply since
+			// there's no CubeFS user/policy record for this identity.
+			if vol != nil {
+				if backendAk, _, bridgeAllowed := vol.OSSAccelBackendCredential(); bridgeAllowed && backendAk == param.AccessKey() {
+					log.LogDebugf("user policy check: oss-accel backend-credential bridge: requestID(%v) volume(%v)",
+						GetRequestID(r), vol.Name())
+					allowed = true
+					err = nil
+					return
+				}
+			}
 			log.LogErrorf("user policy check: load user policy from master fail: requestID(%v) accessKey(%v) err(%v)",
 				GetRequestID(r), param.AccessKey(), err)
 			allowed = false

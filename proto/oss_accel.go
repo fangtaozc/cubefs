@@ -88,6 +88,14 @@ type OSSAccelBackendConfig struct {
 	SecretKeyEnv  string `json:"secretKeyEnv,omitempty"`
 	PathStyle     bool   `json:"pathStyle,omitempty"`
 	SkipTLSVerify bool   `json:"skipTlsVerify,omitempty"`
+	// AllowBackendCredentialAuth opts this volume in to accepting S3
+	// requests against ObjectNode that are signed with THIS backend's own
+	// AK/SK (the same pair used to reach the external cold bucket) as a
+	// valid identity — full read/write, mapped to the volume owner's
+	// permissions. Off by default: this is a bridge from a
+	// pre-existing-elsewhere credential into CubeFS's own namespace, not
+	// something that should activate just because a backend is configured.
+	AllowBackendCredentialAuth bool `json:"allowBackendCredentialAuth,omitempty"`
 }
 
 // ChecksumPrefixSHA256 prefixes the value stored in XAttrKeyOSSAccelChecksum.

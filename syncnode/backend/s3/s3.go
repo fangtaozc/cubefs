@@ -170,6 +170,44 @@ type Backend struct {
 	cfg        *Config
 }
 
+// ResolveCredentials resolves cfg's AK/SK to concrete string values:
+// inline Config.AccessKey/SecretKey first, then the named env vars, then
+// (if still unresolved) the AWS SDK's own default credential chain —
+// further env vars, the shared credentials file pointed at by
+// AWS_SHARED_CREDENTIALS_FILE, IAM role, etc.
+//
+// This mirrors the resolution New() performs internally when constructing
+// a client, except New() hands whatever it finds straight to the SDK
+// without ever exposing the string values — callers that need the actual
+// value (e.g. to compare against a signature, not to make S3 calls) should
+// use this instead of constructing a full Backend. Kept as a separate,
+// deliberately duplicated 6-line resolution rather than a shared helper
+// New() also calls, to avoid changing New()'s existing (lazy,
+// request-time) credential resolution behavior for the real upload path.
+func ResolveCredentials(ctx context.Context, c *Config) (ak, sk string, err error) {
+	ak = c.AccessKey
+	sk = c.SecretKey
+	if ak == "" && c.AccessKeyEnv != "" {
+		ak = os.Getenv(c.AccessKeyEnv)
+	}
+	if sk == "" && c.SecretKeyEnv != "" {
+		sk = os.Getenv(c.SecretKeyEnv)
+	}
+	if ak != "" && sk != "" {
+		return ak, sk, nil
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(c.Region))
+	if err != nil {
+		return "", "", fmt.Errorf("s3 backend: load aws config: %w", err)
+	}
+	creds, err := awsCfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("s3 backend: resolve default credential chain: %w", err)
+	}
+	return creds.AccessKeyID, creds.SecretAccessKey, nil
+}
+
 // New constructs a Backend from cfg (which must be *Config). Required by
 // the registry pattern — see backend/registry.go.
 //

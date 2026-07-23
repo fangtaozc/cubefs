@@ -176,13 +176,14 @@ func newOssAccelVolMetaWrapper(client *master.MasterClient, volName string) (*me
 
 func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 	var (
-		endpoint      string
-		region        string
-		bucket        string
-		accessKeyEnv  string
-		secretKeyEnv  string
-		pathStyle     bool
-		skipTLSVerify bool
+		endpoint                   string
+		region                     string
+		bucket                     string
+		accessKeyEnv               string
+		secretKeyEnv               string
+		pathStyle                  bool
+		skipTLSVerify              bool
+		allowBackendCredentialAuth bool
 	)
 	cmd := &cobra.Command{
 		Use:   cmdOssAccelBackendSetUse,
@@ -195,13 +196,14 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 				return
 			}
 			cfg := proto.OSSAccelBackendConfig{
-				Endpoint:      endpoint,
-				Region:        region,
-				Bucket:        bucket,
-				AccessKeyEnv:  accessKeyEnv,
-				SecretKeyEnv:  secretKeyEnv,
-				PathStyle:     pathStyle,
-				SkipTLSVerify: skipTLSVerify,
+				Endpoint:                   endpoint,
+				Region:                     region,
+				Bucket:                     bucket,
+				AccessKeyEnv:               accessKeyEnv,
+				SecretKeyEnv:               secretKeyEnv,
+				PathStyle:                  pathStyle,
+				SkipTLSVerify:              skipTLSVerify,
+				AllowBackendCredentialAuth: allowBackendCredentialAuth,
 			}
 			raw, err := json.Marshal(cfg)
 			if err != nil {
@@ -228,6 +230,8 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().StringVar(&secretKeyEnv, "secret-key-env", "", "name of the lcnode env var holding the secret key (defaults to the mover's global OSS_ACCEL_S3_SK if empty)")
 	cmd.Flags().BoolVar(&pathStyle, "path-style", false, "use S3 path-style addressing (MinIO/Ceph RGW)")
 	cmd.Flags().BoolVar(&skipTLSVerify, "skip-tls-verify", false, "skip TLS certificate verification")
+	cmd.Flags().BoolVar(&allowBackendCredentialAuth, "allow-backend-credential-auth", false,
+		"allow S3 requests against ObjectNode signed with this backend's own AK/SK to authenticate as the volume owner (off by default)")
 	return cmd
 }
 

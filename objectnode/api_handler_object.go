@@ -617,7 +617,7 @@ func (o *ObjectNode) deleteObjectsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	userInfo, err := o.getUserInfoByAccessKeyV2(param.AccessKey())
+	userInfo, err := o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket())
 	if err != nil {
 		log.LogErrorf("deleteObjectsHandler: get userinfo fail: requestID(%v) volume(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.Bucket(), param.AccessKey(), err)
@@ -789,7 +789,7 @@ func (o *ObjectNode) copyObjectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// check ACL
-	userInfo, err := o.getUserInfoByAccessKeyV2(param.AccessKey())
+	userInfo, err := o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket())
 	if err != nil {
 		log.LogErrorf("copyObjectHandler: get user info fail: requestID(%v) volume(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.Bucket(), param.AccessKey(), err)
@@ -1318,7 +1318,7 @@ func (o *ObjectNode) putObjectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var userInfo *proto.UserInfo
-	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey()); err != nil {
+	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket()); err != nil {
 		log.LogErrorf("putObjectHandler: get user info fail: requestID(%v) volume(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.Bucket(), param.AccessKey(), err)
 		return
@@ -1435,7 +1435,7 @@ func (o *ObjectNode) postObjectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var userInfo *proto.UserInfo
-	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey()); err != nil {
+	if userInfo, err = o.getUserInfoByAccessKeyV2(param.AccessKey(), param.Bucket()); err != nil {
 		log.LogErrorf("postObjectHandler: get user info fail: requestID(%v) volume(%v) accessKey(%v) err(%v)",
 			GetRequestID(r), param.Bucket(), param.AccessKey(), err)
 		return
