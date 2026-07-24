@@ -72,7 +72,8 @@ func (l *LcNode) httpServiceOssAccelTrashPurge(w http.ResponseWriter, r *http.Re
 // one purge pass — the shared setup both httpServiceOssAccelTrashPurge
 // (manual trigger) and opOssAccelTrashPurge (系统层面收尾: master-scheduled
 // AdminTask, lcnode/lc_op.go) call.
-func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours uint64) ([]string, error) {
+func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours uint64) (purged []string, err error) {
+	defer ossAccelObserve("trashPurge", vol, &err)()
 	metaWrapper, err := l.buildVolMetaWrapper(vol)
 	if err != nil {
 		return nil, err

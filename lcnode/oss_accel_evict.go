@@ -69,6 +69,7 @@ type ossAccelEvictCandidate struct {
 // ratio (all needed by master to decide whether another round is needed —
 // see proto.OSSAccelEvictionTaskResponse).
 func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64) (considered, evicted int, usageRatioAfter float64, err error) {
+	defer ossAccelObserve("evict", vol, &err)()
 	mw, berr := l.buildVolMetaWrapper(vol)
 	if berr != nil {
 		return 0, 0, 0, berr
@@ -131,7 +132,7 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 			wg.Add(1)
 			go func(i int, c ossAccelEvictCandidate) {
 				defer wg.Done()
-				if _, _, _, cerr := runOssAccelCommitCold(mw, c.ino, c.path, 0); cerr != nil {
+				if _, _, _, cerr := runOssAccelCommitCold(mw, vol, c.ino, c.path, 0); cerr != nil {
 					log.LogWarnf("runOssAccelEvictionSweep: vol(%v) commit-cold ino(%v) name(%v) err: %v", vol, c.ino, c.name, cerr)
 					return // one stuck candidate (e.g. lease still valid) shouldn't abort the whole sweep
 				}

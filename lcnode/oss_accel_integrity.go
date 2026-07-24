@@ -84,6 +84,7 @@ type ossAccelIntegrityCandidate struct {
 // one integrity sweep — mirrors runOssAccelAuditForVol's construction
 // pattern.
 func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount uint32) (cheapChecked, fullChecked, mismatches int, err error) {
+	defer ossAccelObserve("integrity", vol, &err)()
 	mw, berr := l.buildVolMetaWrapper(vol)
 	if berr != nil {
 		return 0, 0, 0, berr

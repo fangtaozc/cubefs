@@ -419,7 +419,7 @@ func (l *LcNode) httpServiceStart() {
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelFlush))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelRecall").
-		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelRecall))
+		HandlerFunc(requireLcnodeAdminToken(ossAccelObserveHTTP("recall", l.httpServiceOssAccelRecall)))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelCommitCold").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelCommitCold))

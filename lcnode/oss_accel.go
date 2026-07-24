@@ -248,6 +248,7 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 // the file actually released from the hot tier must follow up with
 // runOssAccelCommitCold (see runOssAccelFlushPolicyForVol for exactly that).
 func (l *LcNode) runOssAccelFlushForVol(vol, path string, ino, size uint64, sc, vsc uint32, asc []uint32) (s3key, checksum string, err error) {
+	defer ossAccelObserve("flush", vol, &err)()
 	s3key = normalizeOssAccelKey(path)
 
 	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
@@ -830,7 +831,7 @@ func (l *LcNode) httpServiceOssAccelCommitCold(w http.ResponseWriter, r *http.Re
 	}
 	defer metaWrapper.Close()
 
-	beforeSC, afterSC, afterSize, cerr := runOssAccelCommitCold(metaWrapper, ino, path, delayDelMinute)
+	beforeSC, afterSC, afterSize, cerr := runOssAccelCommitCold(metaWrapper, vol, ino, path, delayDelMinute)
 	if cerr != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(cerr, errOssAccelLeaseNotExpired) {
@@ -857,7 +858,8 @@ var errOssAccelLeaseNotExpired = errors.New("migration lease not expired")
 // (oss_accel_evict.go). vsc/extentClient are NOT needed here (unlike
 // flush/recall): commit-cold is a pure metadata operation
 // (UpdateExtentKeyAfterMigration), so this only needs a MetaWrapper.
-func runOssAccelCommitCold(mw *meta.MetaWrapper, ino uint64, path string, delayDelMinute uint64) (beforeSC, afterSC uint32, afterSize uint64, err error) {
+func runOssAccelCommitCold(mw *meta.MetaWrapper, vol string, ino uint64, path string, delayDelMinute uint64) (beforeSC, afterSC uint32, afterSize uint64, err error) {
+	defer ossAccelObserve("commitCold", vol, &err)()
 	before, gerr := mw.InodeGet_ll(ino)
 	if gerr != nil || before == nil {
 		return 0, 0, 0, fmt.Errorf("InodeGet_ll err: %v", gerr)
@@ -1107,6 +1109,7 @@ func effectiveOssAccelChangelogKey(changelogKey string) string {
 // back in. 0/0 (the manual HTTP endpoint's fixed arguments) preserves the
 // original never-skip behavior exactly.
 func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string, skipAfterFailures, consecutiveFailures uint32) (processed, skipped, failed int, cursor, newCursor uint64, err error) {
+	defer ossAccelObserve("changelogSync", vol, &err)()
 	changelogKey = effectiveOssAccelChangelogKey(changelogKey)
 
 	metaWrapper, err := l.buildVolMetaWrapper(vol)

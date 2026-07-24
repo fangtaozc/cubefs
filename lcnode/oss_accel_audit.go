@@ -163,7 +163,8 @@ func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request
 // trigger) and opOssAccelAudit (系统层面收尾: master-scheduled AdminTask,
 // lcnode/lc_op.go) call, so the construction logic isn't duplicated
 // between the two entry points.
-func (l *LcNode) runOssAccelAuditForVol(vol, prefix string, graceHours uint64) (ossAccelAuditResult, error) {
+func (l *LcNode) runOssAccelAuditForVol(vol, prefix string, graceHours uint64) (result ossAccelAuditResult, err error) {
+	defer ossAccelObserve("audit", vol, &err)()
 	metaWrapper, err := l.buildVolMetaWrapper(vol)
 	if err != nil {
 		return ossAccelAuditResult{}, err

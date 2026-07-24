@@ -78,6 +78,7 @@ type ossAccelFlushPolicyCandidate struct {
 // filter, and how many hit an error partway through (a single stuck
 // candidate never aborts the whole sweep).
 func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours uint32, minSizeBytes uint64) (scanned, flushed, skipped, errors int, err error) {
+	defer ossAccelObserve("flushPolicy", vol, &err)()
 	mw, berr := l.buildVolMetaWrapper(vol)
 	if berr != nil {
 		return 0, 0, 0, 0, berr
@@ -147,7 +148,7 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 					log.LogWarnf("runOssAccelFlushPolicyForVol: vol(%v) flush ino(%v) path(%v) err: %v", vol, c.ino, c.path, ferr)
 					return // one stuck candidate shouldn't abort the whole sweep
 				}
-				if _, _, _, cerr := runOssAccelCommitCold(mw, c.ino, c.path, 0); cerr != nil {
+				if _, _, _, cerr := runOssAccelCommitCold(mw, vol, c.ino, c.path, 0); cerr != nil {
 					log.LogWarnf("runOssAccelFlushPolicyForVol: vol(%v) commit-cold ino(%v) path(%v) err: %v", vol, c.ino, c.path, cerr)
 					return
 				}
