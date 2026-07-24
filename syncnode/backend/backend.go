@@ -129,6 +129,15 @@ type Stat struct {
 	UID    *uint32           // POSIX uid; nil when not stored
 	GID    *uint32           // POSIX gid; nil when not stored
 	Xattrs map[string][]byte // xattr name → raw bytes; nil/empty when none
+
+	// RawMetadata is the backend's full, unparsed metadata map (for s3:
+	// every x-amz-meta-* key as the caller wrote it, not just the
+	// syncnode-* fields already broken out above) — lets callers outside
+	// this package check for their own caller-defined metadata keys
+	// (e.g. an ownership marker) without backend needing to know what
+	// those keys mean. nil when the backend doesn't support arbitrary
+	// metadata passthrough.
+	RawMetadata map[string]string
 }
 
 // ServerSideCopier is an optional capability interface for backends that

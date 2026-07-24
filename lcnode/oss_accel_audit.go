@@ -64,17 +64,20 @@ const ossAccelTrashPrefix = ".trash/"
 const ossAccelDefaultOrphanGraceHours = 24
 
 // ossAccelReservedS3Prefixes are S3 key prefixes known to belong to OTHER
-// systems sharing this bucket, never to oss-accel — Direction B's orphan
-// scan must never treat them as candidates. "No CubeFS inode references
-// this key" is true of literally everything outside oss-accel's own
-// namespace, not just genuine leaks; without this list, an audit call whose
-// prefix ends up too broad (or empty) can't tell the difference.
+// systems sharing this bucket, never to oss-accel — a fast pre-filter so
+// Direction B's orphan scan doesn't bother Head-confirming keys that are
+// obviously not ours. This list is NOT the safety mechanism anymore (see
+// ossAccelOwnerMetadataKey below) — it only saves a Head call for the
+// common, already-known-foreign cases; anything that slips past this list
+// still gets the ownership-marker check before it can ever be quarantined.
 //
 // Real-machine incident (2026-07-22): an unscoped audit run (prefix="")
 // quarantined 74 Terraform/OpenTofu remote-state files
 // (envs/<env>/<component>/terraform.tfstate) that share this bucket with
-// oss-accel's test data — restored by hand, but the underlying gap (no
-// notion of "this key belongs to someone else") needed closing here.
+// oss-accel's test data — restored by hand. The underlying gap this
+// exposed ("no notion of 'this key belongs to someone else'") is what the
+// marker+confirm scheme below actually closes; this prefix list remains
+// only as a cheap optimization, not the thing preventing a repeat.
 var ossAccelReservedS3Prefixes = []string{
 	"envs/", // this repo's own Terraform/OpenTofu S3 remote-state layout (see cubefs-deploy/root.hcl)
 }
@@ -86,6 +89,49 @@ func isOssAccelReservedS3Key(key string) bool {
 		}
 	}
 	return false
+}
+
+// ossAccelOwnerMetadataKey/Value is the ownership marker every oss-accel
+// flush stamps on its S3 objects (see httpServiceOssAccelFlush's Put call).
+// Direction B's orphan scan uses this — not the reserved-prefix list above
+// — as the actual safety mechanism before quarantining a key: no marker
+// means "not written by this oss-accel deployment," full stop, regardless
+// of what prefix it happens to live under. This is what makes the 2026-07-22
+// incident (see ossAccelReservedS3Prefixes) structurally impossible to
+// repeat — a shared bucket can gain arbitrary new foreign prefixes in the
+// future and none of them need to be enumerated here.
+//
+// Known limitation: objects flushed before this marker existed have no way
+// to acquire it retroactively short of being re-flushed — they'll be
+// treated as foreign (skipped, never quarantined) rather than losing their
+// orphan-detection coverage in the unsafe direction. A one-off backfill
+// job could re-tag them if that coverage gap matters in practice; not done
+// here.
+const (
+	ossAccelOwnerMetadataKey   = "oss-accel-owner"
+	ossAccelOwnerMetadataValue = "cubefs"
+)
+
+// isOssAccelOwnedS3Key confirms key actually carries the ownership marker
+// before it's allowed to be treated as an orphan candidate. Treats any
+// Head/Stat failure (including ErrKeyNotFound — a benign list/head race on
+// a key deleted between the two calls) as "not confirmed ours" — the safe
+// direction is to skip, never to quarantine on missing information.
+func isOssAccelOwnedS3Key(ctx context.Context, s3Backend backend.Backend, key string) bool {
+	stater, ok := s3Backend.(backend.Stater)
+	if !ok {
+		// Backend doesn't support metadata passthrough at all — can't
+		// confirm ownership, so nothing is ever quarantined. Correct for
+		// today (oss-accel's cold backend is always the s3 kind, which
+		// does implement Stater), and safe even if that ever changes.
+		return false
+	}
+	st, err := stater.Stat(ctx, key)
+	if err != nil {
+		log.LogWarnf("isOssAccelOwnedS3Key: Stat key(%v) err(%v) — treating as not confirmed ours", key, err)
+		return false
+	}
+	return st.RawMetadata[ossAccelOwnerMetadataKey] == ossAccelOwnerMetadataValue
 }
 
 // httpServiceOssAccelAudit handles GET /ossAccelAudit?vol=&prefix=&orphanGraceHours=
@@ -102,26 +148,7 @@ func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request
 	prefix := r.FormValue("prefix")
 	graceHours := parseUintForm(r, "orphanGraceHours", ossAccelDefaultOrphanGraceHours)
 
-	metaWrapper, err := l.buildVolMetaWrapper(vol)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer metaWrapper.Close()
-
-	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	s3Backend, err := s3.New(s3Cfg)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer s3Backend.Close()
-
-	result, err := runOssAccelAudit(metaWrapper, s3Backend, prefix, time.Duration(graceHours)*time.Hour)
+	result, err := l.runOssAccelAuditForVol(vol, prefix, graceHours)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -129,6 +156,31 @@ func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request
 	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v orphansConsidered=%v quarantined=%v relocated=%v driftConflicts=%v\ndanglingKeys=%v\nquarantinedKeys=%v\nrelocatedKeys=%v\ndriftConflictKeys=%v\n",
 		vol, prefix, len(result.DanglingKeys), len(result.OrphanCandidateKeys), len(result.QuarantinedKeys), len(result.RelocatedKeys), len(result.DriftConflictKeys),
 		result.DanglingKeys, result.QuarantinedKeys, result.RelocatedKeys, result.DriftConflictKeys)
+}
+
+// runOssAccelAuditForVol builds this volume's meta/S3 clients and runs one
+// audit pass — the shared setup both httpServiceOssAccelAudit (manual
+// trigger) and opOssAccelAudit (系统层面收尾: master-scheduled AdminTask,
+// lcnode/lc_op.go) call, so the construction logic isn't duplicated
+// between the two entry points.
+func (l *LcNode) runOssAccelAuditForVol(vol, prefix string, graceHours uint64) (ossAccelAuditResult, error) {
+	metaWrapper, err := l.buildVolMetaWrapper(vol)
+	if err != nil {
+		return ossAccelAuditResult{}, err
+	}
+	defer metaWrapper.Close()
+
+	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
+	if err != nil {
+		return ossAccelAuditResult{}, err
+	}
+	s3Backend, err := s3.New(s3Cfg)
+	if err != nil {
+		return ossAccelAuditResult{}, fmt.Errorf("s3 backend init err: %v", err)
+	}
+	defer s3Backend.Close()
+
+	return runOssAccelAudit(metaWrapper, s3Backend, prefix, time.Duration(graceHours)*time.Hour)
 }
 
 // ossAccelAuditResult carries not just counts but the actual affected keys —
@@ -256,6 +308,14 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 		}
 		if now.Sub(mtime) < orphanGrace {
 			continue // too fresh — may just not be consumed via changelog yet
+		}
+		if !isOssAccelOwnedS3Key(ctx, s3Backend, key) {
+			// Confirmed not ours (or unconfirmable) — never quarantine.
+			// This, not the reserved-prefix list, is what makes the
+			// 2026-07-22 shared-bucket incident structurally impossible
+			// to repeat: any foreign key, under any prefix, is safe by
+			// default.
+			continue
 		}
 		result.OrphanCandidateKeys = append(result.OrphanCandidateKeys, key)
 		trashKey := ossAccelTrashPrefix + key

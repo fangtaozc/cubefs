@@ -395,7 +395,9 @@ static int cfs_oss_accel_gate(struct cfs_inode *ci)
 		size = i_size_read(inode);
 	}
 
-	ret = cfs_oss_accel_recall_via_helper(mover_addr, cmi->options->volume,
+	ret = cfs_oss_accel_recall_via_helper(mover_addr,
+					      cmi->options->oss_accel_admin_token,
+					      cmi->options->volume,
 					      inode->i_ino, size, s3key,
 					      checksum);
 	if (ret == 0) {

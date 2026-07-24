@@ -26,6 +26,10 @@
  * be an empty string (skips server-side verification, not a security
  * concern since the bytes still come from the inode's own designated S3 key).
  *
+ * admin_token (系统层面收尾) is forwarded as-is to the helper's -token flag;
+ * NULL/empty sends no Authorization header, matching lcnode's own
+ * passthrough-when-empty behavior when its own admin token isn't configured.
+ *
  * Returns:
  *   0        recall succeeded (or the mover reports the inode already at
  *            the target class); caller should refresh cached extents/attrs
@@ -36,7 +40,8 @@
  *            mover response). Caller must not fall through to a read that
  *            could return zero-filled data.
  */
-int cfs_oss_accel_recall_via_helper(const char *mover_addr, const char *vol,
+int cfs_oss_accel_recall_via_helper(const char *mover_addr,
+				    const char *admin_token, const char *vol,
 				    u64 ino, u64 size, const char *s3key,
 				    const char *checksum);
 

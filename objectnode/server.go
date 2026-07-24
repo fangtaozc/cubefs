@@ -163,6 +163,16 @@ const (
 	//			"ossAccelMoverAddr": "10.54.120.80:17511"
 	//		}
 	configOssAccelMoverAddr = "ossAccelMoverAddr"
+
+	// 系统层面收尾: shared admin token ObjectNode sends when calling lcnode's
+	// /ossAccelRecall (see lcnode/oss_accel_auth.go — the same token value
+	// configured on lcnode's own side). Empty/absent = no Authorization
+	// header sent, matching lcnode's own passthrough-when-empty behavior.
+	// Example:
+	//		{
+	//			"ossAccelAdminToken": "..."
+	//		}
+	configOssAccelAdminToken = "ossAccelAdminToken"
 )
 
 // Default of configuration value
@@ -193,6 +203,8 @@ var (
 	// directly by fs_volume.go rather than threaded through VolumeConfig,
 	// same pattern as blockCache above.
 	ossAccelMoverAddr string
+	// ossAccelAdminToken: see configOssAccelAdminToken above.
+	ossAccelAdminToken string
 )
 
 type ObjectNode struct {
@@ -344,6 +356,11 @@ func (o *ObjectNode) loadConfig(cfg *config.Config) (err error) {
 	ossAccelMoverAddr = cfg.GetString(configOssAccelMoverAddr)
 	if ossAccelMoverAddr != "" {
 		log.LogInfof("loadConfig: setup config: %v(%v)", configOssAccelMoverAddr, ossAccelMoverAddr)
+	}
+
+	ossAccelAdminToken = cfg.GetString(configOssAccelAdminToken)
+	if ossAccelAdminToken != "" {
+		log.LogInfof("loadConfig: setup config: %v(set)", configOssAccelAdminToken)
 	}
 
 	return

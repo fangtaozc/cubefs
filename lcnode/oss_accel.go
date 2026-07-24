@@ -104,6 +104,7 @@ func loadOssAccelS3ConfigFromVol(mw *meta.MetaWrapper) (*s3.Config, error) {
 		Bucket:             cfg.Bucket,
 		AccessKeyEnv:       cfg.AccessKeyEnv,
 		SecretKeyEnv:       cfg.SecretKeyEnv,
+		Profile:            cfg.ProfileName,
 		UsePathStyle:       cfg.PathStyle,
 		InsecureSkipVerify: cfg.SkipTLSVerify,
 	}, nil
@@ -274,7 +275,10 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	}()
 
 	ctx := context.Background()
-	putRes, putErr := s3Backend.Put(ctx, s3key, pr, int64(size), backend.PutOptions{ComputeChecksum: true})
+	putRes, putErr := s3Backend.Put(ctx, s3key, pr, int64(size), backend.PutOptions{
+		ComputeChecksum: true,
+		Metadata:        map[string]string{ossAccelOwnerMetadataKey: ossAccelOwnerMetadataValue},
+	})
 	pr.Close()
 	if srcErr != nil {
 		http.Error(w, fmt.Sprintf("read src extent err: %v", srcErr), http.StatusInternalServerError)

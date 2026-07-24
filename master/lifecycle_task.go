@@ -58,6 +58,12 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 	case proto.OpLcNodeOssAccelEvict:
 		response := task.Response.(*proto.OSSAccelEvictionTaskResponse)
 		err = c.handleLcNodeOssAccelEvictResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelAudit:
+		response := task.Response.(*proto.OSSAccelAuditTaskResponse)
+		err = c.handleLcNodeOssAccelAuditResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelTrashPurge:
+		response := task.Response.(*proto.OSSAccelTrashPurgeTaskResponse)
+		err = c.handleLcNodeOssAccelTrashPurgeResp(task.OperatorAddr, response)
 	default:
 		err = fmt.Errorf(fmt.Sprintf("lc unknown operate code %v", task.OpCode))
 		goto errHandler
@@ -142,6 +148,63 @@ func (c *Cluster) handleLcNodeOssAccelEvictResp(nodeAddr string, resp *proto.OSS
 	}
 	c.ossAccelEvictionRuleCache.Put(&updated)
 	log.LogInfof("handleLcNodeOssAccelEvictResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
+}
+
+// handleLcNodeOssAccelAuditResp records the real outcome of a dispatched
+// audit run, overwriting the optimistic LastRunAt stamp fireRule set at
+// dispatch time. Mirrors handleLcNodeOssAccelChangelogSyncResp's "rule
+// deleted mid-flight is a normal race, not an error" handling.
+func (c *Cluster) handleLcNodeOssAccelAuditResp(nodeAddr string, resp *proto.OSSAccelAuditTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelAuditRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelAuditResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: dangling=%v orphans=%v quarantined=%v relocated=%v driftConflicts=%v",
+			resp.Dangling, resp.Orphans, resp.Quarantined, resp.Relocated, resp.DriftConflicts)
+	}
+	if err := c.syncUpdateOSSAccelAuditRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelAuditResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelAuditRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelAuditResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
+}
+
+// handleLcNodeOssAccelTrashPurgeResp records the real outcome of a
+// dispatched trash purge run — same shape as handleLcNodeOssAccelAuditResp.
+func (c *Cluster) handleLcNodeOssAccelTrashPurgeResp(nodeAddr string, resp *proto.OSSAccelTrashPurgeTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelTrashPurgeRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelTrashPurgeResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: purged=%v", resp.Purged)
+	}
+	if err := c.syncUpdateOSSAccelTrashPurgeRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelTrashPurgeResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelTrashPurgeRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelTrashPurgeResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
 

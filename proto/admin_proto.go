@@ -289,6 +289,20 @@ const (
 	OSSAccelEvictionRuleGet    = "/ossAccelEvictionRule/get"    // GET  ?name=<vol>
 	OSSAccelEvictionRuleDelete = "/ossAccelEvictionRule/delete" // POST ?name=<vol>
 
+	// OSSAccelAuditRule / OSSAccelTrashPurgeRule: per-volume schedules
+	// automating the previously manual-only /ossAccelAudit and
+	// /ossAccelTrashPurge lcnode endpoints — same granularity/auth model as
+	// OSSAccelChangelogRule. Body / query params documented in
+	// master/api_service_oss_accel_audit_rule.go and
+	// master/api_service_oss_accel_trash_purge_rule.go.
+	OSSAccelAuditRuleSet    = "/ossAccelAuditRule/set"    // POST body: proto.OSSAccelAuditRule
+	OSSAccelAuditRuleGet    = "/ossAccelAuditRule/get"    // GET  ?name=<vol>
+	OSSAccelAuditRuleDelete = "/ossAccelAuditRule/delete" // POST ?name=<vol>
+
+	OSSAccelTrashPurgeRuleSet    = "/ossAccelTrashPurgeRule/set"    // POST body: proto.OSSAccelTrashPurgeRule
+	OSSAccelTrashPurgeRuleGet    = "/ossAccelTrashPurgeRule/get"    // GET  ?name=<vol>
+	OSSAccelTrashPurgeRuleDelete = "/ossAccelTrashPurgeRule/delete" // POST ?name=<vol>
+
 	// SyncTask observability + lifecycle. Master-side ledger answers
 	// list / get; cancel + retry hit the dispatch layer.
 	SyncTaskList   = "/syncTask/list"   // GET  [?status=&ruleID=&owner=]

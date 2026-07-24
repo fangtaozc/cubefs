@@ -311,6 +311,109 @@ func (l *LcNode) opOssAccelEvict(conn net.Conn, p *proto.Packet) (err error) {
 	return
 }
 
+// opOssAccelAudit handles OpLcNodeOssAccelAudit — 系统层面收尾 (自动化程度
+// 不均): the master-scheduled AdminTask counterpart to the manual
+// GET /ossAccelAudit endpoint (see master/oss_accel_audit_rule_manager.go).
+// Same envelope shape as opOssAccelEvict/opOssAccelChangelogSync.
+func (l *LcNode) opOssAccelAudit(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelAuditTaskRequest{}
+			resp      = &proto.OSSAccelAuditTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelAuditTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		result, runErr := l.runOssAccelAuditForVol(request.VolName, request.Prefix, uint64(request.OrphanGraceHours))
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.Dangling = len(result.DanglingKeys)
+		resp.Orphans = len(result.OrphanCandidateKeys)
+		resp.Quarantined = len(result.QuarantinedKeys)
+		resp.Relocated = len(result.RelocatedKeys)
+		resp.DriftConflicts = len(result.DriftConflictKeys)
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
+// opOssAccelTrashPurge handles OpLcNodeOssAccelTrashPurge — 系统层面收尾:
+// the master-scheduled AdminTask counterpart to the manual
+// GET /ossAccelTrashPurge endpoint (see
+// master/oss_accel_trash_purge_rule_manager.go). Same envelope shape as
+// opOssAccelAudit.
+func (l *LcNode) opOssAccelTrashPurge(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelTrashPurgeTaskRequest{}
+			resp      = &proto.OSSAccelTrashPurgeTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelTrashPurgeTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		purged, runErr := l.runOssAccelTrashPurgeForVol(request.VolName, request.Prefix, uint64(request.RetentionHours))
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.Purged = len(purged)
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
 func responseAckOKToMaster(conn net.Conn, p *proto.Packet) {
 	go func() {
 		p.PacketOkReply()

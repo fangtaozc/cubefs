@@ -56,6 +56,8 @@ static void cfs_options_clear(struct cfs_options *options)
 	options->owner = NULL;
 	kfree(options->oss_accel_mover_addr);
 	options->oss_accel_mover_addr = NULL;
+	kfree(options->oss_accel_admin_token);
+	options->oss_accel_admin_token = NULL;
 }
 
 /**
@@ -203,6 +205,28 @@ static int cfs_options_parse(const char *dev_str, const char *opt_str,
 				options->oss_accel_mover_addr =
 					kstrdup(start, GFP_NOFS);
 			if (!options->oss_accel_mover_addr) {
+				cfs_options_clear(options);
+				return -ENOMEM;
+			}
+			if (end)
+				start = end + 1;
+			else
+				break;
+		} else if (strncmp(start, "ossacceladmintoken=", 19) == 0) {
+			/* 系统层面收尾: shared admin token sent as
+			 * `Authorization: Bearer <token>` on every
+			 * /ossAccelRecall call — see cfs_option.h. Single
+			 * value, same comma-terminates-value convention as
+			 * ossaccelmoveraddr= above. */
+			start += 19;
+			end = strchr(start, ',');
+			if (end)
+				options->oss_accel_admin_token = kstrndup(
+					start, end - start, GFP_NOFS);
+			else
+				options->oss_accel_admin_token =
+					kstrdup(start, GFP_NOFS);
+			if (!options->oss_accel_admin_token) {
 				cfs_options_clear(options);
 				return -ENOMEM;
 			}

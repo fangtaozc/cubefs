@@ -81,7 +81,17 @@ func (s *Super) ossAccelColdReadGate(ino uint64) (err error, recalled bool) {
 		proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD,
 		s3key, checksum)
 
-	resp, herr := ossAccelHTTPClient.Get(url)
+	req, rerr := http.NewRequest(http.MethodGet, url, nil)
+	if rerr != nil {
+		log.LogErrorf("ossAccelColdReadGate: ino(%v) s3key(%v) build request err: %v", ino, s3key, rerr)
+		return syscall.EIO, false
+	}
+	// 系统层面收尾: lcnode's /ossAccelRecall is now gated behind the shared
+	// admin token (lcnode/oss_accel_auth.go) — send it if configured.
+	if s.ossAccelAdminToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.ossAccelAdminToken)
+	}
+	resp, herr := ossAccelHTTPClient.Do(req)
 	if herr != nil {
 		log.LogErrorf("ossAccelColdReadGate: ino(%v) s3key(%v) mover request err: %v", ino, s3key, herr)
 		return syscall.EIO, false

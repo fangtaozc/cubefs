@@ -368,6 +368,18 @@ const (
 	opSyncAddOSSAccelEvictionRule    uint32 = 0x77
 	opSyncDeleteOSSAccelEvictionRule uint32 = 0x78
 	opSyncUpdateOSSAccelEvictionRule uint32 = 0x79
+
+	// 系统层面收尾: oss-accel audit rule persistence (0x7A-0x7C), immediately
+	// after the eviction rule block above — see master/oss_accel_audit_rule_store.go.
+	opSyncAddOSSAccelAuditRule    uint32 = 0x7A
+	opSyncDeleteOSSAccelAuditRule uint32 = 0x7B
+	opSyncUpdateOSSAccelAuditRule uint32 = 0x7C
+
+	// 系统层面收尾: oss-accel trash purge rule persistence (0x7D-0x7F) — see
+	// master/oss_accel_trash_purge_rule_store.go.
+	opSyncAddOSSAccelTrashPurgeRule    uint32 = 0x7D
+	opSyncDeleteOSSAccelTrashPurgeRule uint32 = 0x7E
+	opSyncUpdateOSSAccelTrashPurgeRule uint32 = 0x7F
 )
 
 func init() {
@@ -446,6 +458,14 @@ func init() {
 		opSyncAddOSSAccelEvictionRule,
 		opSyncDeleteOSSAccelEvictionRule,
 		opSyncUpdateOSSAccelEvictionRule,
+
+		opSyncAddOSSAccelAuditRule,
+		opSyncDeleteOSSAccelAuditRule,
+		opSyncUpdateOSSAccelAuditRule,
+
+		opSyncAddOSSAccelTrashPurgeRule,
+		opSyncDeleteOSSAccelTrashPurgeRule,
+		opSyncUpdateOSSAccelTrashPurgeRule,
 	} {
 		if _, in := set[op]; in {
 			panic(op)

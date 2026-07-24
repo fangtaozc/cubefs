@@ -322,6 +322,7 @@ func (v *Volume) loadOssAccelBackendCredentialFresh() (*ossAccelBackendCredentia
 		Region:       cfg.Region,
 		AccessKeyEnv: cfg.AccessKeyEnv,
 		SecretKeyEnv: cfg.SecretKeyEnv,
+		Profile:      cfg.ProfileName,
 	})
 	if err != nil {
 		return nil, err
@@ -1647,7 +1648,19 @@ func (v *Volume) ossAccelColdReadGate(inode uint64) error {
 		proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD,
 		s3key, checksum)
 
-	resp, herr := ossAccelHTTPClient.Get(url)
+	req, rerr := http.NewRequest(http.MethodGet, url, nil)
+	if rerr != nil {
+		log.LogErrorf("ossAccelColdReadGate: volume(%v) inode(%v) s3key(%v) build request err: %v", v.name, inode, s3key, rerr)
+		return syscall.EIO
+	}
+	// 系统层面收尾: lcnode's /ossAccelRecall is now gated behind the shared
+	// admin token (lcnode/oss_accel_auth.go) — send it if configured;
+	// lcnode itself passes the request through unauthenticated when it has
+	// no token configured, so an empty ossAccelAdminToken here is safe.
+	if ossAccelAdminToken != "" {
+		req.Header.Set("Authorization", "Bearer "+ossAccelAdminToken)
+	}
+	resp, herr := ossAccelHTTPClient.Do(req)
 	if herr != nil {
 		log.LogErrorf("ossAccelColdReadGate: volume(%v) inode(%v) s3key(%v) mover request err: %v", v.name, inode, s3key, herr)
 		return syscall.EIO

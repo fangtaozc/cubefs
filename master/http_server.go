@@ -528,6 +528,29 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.OSSAccelEvictionRuleDelete).
 		HandlerFunc(m.deleteOSSAccelEvictionRule)
 
+	// 系统层面收尾 oss-accel audit rule (one schedule per volume) — same
+	// plain auth model as the changelog/eviction rule blocks above.
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelAuditRuleSet).
+		HandlerFunc(m.setOSSAccelAuditRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelAuditRuleGet).
+		HandlerFunc(m.getOSSAccelAuditRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelAuditRuleDelete).
+		HandlerFunc(m.deleteOSSAccelAuditRule)
+
+	// 系统层面收尾 oss-accel trash purge rule (one schedule per volume).
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelTrashPurgeRuleSet).
+		HandlerFunc(m.setOSSAccelTrashPurgeRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelTrashPurgeRuleGet).
+		HandlerFunc(m.getOSSAccelTrashPurgeRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelTrashPurgeRuleDelete).
+		HandlerFunc(m.deleteOSSAccelTrashPurgeRule)
+
 	// syncnode management APIs — gated by the shared admin token
 	// middleware (SEC1). Empty token disables the check, preserving
 	// dev/test defaults.

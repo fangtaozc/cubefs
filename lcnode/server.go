@@ -221,6 +221,15 @@ func (l *LcNode) parseConfig(cfg *config.Config) (err error) {
 
 	stream.SetExentRetryArgs(defaultAllocRetryInterval, defaultWriteRetryInterval, defaultExtenthandlerMaxRetryMin, true)
 
+	// 系统层面收尾: shared admin token gating the 7 oss-accel HTTP endpoints
+	// (see oss_accel_auth.go). Empty (the default) disables the check,
+	// preserving zero-config deployments.
+	adminToken := cfg.GetString(configLcnodeAdminToken)
+	SetLcnodeAdminToken(adminToken)
+	if adminToken != "" {
+		log.LogWarnf("loadConfig: setup config: %v(set)", configLcnodeAdminToken)
+	}
+
 	return
 }
 
@@ -350,6 +359,10 @@ func (l *LcNode) handlePacket(conn net.Conn, p *proto.Packet, remoteAddr string)
 		err = l.opOssAccelChangelogSync(conn, p)
 	case proto.OpLcNodeOssAccelEvict:
 		err = l.opOssAccelEvict(conn, p)
+	case proto.OpLcNodeOssAccelAudit:
+		err = l.opOssAccelAudit(conn, p)
+	case proto.OpLcNodeOssAccelTrashPurge:
+		err = l.opOssAccelTrashPurge(conn, p)
 	default:
 		err = fmt.Errorf("%s unknown Opcode: %d, reqId: %d", remoteAddr,
 			p.Opcode, p.GetReqID())
@@ -394,27 +407,30 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/getFile").
 		HandlerFunc(l.httpServiceGetFile)
+	// 系统层面收尾: all 7 oss-accel endpoints gated behind the shared admin
+	// token (see oss_accel_auth.go — empty configured token = passthrough,
+	// zero-config deployments unaffected).
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelFlush").
-		HandlerFunc(l.httpServiceOssAccelFlush)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelFlush))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelRecall").
-		HandlerFunc(l.httpServiceOssAccelRecall)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelRecall))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelCommitCold").
-		HandlerFunc(l.httpServiceOssAccelCommitCold)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelCommitCold))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelChangelogSync").
-		HandlerFunc(l.httpServiceOssAccelChangelogSync)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelChangelogSync))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelRelocate").
-		HandlerFunc(l.httpServiceOssAccelRelocate)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelRelocate))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelAudit").
-		HandlerFunc(l.httpServiceOssAccelAudit)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelAudit))
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelTrashPurge").
-		HandlerFunc(l.httpServiceOssAccelTrashPurge)
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelTrashPurge))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

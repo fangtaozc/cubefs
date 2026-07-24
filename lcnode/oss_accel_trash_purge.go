@@ -59,32 +59,37 @@ func (l *LcNode) httpServiceOssAccelTrashPurge(w http.ResponseWriter, r *http.Re
 	prefix := r.FormValue("prefix")
 	retentionHours := parseUintForm(r, "retentionHours", ossAccelDefaultTrashRetentionHours)
 
-	metaWrapper, err := l.buildVolMetaWrapper(vol)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer metaWrapper.Close()
-
-	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
-	}
-	s3Backend, err := s3.New(s3Cfg)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer s3Backend.Close()
-
-	purged, perr := runOssAccelTrashPurge(s3Backend, prefix, time.Duration(retentionHours)*time.Hour)
+	purged, perr := l.runOssAccelTrashPurgeForVol(vol, prefix, retentionHours)
 	if perr != nil {
 		http.Error(w, perr.Error(), http.StatusInternalServerError)
 		return
 	}
 	fmt.Fprintf(w, "ok: vol=%v prefix=%v retentionHours=%v purged=%v\npurgedKeys=%v\n",
 		vol, prefix, retentionHours, len(purged), purged)
+}
+
+// runOssAccelTrashPurgeForVol builds this volume's meta/S3 clients and runs
+// one purge pass — the shared setup both httpServiceOssAccelTrashPurge
+// (manual trigger) and opOssAccelTrashPurge (系统层面收尾: master-scheduled
+// AdminTask, lcnode/lc_op.go) call.
+func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours uint64) ([]string, error) {
+	metaWrapper, err := l.buildVolMetaWrapper(vol)
+	if err != nil {
+		return nil, err
+	}
+	defer metaWrapper.Close()
+
+	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
+	if err != nil {
+		return nil, err
+	}
+	s3Backend, err := s3.New(s3Cfg)
+	if err != nil {
+		return nil, fmt.Errorf("s3 backend init err: %v", err)
+	}
+	defer s3Backend.Close()
+
+	return runOssAccelTrashPurge(s3Backend, prefix, time.Duration(retentionHours)*time.Hour)
 }
 
 // runOssAccelTrashPurge deletes every object under .trash/<prefix> whose S3

@@ -32,6 +32,9 @@ const (
 	configLcNodeTaskCountLimit         = "lcNodeTaskCountLimit"
 	configDelayDelMinute               = "delayDelMinute"
 	configUseCreateTime                = "useCreateTime"
+	// 系统层面收尾: shared admin token gating the 7 oss-accel HTTP endpoints
+	// (see oss_accel_auth.go). Empty = auth disabled.
+	configLcnodeAdminToken = "lcnodeAdminToken"
 )
 
 // Default of configuration value

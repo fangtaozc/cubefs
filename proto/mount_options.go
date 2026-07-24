@@ -105,6 +105,11 @@ const (
 	// oss-accel is not enabled for this mount — the cold read gate is a no-op and
 	// StorageClass=BlobStore files fall back to the native blobstore reader.
 	OssAccelMoverAddr
+	// 系统层面收尾: shared admin token sent to lcnode's /ossAccelRecall (see
+	// lcnode/oss_accel_auth.go — the same token value configured on
+	// lcnode's own side). Empty (default) sends no Authorization header,
+	// matching lcnode's own passthrough-when-empty behavior.
+	OssAccelAdminToken
 	MaxMountOption
 )
 
@@ -215,6 +220,7 @@ func InitMountOptions(opts []MountOption) {
 	opts[InodeLruLimit] = MountOption{"inodeLruLimit", "capacity for inode lru", "", int64(10000000)}
 	opts[FuseServeThreads] = MountOption{"fuseServeThreads", "Fuse Serve Threads", "", int64(0)}
 	opts[OssAccelMoverAddr] = MountOption{"ossAccelMoverAddr", "oss-accel mover (lcnode) addresses, comma-separated; empty disables oss-accel", "", ""}
+	opts[OssAccelAdminToken] = MountOption{"ossAccelAdminToken", "shared admin token sent to lcnode's oss-accel endpoints; empty sends no Authorization header", "", ""}
 	for i := 0; i < MaxMountOption; i++ {
 		flag.StringVar(&opts[i].cmdlineValue, opts[i].keyword, "", opts[i].description)
 	}
@@ -411,4 +417,7 @@ type MountOptions struct {
 	// oss-accel: comma-separated lcnode (mover) addresses. Empty disables the
 	// cold read gate (see OssAccelMoverAddr mount option).
 	OssAccelMoverAddr string
+	// oss-accel: shared admin token sent to lcnode (see OssAccelAdminToken
+	// mount option).
+	OssAccelAdminToken string
 }

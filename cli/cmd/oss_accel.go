@@ -181,6 +181,7 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 		bucket                     string
 		accessKeyEnv               string
 		secretKeyEnv               string
+		profile                    string
 		pathStyle                  bool
 		skipTLSVerify              bool
 		allowBackendCredentialAuth bool
@@ -201,6 +202,7 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 				Bucket:                     bucket,
 				AccessKeyEnv:               accessKeyEnv,
 				SecretKeyEnv:               secretKeyEnv,
+				ProfileName:                profile,
 				PathStyle:                  pathStyle,
 				SkipTLSVerify:              skipTLSVerify,
 				AllowBackendCredentialAuth: allowBackendCredentialAuth,
@@ -228,6 +230,7 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().StringVar(&bucket, "bucket", "", "bucket name (required)")
 	cmd.Flags().StringVar(&accessKeyEnv, "access-key-env", "", "name of the lcnode env var holding the access key (defaults to the mover's global OSS_ACCEL_S3_AK if empty — credential VALUES are never stored here)")
 	cmd.Flags().StringVar(&secretKeyEnv, "secret-key-env", "", "name of the lcnode env var holding the secret key (defaults to the mover's global OSS_ACCEL_S3_SK if empty)")
+	cmd.Flags().StringVar(&profile, "profile", "", "named profile in the shared-credentials file to resolve this volume's ak/sk from (defaults to \"default\" if empty — lets multiple volumes share one mounted credentials file while each resolving to a different secret value)")
 	cmd.Flags().BoolVar(&pathStyle, "path-style", false, "use S3 path-style addressing (MinIO/Ceph RGW)")
 	cmd.Flags().BoolVar(&skipTLSVerify, "skip-tls-verify", false, "skip TLS certificate verification")
 	cmd.Flags().BoolVar(&allowBackendCredentialAuth, "allow-backend-credential-auth", false,

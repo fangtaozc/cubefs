@@ -22,15 +22,16 @@ module_param(oss_accel_helper_path, charp, 0644);
 MODULE_PARM_DESC(oss_accel_helper_path,
 		 "path to the cfs-oss-accel-helper binary invoked to recall oss-accel cold files (see cmd/cfs-oss-accel-helper)");
 
-int cfs_oss_accel_recall_via_helper(const char *mover_addr, const char *vol,
+int cfs_oss_accel_recall_via_helper(const char *mover_addr,
+				    const char *admin_token, const char *vol,
 				    u64 ino, u64 size, const char *s3key,
 				    const char *checksum)
 {
-	char *argv[11];
+	char *argv[12];
 	char *envp[] = { "HOME=/", "PATH=/sbin:/usr/sbin:/bin:/usr/bin",
 			 NULL };
 	char *mover_arg, *vol_arg, *ino_arg, *size_arg, *path_arg,
-		*checksum_arg, *sc_arg, *vsc_arg, *asc_arg;
+		*checksum_arg, *sc_arg, *vsc_arg, *asc_arg, *token_arg;
 	int ret;
 	int status;
 
@@ -45,8 +46,14 @@ int cfs_oss_accel_recall_via_helper(const char *mover_addr, const char *vol,
 			    CFS_STORAGE_CLASS_REPLICA_HDD);
 	asc_arg = kasprintf(GFP_NOFS, "-asc=%u",
 			    CFS_STORAGE_CLASS_REPLICA_HDD);
+	/* admin_token may be NULL (option absent) — guard against %s-with-NULL
+	 * before it ever reaches kasprintf, rather than relying on a
+	 * particular kernel's printf NULL-handling to happen to produce an
+	 * empty/safe result. */
+	token_arg = kasprintf(GFP_NOFS, "-token=%s",
+			       admin_token ? admin_token : "");
 	if (!mover_arg || !vol_arg || !ino_arg || !size_arg || !path_arg ||
-	    !checksum_arg || !sc_arg || !vsc_arg || !asc_arg) {
+	    !checksum_arg || !sc_arg || !vsc_arg || !asc_arg || !token_arg) {
 		ret = -ENOMEM;
 		goto out_free;
 	}
@@ -61,7 +68,8 @@ int cfs_oss_accel_recall_via_helper(const char *mover_addr, const char *vol,
 	argv[7] = asc_arg;
 	argv[8] = path_arg;
 	argv[9] = checksum_arg;
-	argv[10] = NULL;
+	argv[10] = token_arg;
+	argv[11] = NULL;
 
 	/* UMH_WAIT_PROC blocks this (process-context, sleepable) thread until
 	 * the helper exits. status encodes the same wait()-status word a
@@ -100,5 +108,6 @@ out_free:
 	kfree(sc_arg);
 	kfree(vsc_arg);
 	kfree(asc_arg);
+	kfree(token_arg);
 	return ret;
 }

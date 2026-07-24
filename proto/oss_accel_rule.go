@@ -146,3 +146,93 @@ type OSSAccelChangelogSyncTaskResponse struct {
 	Cursor    uint64
 	Swept     int
 }
+
+// M5 系统层面收尾(自动化程度不均): master-persisted schedules for the
+// previously manual-only /ossAccelAudit and /ossAccelTrashPurge endpoints.
+// Both mirror OSSAccelChangelogRule's shape/lifecycle exactly (elapsed-time
+// polling, one rule per volume, same store/CRUD/manager pattern) — neither
+// needs an in-flight flag: a lost/crashed lcnode just means the next tick
+// naturally re-fires once IntervalSeconds has passed again, the same
+// argument OSSAccelChangelogRuleManager's doc comment already makes.
+
+// OSSAccelAuditRule is the master-persisted, per-volume audit schedule —
+// automates what was previously only reachable via a manual
+// GET /ossAccelAudit call. OrphanGraceHours mirrors the manual endpoint's
+// own orphanGraceHours query param (0 = use lcnode's built-in default).
+type OSSAccelAuditRule struct {
+	VolName          string    `json:"volName"`
+	Prefix           string    `json:"prefix,omitempty"`
+	OrphanGraceHours uint32    `json:"orphanGraceHours,omitempty"`
+	IntervalSeconds  uint32    `json:"intervalSeconds"`
+	Enabled          bool      `json:"enabled"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+	LastRunAt        time.Time `json:"lastRunAt,omitempty"`
+	LastRunResult    string    `json:"lastRunResult,omitempty"`
+}
+
+// OSSAccelAuditTaskRequest is the AdminTask payload for a dispatched audit
+// run (OpLcNodeOssAccelAudit).
+type OSSAccelAuditTaskRequest struct {
+	MasterAddr       string
+	LcNodeAddr       string
+	VolName          string
+	Prefix           string
+	OrphanGraceHours uint32
+}
+
+// OSSAccelAuditTaskResponse is what lcnode reports back after running the
+// task — mirrors runOssAccelAudit's own result shape (lcnode/oss_accel_audit.go).
+type OSSAccelAuditTaskResponse struct {
+	VolName    string
+	LcNode     string
+	StartTime  *time.Time
+	EndTime    *time.Time
+	Done       bool
+	StartErr   string
+	Dangling   int
+	Orphans    int
+	Quarantined int
+	Relocated  int
+	DriftConflicts int
+}
+
+// OSSAccelTrashPurgeRule is the master-persisted, per-volume trash purge
+// schedule — automates what was previously only reachable via a manual
+// GET /ossAccelTrashPurge call. RetentionHours mirrors the manual
+// endpoint's own retentionHours query param (0 = use lcnode's built-in
+// default).
+type OSSAccelTrashPurgeRule struct {
+	VolName         string    `json:"volName"`
+	Prefix          string    `json:"prefix,omitempty"`
+	RetentionHours  uint32    `json:"retentionHours,omitempty"`
+	IntervalSeconds uint32    `json:"intervalSeconds"`
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	LastRunAt       time.Time `json:"lastRunAt,omitempty"`
+	LastRunResult   string    `json:"lastRunResult,omitempty"`
+}
+
+// OSSAccelTrashPurgeTaskRequest is the AdminTask payload for a dispatched
+// trash purge run (OpLcNodeOssAccelTrashPurge).
+type OSSAccelTrashPurgeTaskRequest struct {
+	MasterAddr     string
+	LcNodeAddr     string
+	VolName        string
+	Prefix         string
+	RetentionHours uint32
+}
+
+// OSSAccelTrashPurgeTaskResponse is what lcnode reports back after running
+// the task — mirrors runOssAccelTrashPurge's own result shape
+// (lcnode/oss_accel_trash_purge.go).
+type OSSAccelTrashPurgeTaskResponse struct {
+	VolName   string
+	LcNode    string
+	StartTime *time.Time
+	EndTime   *time.Time
+	Done      bool
+	StartErr  string
+	Purged    int
+}

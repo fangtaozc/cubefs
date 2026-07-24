@@ -96,6 +96,12 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelEvictionRuleMgr != nil {
 			m.cluster.ossAccelEvictionRuleMgr.Start()
 		}
+		if m.cluster.ossAccelAuditRuleMgr != nil {
+			m.cluster.ossAccelAuditRuleMgr.Start()
+		}
+		if m.cluster.ossAccelTrashPurgeRuleMgr != nil {
+			m.cluster.ossAccelTrashPurgeRuleMgr.Start()
+		}
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
@@ -123,6 +129,14 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelEvictionRuleMgr != nil {
 			m.cluster.ossAccelEvictionRuleMgr.Stop()
 			m.cluster.ossAccelEvictionRuleMgr = NewOSSAccelEvictionRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelAuditRuleMgr != nil {
+			m.cluster.ossAccelAuditRuleMgr.Stop()
+			m.cluster.ossAccelAuditRuleMgr = NewOSSAccelAuditRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelTrashPurgeRuleMgr != nil {
+			m.cluster.ossAccelTrashPurgeRuleMgr.Stop()
+			m.cluster.ossAccelTrashPurgeRuleMgr = NewOSSAccelTrashPurgeRuleManager(m.cluster)
 		}
 		m.metaReady = false
 		m.cluster.metaReady = false
@@ -350,6 +364,23 @@ func (m *Server) loadMetadata() {
 		panic(err)
 	}
 	log.LogInfo("action[loadOSSAccelEvictionRules] end")
+
+	// 系统层面收尾: master owns the oss-accel audit / trash purge rule
+	// stores (one rule per volume each). Mirrors loadOSSAccelChangelogRules'
+	// lifecycle.
+	log.LogInfo("action[loadOSSAccelAuditRules] begin")
+	m.cluster.ossAccelAuditRuleCache = NewOSSAccelAuditRuleCache()
+	if err = m.cluster.loadOSSAccelAuditRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelAuditRules] end")
+
+	log.LogInfo("action[loadOSSAccelTrashPurgeRules] begin")
+	m.cluster.ossAccelTrashPurgeRuleCache = NewOSSAccelTrashPurgeRuleCache()
+	if err = m.cluster.loadOSSAccelTrashPurgeRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelTrashPurgeRules] end")
 
 	// Phase 1: bench rule master raft persistence.
 	// See docs/plan/master/bench-rule-persistence.md. benchRuleStore is

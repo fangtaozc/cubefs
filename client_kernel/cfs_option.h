@@ -22,6 +22,12 @@ struct cfs_options {
 	 * the option is absent, meaning the cold-read gate stays fully
 	 * disabled (zero behavior change) — see cfs_fs.c cfs_oss_accel_gate. */
 	char *oss_accel_mover_addr;
+	/* 系统层面收尾: shared admin token from mount option
+	 * "ossacceladmintoken=..." — sent as `Authorization: Bearer <token>`
+	 * on every /ossAccelRecall call (lcnode/oss_accel_auth.go gates that
+	 * endpoint behind this same token). NULL/absent sends no header,
+	 * matching lcnode's own passthrough-when-empty behavior. */
+	char *oss_accel_admin_token;
 };
 
 struct cfs_options *cfs_options_new(const char *dev_str, const char *opt_str);

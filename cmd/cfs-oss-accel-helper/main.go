@@ -42,7 +42,7 @@ func main() {
 }
 
 func run() int {
-	var mover, vol, path, checksum string
+	var mover, vol, path, checksum, token string
 	var ino, size uint64
 	var sc, vsc, asc uint
 
@@ -55,6 +55,11 @@ func run() int {
 	flag.UintVar(&asc, "asc", 0, "volume's allowed storage classes (single value, repeated as needed)")
 	flag.StringVar(&path, "path", "", "file path within the volume (also the S3 key basis)")
 	flag.StringVar(&checksum, "checksum", "", "expected sha256, e.g. sha256:<hex> or bare hex")
+	// 系统层面收尾: lcnode's /ossAccelRecall is now gated behind the shared
+	// admin token (lcnode/oss_accel_auth.go) — passed through from the
+	// kernel module's mount option, same value configured on lcnode's own
+	// side. Empty (default) sends no Authorization header.
+	flag.StringVar(&token, "token", "", "shared admin token for lcnode's oss-accel endpoints")
 	flag.Parse()
 
 	if mover == "" || vol == "" || ino == 0 || path == "" {
@@ -65,8 +70,16 @@ func run() int {
 	url := fmt.Sprintf("http://%s/ossAccelRecall?vol=%s&ino=%d&size=%d&sc=%d&vsc=%d&asc=%d&path=%s&checksum=%s",
 		mover, vol, ino, size, sc, vsc, asc, path, checksum)
 
+	req, rerr := http.NewRequest(http.MethodGet, url, nil)
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "cfs-oss-accel-helper: build request err: %v\n", rerr)
+		return exitOtherError
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	client := &http.Client{Timeout: recallHTTPTimeout}
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cfs-oss-accel-helper: mover request err: %v\n", err)
 		return exitOtherError

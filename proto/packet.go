@@ -146,6 +146,13 @@ const (
 	// eviction sweep. Same AdminTask dispatch mechanism as
 	// OpLcNodeOssAccelChangelogSync, triggered by OSSAccelEvictionRuleManager.
 	OpLcNodeOssAccelEvict uint8 = 0x5D
+	// OpLcNodeOssAccelAudit / OpLcNodeOssAccelTrashPurge: master-scheduled
+	// automation for the previously manual-only /ossAccelAudit and
+	// /ossAccelTrashPurge endpoints — same AdminTask dispatch mechanism as
+	// OpLcNodeOssAccelChangelogSync/Evict, triggered by
+	// OSSAccelAuditRuleManager / OSSAccelTrashPurgeRuleManager.
+	OpLcNodeOssAccelAudit      uint8 = 0x5E
+	OpLcNodeOssAccelTrashPurge uint8 = 0x5F
 
 	// backUp
 	OpBatchLockNormalExtent   uint8 = 0x57
@@ -764,6 +771,10 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpLcNodeOssAccelChangelogSync"
 	case OpLcNodeOssAccelEvict:
 		m = "OpLcNodeOssAccelEvict"
+	case OpLcNodeOssAccelAudit:
+		m = "OpLcNodeOssAccelAudit"
+	case OpLcNodeOssAccelTrashPurge:
+		m = "OpLcNodeOssAccelTrashPurge"
 	case OpLcNodeSnapshotVerDel:
 		m = "OpLcNodeSnapshotVerDel"
 	case OpSyncNodeHeartbeat:

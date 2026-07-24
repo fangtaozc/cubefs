@@ -96,6 +96,14 @@ type OSSAccelBackendConfig struct {
 	// pre-existing-elsewhere credential into CubeFS's own namespace, not
 	// something that should activate just because a backend is configured.
 	AllowBackendCredentialAuth bool `json:"allowBackendCredentialAuth,omitempty"`
+	// ProfileName selects a named profile in the shared-credentials file
+	// mounted into lcnode/objectnode (a "[profile-name]" section, alongside
+	// the deployment's default "[default]" profile) — lets this volume
+	// resolve to a genuinely different AK/SK than every other volume
+	// sharing the same pod, without needing its own AccessKeyEnv/
+	// SecretKeyEnv pointing at separately-injected env vars. Empty (the
+	// default) resolves "[default]" exactly as before this field existed.
+	ProfileName string `json:"profileName,omitempty"`
 }
 
 // ChecksumPrefixSHA256 prefixes the value stored in XAttrKeyOSSAccelChecksum.

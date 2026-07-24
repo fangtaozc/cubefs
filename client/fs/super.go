@@ -105,6 +105,9 @@ type Super struct {
 	// oss-accel: comma-separated lcnode (mover) addresses driving the cold read
 	// gate. Empty (default) disables oss-accel for this mount.
 	ossAccelMoverAddrs []string
+	// oss-accel: shared admin token sent to lcnode's /ossAccelRecall (see
+	// lcnode/oss_accel_auth.go). Empty sends no Authorization header.
+	ossAccelAdminToken string
 }
 
 // Functions that Super needs to implement
@@ -230,6 +233,7 @@ func NewSuper(opt *proto.MountOptions) (s *Super, err error) {
 			}
 		}
 	}
+	s.ossAccelAdminToken = opt.OssAccelAdminToken
 
 	if s.enableBcache {
 		s.bc = bcache.NewBcacheClient()

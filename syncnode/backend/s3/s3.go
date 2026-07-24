@@ -97,6 +97,16 @@ type Config struct {
 	AccessKey string
 	SecretKey string
 
+	// Profile selects a named profile (a "[profile-name]" section) in the
+	// AWS SDK's default credential chain — e.g. the shared-credentials
+	// file pointed at by AWS_SHARED_CREDENTIALS_FILE — instead of always
+	// resolving "[default]". Only consulted when both the inline
+	// AccessKey/SecretKey AND the AccessKeyEnv/SecretKeyEnv env vars are
+	// empty (lowest priority, same as the unnamed default-chain fallback
+	// it replaces). Lets multiple volumes share one mounted credentials
+	// file while each resolving to a genuinely different secret value.
+	Profile string
+
 	// StorageClass is the default storage class applied to PutObject when
 	// PutOptions.StorageClass is empty. May itself be empty (S3 picks
 	// STANDARD).
@@ -197,7 +207,11 @@ func ResolveCredentials(ctx context.Context, c *Config) (ak, sk string, err erro
 		return ak, sk, nil
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithRegion(c.Region))
+	loadOpts := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(c.Region)}
+	if c.Profile != "" {
+		loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(c.Profile))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return "", "", fmt.Errorf("s3 backend: load aws config: %w", err)
 	}
@@ -242,6 +256,10 @@ func New(cfg interface{}) (backend.Backend, error) {
 				credentials.NewStaticCredentialsProvider(ak, sk, ""),
 			),
 		)
+	} else if c.Profile != "" {
+		// Only reached when neither inline creds nor env-var creds
+		// resolved — same priority Profile has in ResolveCredentials.
+		loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(c.Profile))
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), loadOpts...)
@@ -465,6 +483,7 @@ func (b *Backend) Stat(ctx context.Context, key string) (backend.Stat, error) {
 	if out.ContentLength != nil {
 		st.Size = *out.ContentLength
 	}
+	st.RawMetadata = out.Metadata
 	st.Mtime = parseSyncnodeMtime(out.Metadata)
 	if st.Mtime.IsZero() && out.LastModified != nil {
 		st.Mtime = *out.LastModified
