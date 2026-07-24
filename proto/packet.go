@@ -153,6 +153,14 @@ const (
 	// OSSAccelAuditRuleManager / OSSAccelTrashPurgeRuleManager.
 	OpLcNodeOssAccelAudit      uint8 = 0x5E
 	OpLcNodeOssAccelTrashPurge uint8 = 0x5F
+	// OpLcNodeOssAccelFlushPolicy / OpLcNodeOssAccelIntegrity: 系统层面收尾续
+	// (补1+3) — master-scheduled age-triggered auto flush+commit-cold and
+	// cold-tier integrity verification. Same AdminTask dispatch mechanism as
+	// the opcodes above, triggered by OSSAccelFlushPolicyRuleManager /
+	// OSSAccelIntegrityRuleManager. 0x94/0x95 chosen from the free byte
+	// range — 0x60-0x93 is occupied by unrelated datanode/metanode opcodes.
+	OpLcNodeOssAccelFlushPolicy uint8 = 0x94
+	OpLcNodeOssAccelIntegrity   uint8 = 0x95
 
 	// backUp
 	OpBatchLockNormalExtent   uint8 = 0x57
@@ -775,6 +783,10 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpLcNodeOssAccelAudit"
 	case OpLcNodeOssAccelTrashPurge:
 		m = "OpLcNodeOssAccelTrashPurge"
+	case OpLcNodeOssAccelFlushPolicy:
+		m = "OpLcNodeOssAccelFlushPolicy"
+	case OpLcNodeOssAccelIntegrity:
+		m = "OpLcNodeOssAccelIntegrity"
 	case OpLcNodeSnapshotVerDel:
 		m = "OpLcNodeSnapshotVerDel"
 	case OpSyncNodeHeartbeat:

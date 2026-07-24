@@ -189,9 +189,14 @@ func normalizeOssAccelKey(path string) string {
 }
 
 // httpServiceOssAccelFlush handles GET /ossAccelFlush?vol=&ino=&size=&sc=&vsc=&asc=&path=
-// M1 manual trigger (no scheduler yet): stream the file's hot-layer bytes to the
-// external S3 bucket at its path-key, then record the cold reference in xattrs.
-// Non-destructive (64a): does not flip StorageClass or release the local extent.
+// Manual trigger: stream the file's hot-layer bytes to the external S3 bucket
+// at its path-key, then record the cold reference in xattrs. Non-destructive:
+// does not flip StorageClass or release the local extent (see
+// runOssAccelFlushForVol's doc comment). The parameter-parsing/HTTP-response
+// shell lives here; the actual flush lives in runOssAccelFlushForVol so the
+// 补1+3 automatic flush-policy scheduler (opOssAccelFlushPolicy,
+// lcnode/oss_accel_flush_policy.go) can call the identical logic without an
+// HTTP round-trip.
 func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if err = r.ParseForm(); err != nil {
@@ -219,12 +224,35 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	s3key := normalizeOssAccelKey(path)
+
+	s3key, checksum, err := l.runOssAccelFlushForVol(vol, path, ino, size, sc, vsc, asc)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	fmt.Fprintf(w, "ok: vol=%v ino=%v size=%v s3key=%v checksum=%v\n", vol, ino, size, s3key, checksum)
+}
+
+// runOssAccelFlushForVol builds this volume's meta/extent/S3 clients and runs
+// one flush — the shared core both httpServiceOssAccelFlush (manual trigger)
+// and runOssAccelFlushPolicyForVol (系统层面收尾续: master-scheduled
+// age-triggered auto flush, lcnode/oss_accel_flush_policy.go) call, so the
+// upload+verify+xattr+changelog sequence isn't duplicated between entry
+// points — mirrors the runOssAccelAuditForVol/runOssAccelEvictionSweep split
+// already established for audit/eviction.
+//
+// M1 slice (64a): upload bytes + write cold-reference xattrs only. Does NOT
+// flip the inode StorageClass or release the local extent — the file stays
+// fully readable from the hot layer, and a copy now also exists in the S3
+// bucket under a path-key identical to its POSIX path. Callers that also want
+// the file actually released from the hot tier must follow up with
+// runOssAccelCommitCold (see runOssAccelFlushPolicyForVol for exactly that).
+func (l *LcNode) runOssAccelFlushForVol(vol, path string, ino, size uint64, sc, vsc uint32, asc []uint32) (s3key, checksum string, err error) {
+	s3key = normalizeOssAccelKey(path)
 
 	metaWrapper, extentClient, err := l.buildVolClients(vol, vsc, asc)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return "", "", err
 	}
 	defer metaWrapper.Close()
 	defer extentClient.Close()
@@ -234,31 +262,26 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	// write-then-reject). See proto.OSSAccelRoleConfig doc comment.
 	roleCfg, err := loadOssAccelRoleConfig(metaWrapper)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		return "", "", err
 	}
 	if !ossAccelWriteAllowed(roleCfg, s3key) {
-		http.Error(w, fmt.Sprintf("vol(%v) is role=%v and s3key(%v) is not under any OwnedPrefixes — write rejected", vol, roleCfg.Role, s3key), http.StatusForbidden)
-		return
+		return "", "", fmt.Errorf("vol(%v) is role=%v and s3key(%v) is not under any OwnedPrefixes — write rejected", vol, roleCfg.Role, s3key)
 	}
 
 	// Per-vol backend override lives on this vol's own root inode, so the S3
 	// config can only be resolved once metaWrapper (above) exists.
 	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
-		return
+		return "", "", err
 	}
 	s3Backend, err := s3.New(s3Cfg)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
-		return
+		return "", "", fmt.Errorf("s3 backend init err: %v", err)
 	}
 	defer s3Backend.Close()
 
 	if err = extentClient.OpenStream(ino, false, false, ""); err != nil {
-		http.Error(w, fmt.Sprintf("OpenStream err: %v", err), http.StatusBadRequest)
-		return
+		return "", "", fmt.Errorf("OpenStream err: %v", err)
 	}
 	defer extentClient.CloseStream(ino)
 
@@ -281,28 +304,24 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 	})
 	pr.Close()
 	if srcErr != nil {
-		http.Error(w, fmt.Sprintf("read src extent err: %v", srcErr), http.StatusInternalServerError)
-		return
+		return "", "", fmt.Errorf("read src extent err: %v", srcErr)
 	}
 	if putErr != nil {
-		http.Error(w, fmt.Sprintf("s3 put err: %v", putErr), http.StatusInternalServerError)
-		return
+		return "", "", fmt.Errorf("s3 put err: %v", putErr)
 	}
 
 	// Two-phase check: HEAD the freshly written object and verify size.
 	headSize, _, _, headErr := s3Backend.Head(ctx, s3key)
 	if headErr != nil {
-		http.Error(w, fmt.Sprintf("s3 head verify err: %v", headErr), http.StatusInternalServerError)
-		return
+		return "", "", fmt.Errorf("s3 head verify err: %v", headErr)
 	}
 	if headSize != int64(size) {
-		http.Error(w, fmt.Sprintf("s3 size mismatch: local(%v) remote(%v)", size, headSize), http.StatusInternalServerError)
-		return
+		return "", "", fmt.Errorf("s3 size mismatch: local(%v) remote(%v)", size, headSize)
 	}
 
 	// Record the cold reference in xattrs (extendTree). State stays clean; the
 	// inode remains a hot Replica until a later slice flips the class.
-	checksum := proto.ChecksumPrefixSHA256 + putRes.Checksum
+	checksum = proto.ChecksumPrefixSHA256 + putRes.Checksum
 	attrs := map[string]string{
 		proto.XAttrKeyOSSAccelS3Key:    s3key,
 		proto.XAttrKeyOSSAccelChecksum: checksum,
@@ -310,8 +329,7 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 		proto.XAttrKeyOSSAccelState:    proto.ColdStateClean,
 	}
 	if err = metaWrapper.BatchSetXAttr_ll(ino, attrs); err != nil {
-		http.Error(w, fmt.Sprintf("set oss-accel xattr err: %v", err), http.StatusInternalServerError)
-		return
+		return "", "", fmt.Errorf("set oss-accel xattr err: %v", err)
 	}
 
 	// M4: announce this write on the shared changelog so other clusters
@@ -331,7 +349,7 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 
 	log.LogInfof("ossAccelFlush success: vol(%v) ino(%v) size(%v) s3key(%v) checksum(%v)",
 		vol, ino, size, s3key, checksum)
-	fmt.Fprintf(w, "ok: vol=%v ino=%v size=%v s3key=%v checksum=%v\n", vol, ino, size, s3key, checksum)
+	return s3key, checksum, nil
 }
 
 // appendOssAccelChangelogEvent appends one NDJSON line to the shared

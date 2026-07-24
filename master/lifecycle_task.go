@@ -64,6 +64,12 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 	case proto.OpLcNodeOssAccelTrashPurge:
 		response := task.Response.(*proto.OSSAccelTrashPurgeTaskResponse)
 		err = c.handleLcNodeOssAccelTrashPurgeResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelFlushPolicy:
+		response := task.Response.(*proto.OSSAccelFlushPolicyTaskResponse)
+		err = c.handleLcNodeOssAccelFlushPolicyResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelIntegrity:
+		response := task.Response.(*proto.OSSAccelIntegrityTaskResponse)
+		err = c.handleLcNodeOssAccelIntegrityResp(task.OperatorAddr, response)
 	default:
 		err = fmt.Errorf(fmt.Sprintf("lc unknown operate code %v", task.OpCode))
 		goto errHandler
@@ -205,6 +211,66 @@ func (c *Cluster) handleLcNodeOssAccelTrashPurgeResp(nodeAddr string, resp *prot
 	}
 	c.ossAccelTrashPurgeRuleCache.Put(&updated)
 	log.LogInfof("handleLcNodeOssAccelTrashPurgeResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
+}
+
+// handleLcNodeOssAccelFlushPolicyResp records the real outcome of a
+// dispatched flush-policy sweep, clears FlushPolicyInFlight so the next tick
+// can dispatch again (mirrors handleLcNodeOssAccelEvictResp's exact
+// EvictionInFlight-clearing reasoning — see proto.OSSAccelFlushPolicyRule's
+// doc comment for why this rule, unlike audit/trash-purge, needs the flag).
+// Also mirrors handleLcNodeOssAccelAuditResp's "rule deleted mid-flight is a
+// normal race, not an error" handling.
+func (c *Cluster) handleLcNodeOssAccelFlushPolicyResp(nodeAddr string, resp *proto.OSSAccelFlushPolicyTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelFlushPolicyRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelFlushPolicyResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.FlushPolicyInFlight = false
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: scanned=%v flushed=%v skipped=%v errors=%v", resp.Scanned, resp.Flushed, resp.Skipped, resp.Errors)
+	}
+	if err := c.syncUpdateOSSAccelFlushPolicyRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelFlushPolicyResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelFlushPolicyRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelFlushPolicyResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
+}
+
+// handleLcNodeOssAccelIntegrityResp records the real outcome of a dispatched
+// integrity-check sweep — same shape as handleLcNodeOssAccelFlushPolicyResp.
+func (c *Cluster) handleLcNodeOssAccelIntegrityResp(nodeAddr string, resp *proto.OSSAccelIntegrityTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelIntegrityRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelIntegrityResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: cheapChecked=%v fullChecked=%v mismatches=%v", resp.CheapChecked, resp.FullChecked, resp.Mismatches)
+	}
+	if err := c.syncUpdateOSSAccelIntegrityRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelIntegrityResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelIntegrityRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelIntegrityResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
 

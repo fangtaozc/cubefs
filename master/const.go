@@ -380,6 +380,24 @@ const (
 	opSyncAddOSSAccelTrashPurgeRule    uint32 = 0x7D
 	opSyncDeleteOSSAccelTrashPurgeRule uint32 = 0x7E
 	opSyncUpdateOSSAccelTrashPurgeRule uint32 = 0x7F
+
+	// 系统层面收尾续(补1+3): oss-accel flush policy rule persistence
+	// (0x89-0x8B). NOTE: this uint32 opSync* space is shared across MULTIPLE
+	// files (const.go, sync_node.go, sync_rule_store.go, bench_rule_store.go
+	// all allocate from it) — 0x80-0x88 looked free from a const.go-only
+	// scan but was NOT (opSyncDeleteSyncNode=0x81, opSyncDeleteSyncRule=0x84,
+	// opSyncDeleteBenchRule=0x87 collided, caught by the compiler's
+	// "duplicate case" error in metadata_fsm.go). Always grep across ALL of
+	// master/*.go, not just this file, before allocating here.
+	opSyncAddOSSAccelFlushPolicyRule    uint32 = 0x89
+	opSyncDeleteOSSAccelFlushPolicyRule uint32 = 0x8A
+	opSyncUpdateOSSAccelFlushPolicyRule uint32 = 0x8B
+
+	// 系统层面收尾续(补1+3): oss-accel integrity rule persistence
+	// (0x8C-0x8E) — see master/oss_accel_integrity_rule_store.go.
+	opSyncAddOSSAccelIntegrityRule    uint32 = 0x8C
+	opSyncDeleteOSSAccelIntegrityRule uint32 = 0x8D
+	opSyncUpdateOSSAccelIntegrityRule uint32 = 0x8E
 )
 
 func init() {
@@ -466,6 +484,14 @@ func init() {
 		opSyncAddOSSAccelTrashPurgeRule,
 		opSyncDeleteOSSAccelTrashPurgeRule,
 		opSyncUpdateOSSAccelTrashPurgeRule,
+
+		opSyncAddOSSAccelFlushPolicyRule,
+		opSyncDeleteOSSAccelFlushPolicyRule,
+		opSyncUpdateOSSAccelFlushPolicyRule,
+
+		opSyncAddOSSAccelIntegrityRule,
+		opSyncDeleteOSSAccelIntegrityRule,
+		opSyncUpdateOSSAccelIntegrityRule,
 	} {
 		if _, in := set[op]; in {
 			panic(op)

@@ -102,6 +102,12 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelTrashPurgeRuleMgr != nil {
 			m.cluster.ossAccelTrashPurgeRuleMgr.Start()
 		}
+		if m.cluster.ossAccelFlushPolicyRuleMgr != nil {
+			m.cluster.ossAccelFlushPolicyRuleMgr.Start()
+		}
+		if m.cluster.ossAccelIntegrityRuleMgr != nil {
+			m.cluster.ossAccelIntegrityRuleMgr.Start()
+		}
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
@@ -137,6 +143,14 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelTrashPurgeRuleMgr != nil {
 			m.cluster.ossAccelTrashPurgeRuleMgr.Stop()
 			m.cluster.ossAccelTrashPurgeRuleMgr = NewOSSAccelTrashPurgeRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelFlushPolicyRuleMgr != nil {
+			m.cluster.ossAccelFlushPolicyRuleMgr.Stop()
+			m.cluster.ossAccelFlushPolicyRuleMgr = NewOSSAccelFlushPolicyRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelIntegrityRuleMgr != nil {
+			m.cluster.ossAccelIntegrityRuleMgr.Stop()
+			m.cluster.ossAccelIntegrityRuleMgr = NewOSSAccelIntegrityRuleManager(m.cluster)
 		}
 		m.metaReady = false
 		m.cluster.metaReady = false
@@ -381,6 +395,23 @@ func (m *Server) loadMetadata() {
 		panic(err)
 	}
 	log.LogInfo("action[loadOSSAccelTrashPurgeRules] end")
+
+	// 系统层面收尾续(补1+3): master owns the oss-accel flush-policy /
+	// integrity rule stores (one rule per volume each). Mirrors
+	// loadOSSAccelChangelogRules' lifecycle.
+	log.LogInfo("action[loadOSSAccelFlushPolicyRules] begin")
+	m.cluster.ossAccelFlushPolicyRuleCache = NewOSSAccelFlushPolicyRuleCache()
+	if err = m.cluster.loadOSSAccelFlushPolicyRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelFlushPolicyRules] end")
+
+	log.LogInfo("action[loadOSSAccelIntegrityRules] begin")
+	m.cluster.ossAccelIntegrityRuleCache = NewOSSAccelIntegrityRuleCache()
+	if err = m.cluster.loadOSSAccelIntegrityRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelIntegrityRules] end")
 
 	// Phase 1: bench rule master raft persistence.
 	// See docs/plan/master/bench-rule-persistence.md. benchRuleStore is

@@ -414,6 +414,109 @@ func (l *LcNode) opOssAccelTrashPurge(conn net.Conn, p *proto.Packet) (err error
 	return
 }
 
+// opOssAccelFlushPolicy handles OpLcNodeOssAccelFlushPolicy — 系统层面收尾续
+// (补1+3): the master-scheduled AdminTask counterpart to the age-triggered
+// auto flush+commit-cold sweep (see master/oss_accel_flush_policy_rule_manager.go).
+// Same envelope shape as opOssAccelAudit.
+func (l *LcNode) opOssAccelFlushPolicy(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelFlushPolicyTaskRequest{}
+			resp      = &proto.OSSAccelFlushPolicyTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelFlushPolicyTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		scanned, flushed, skipped, errCount, runErr := l.runOssAccelFlushPolicyForVol(request.VolName, request.Prefix, request.MinIdleHours, request.MinSizeBytes)
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.Scanned = scanned
+		resp.Flushed = flushed
+		resp.Skipped = skipped
+		resp.Errors = errCount
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
+// opOssAccelIntegrity handles OpLcNodeOssAccelIntegrity — 系统层面收尾续
+// (补1+3): the master-scheduled AdminTask counterpart to the cold-tier
+// integrity verification sweep (see master/oss_accel_integrity_rule_manager.go).
+// Same envelope shape as opOssAccelAudit.
+func (l *LcNode) opOssAccelIntegrity(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelIntegrityTaskRequest{}
+			resp      = &proto.OSSAccelIntegrityTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelIntegrityTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		cheapChecked, fullChecked, mismatches, runErr := l.runOssAccelIntegrityForVol(request.VolName, request.Prefix, request.FullSampleCount)
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.CheapChecked = cheapChecked
+		resp.FullChecked = fullChecked
+		resp.Mismatches = mismatches
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
 func responseAckOKToMaster(conn net.Conn, p *proto.Packet) {
 	go func() {
 		p.PacketOkReply()

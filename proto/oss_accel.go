@@ -162,6 +162,16 @@ const XAttrKeyOSSAccelPin = "oss-accel.pin"
 // signal instead of depending on a setting it doesn't control.
 const XAttrKeyOSSAccelLastRecallTime = "oss-accel.lastRecallTime"
 
+// XAttrKeyOSSAccelLastIntegrityCheckTime (系统层面收尾续/补1+3, RFC3339) is
+// stamped after EVERY full-tier integrity check (match or mismatch —
+// lcnode/oss_accel_integrity.go), never after a cheap (HeadObject-only)
+// check. The integrity sweep sorts candidates ascending by this field to
+// pick its FullSampleCount sample each run, the same "oldest/never-checked
+// sorts first" rotation OSSAccelEvictionRuleManager's ranking uses for
+// XAttrKeyOSSAccelLastRecallTime — guarantees repeated runs eventually cover
+// every cold object instead of re-checking the same few every time.
+const XAttrKeyOSSAccelLastIntegrityCheckTime = "oss-accel.lastIntegrityCheckTime"
+
 // XAttrKeyOSSAccelRoleConfig is the M4 (multi-cluster) per-volume write role,
 // stored on the VOLUME ROOT inode alongside XAttrKeyOSSAccelBackendConfig —
 // same storage mechanism, same reasoning: a role is a deployment-level

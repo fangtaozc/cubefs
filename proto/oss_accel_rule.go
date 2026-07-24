@@ -236,3 +236,126 @@ type OSSAccelTrashPurgeTaskResponse struct {
 	StartErr  string
 	Purged    int
 }
+
+// 系统层面收尾续(补1+3): master-persisted schedules for the two remaining
+// gaps identified in the running gap-analysis — (1) flush has never had any
+// automatic trigger (100% manual-HTTP-only), and (3) cold-tier data has no
+// background integrity re-verification beyond the flush-time/recall-time
+// checksum check. Both mirror OSSAccelAuditRule's shape/lifecycle exactly
+// (elapsed-time polling, one rule per volume, same store/CRUD/manager
+// pattern) — see master/oss_accel_flush_policy_rule_store.go /
+// master/oss_accel_integrity_rule_store.go.
+
+// OSSAccelFlushPolicyRule is the master-persisted, per-volume age-triggered
+// auto flush schedule. A candidate file (never flushed before — has no
+// oss-accel.s3key xattr yet, so this is orthogonal to OSSAccelEvictionRule's
+// job of re-cooling files that WERE already flushed at some point) is flushed
+// AND immediately committed cold (released from the hot tier) in one step
+// once it's been idle (ModifyTime) at least MinIdleHours — see
+// runOssAccelFlushPolicyForVol's doc comment for why ModifyTime, not
+// AccessTime.
+//
+// Unlike OSSAccelAuditRule/OSSAccelChangelogRule (whose sweeps are read-only
+// or idempotent under concurrency, so they deliberately skip an in-flight
+// flag), this rule DOES need one — real-machine testing found that
+// runOssAccelCommitCold's migration-slot handling is NOT safe under two
+// concurrent commit-cold calls on the SAME inode, which a too-short
+// IntervalSeconds (shorter than one sweep's actual duration) can trigger by
+// letting a second sweep dispatch before the first one's commit-cold calls
+// have finished — the race left several files permanently stuck (server-side
+// hang, not merely a client cache issue) until a lcnode restart. Mirrors
+// OSSAccelEvictionRule.EvictionInFlight exactly, including the same
+// watchdog-timeout escape hatch for a lost/crashed lcnode
+// (master/oss_accel_flush_policy_rule_manager.go).
+type OSSAccelFlushPolicyRule struct {
+	VolName         string    `json:"volName"`
+	Prefix          string    `json:"prefix,omitempty"`
+	MinIdleHours    uint32    `json:"minIdleHours"`
+	MinSizeBytes    uint64    `json:"minSizeBytes,omitempty"`
+	IntervalSeconds uint32    `json:"intervalSeconds"`
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	LastRunAt       time.Time `json:"lastRunAt,omitempty"`
+	LastRunResult   string    `json:"lastRunResult,omitempty"`
+	// FlushPolicyInFlight is server-maintained: true from the moment a sweep
+	// is dispatched until its response lands (or the watchdog times it out).
+	// Not caller-settable via /set.
+	FlushPolicyInFlight bool `json:"flushPolicyInFlight,omitempty"`
+}
+
+// OSSAccelFlushPolicyTaskRequest is the AdminTask payload for a dispatched
+// flush-policy sweep (OpLcNodeOssAccelFlushPolicy).
+type OSSAccelFlushPolicyTaskRequest struct {
+	MasterAddr   string
+	LcNodeAddr   string
+	VolName      string
+	Prefix       string
+	MinIdleHours uint32
+	MinSizeBytes uint64
+}
+
+// OSSAccelFlushPolicyTaskResponse is what lcnode reports back after running
+// a flush-policy sweep — mirrors runOssAccelFlushPolicyForVol's own result
+// shape (lcnode/oss_accel_flush_policy.go).
+type OSSAccelFlushPolicyTaskResponse struct {
+	VolName   string
+	LcNode    string
+	StartTime *time.Time
+	EndTime   *time.Time
+	Done      bool
+	StartErr  string
+	Scanned   int
+	Flushed   int
+	Skipped   int
+	Errors    int
+}
+
+// OSSAccelIntegrityRule is the master-persisted, per-volume cold-tier
+// integrity-check schedule. Every already-cold candidate (has
+// oss-accel.s3key, StorageClass is BlobStore) gets a zero-download "cheap"
+// metadata/checksum comparison (S3 HeadObject) on every run; up to
+// FullSampleCount of them additionally get a full download + re-hash,
+// rotated by oss-accel.lastIntegrityCheckTime so repeated runs eventually
+// cover every cold object rather than re-checking the same few every time.
+// FullSampleCount == 0 disables the full tier entirely (cheap-only).
+//
+// A mismatch (either tier) only marks the file proto.ColdStateError — see
+// runOssAccelIntegrityForVol's doc comment for why there is no attempt at
+// automatic repair.
+type OSSAccelIntegrityRule struct {
+	VolName         string    `json:"volName"`
+	Prefix          string    `json:"prefix,omitempty"`
+	IntervalSeconds uint32    `json:"intervalSeconds"`
+	FullSampleCount uint32    `json:"fullSampleCount,omitempty"`
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	LastRunAt       time.Time `json:"lastRunAt,omitempty"`
+	LastRunResult   string    `json:"lastRunResult,omitempty"`
+}
+
+// OSSAccelIntegrityTaskRequest is the AdminTask payload for a dispatched
+// integrity-check sweep (OpLcNodeOssAccelIntegrity).
+type OSSAccelIntegrityTaskRequest struct {
+	MasterAddr      string
+	LcNodeAddr      string
+	VolName         string
+	Prefix          string
+	FullSampleCount uint32
+}
+
+// OSSAccelIntegrityTaskResponse is what lcnode reports back after running an
+// integrity-check sweep — mirrors runOssAccelIntegrityForVol's own result
+// shape (lcnode/oss_accel_integrity.go).
+type OSSAccelIntegrityTaskResponse struct {
+	VolName      string
+	LcNode       string
+	StartTime    *time.Time
+	EndTime      *time.Time
+	Done         bool
+	StartErr     string
+	CheapChecked int
+	FullChecked  int
+	Mismatches   int
+}

@@ -551,6 +551,29 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.OSSAccelTrashPurgeRuleDelete).
 		HandlerFunc(m.deleteOSSAccelTrashPurgeRule)
 
+	// 系统层面收尾续(补1+3) oss-accel flush-policy rule (one schedule per
+	// volume) — same plain auth model as the blocks above.
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelFlushPolicyRuleSet).
+		HandlerFunc(m.setOSSAccelFlushPolicyRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelFlushPolicyRuleGet).
+		HandlerFunc(m.getOSSAccelFlushPolicyRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelFlushPolicyRuleDelete).
+		HandlerFunc(m.deleteOSSAccelFlushPolicyRule)
+
+	// 系统层面收尾续(补1+3) oss-accel integrity rule (one schedule per volume).
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelIntegrityRuleSet).
+		HandlerFunc(m.setOSSAccelIntegrityRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelIntegrityRuleGet).
+		HandlerFunc(m.getOSSAccelIntegrityRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelIntegrityRuleDelete).
+		HandlerFunc(m.deleteOSSAccelIntegrityRule)
+
 	// syncnode management APIs — gated by the shared admin token
 	// middleware (SEC1). Empty token disables the check, preserving
 	// dev/test defaults.

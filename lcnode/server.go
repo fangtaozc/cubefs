@@ -363,6 +363,10 @@ func (l *LcNode) handlePacket(conn net.Conn, p *proto.Packet, remoteAddr string)
 		err = l.opOssAccelAudit(conn, p)
 	case proto.OpLcNodeOssAccelTrashPurge:
 		err = l.opOssAccelTrashPurge(conn, p)
+	case proto.OpLcNodeOssAccelFlushPolicy:
+		err = l.opOssAccelFlushPolicy(conn, p)
+	case proto.OpLcNodeOssAccelIntegrity:
+		err = l.opOssAccelIntegrity(conn, p)
 	default:
 		err = fmt.Errorf("%s unknown Opcode: %d, reqId: %d", remoteAddr,
 			p.Opcode, p.GetReqID())

@@ -303,6 +303,20 @@ const (
 	OSSAccelTrashPurgeRuleGet    = "/ossAccelTrashPurgeRule/get"    // GET  ?name=<vol>
 	OSSAccelTrashPurgeRuleDelete = "/ossAccelTrashPurgeRule/delete" // POST ?name=<vol>
 
+	// OSSAccelFlushPolicyRule / OSSAccelIntegrityRule: 系统层面收尾续(补1+3)
+	// — per-volume schedules for age-triggered auto flush+commit-cold and
+	// cold-tier integrity verification, same granularity/auth model as
+	// OSSAccelChangelogRule. Body / query params documented in
+	// master/api_service_oss_accel_flush_policy_rule.go and
+	// master/api_service_oss_accel_integrity_rule.go.
+	OSSAccelFlushPolicyRuleSet    = "/ossAccelFlushPolicyRule/set"    // POST body: proto.OSSAccelFlushPolicyRule
+	OSSAccelFlushPolicyRuleGet    = "/ossAccelFlushPolicyRule/get"    // GET  ?name=<vol>
+	OSSAccelFlushPolicyRuleDelete = "/ossAccelFlushPolicyRule/delete" // POST ?name=<vol>
+
+	OSSAccelIntegrityRuleSet    = "/ossAccelIntegrityRule/set"    // POST body: proto.OSSAccelIntegrityRule
+	OSSAccelIntegrityRuleGet    = "/ossAccelIntegrityRule/get"    // GET  ?name=<vol>
+	OSSAccelIntegrityRuleDelete = "/ossAccelIntegrityRule/delete" // POST ?name=<vol>
+
 	// SyncTask observability + lifecycle. Master-side ledger answers
 	// list / get; cancel + retry hit the dispatch layer.
 	SyncTaskList   = "/syncTask/list"   // GET  [?status=&ruleID=&owner=]

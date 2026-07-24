@@ -253,6 +253,15 @@ type Cluster struct {
 	ossAccelTrashPurgeRuleCache *OSSAccelTrashPurgeRuleCache
 	ossAccelTrashPurgeRuleMgr   *OSSAccelTrashPurgeRuleManager
 
+	// ossAccelFlushPolicyRuleCache / ossAccelFlushPolicyRuleMgr and
+	// ossAccelIntegrityRuleCache / ossAccelIntegrityRuleMgr: 系统层面收尾续
+	// (补1+3) — same cache/manager split as the audit/trash-purge rule pair
+	// above, elapsed-time polling (not a watermark trigger like eviction).
+	ossAccelFlushPolicyRuleCache *OSSAccelFlushPolicyRuleCache
+	ossAccelFlushPolicyRuleMgr   *OSSAccelFlushPolicyRuleManager
+	ossAccelIntegrityRuleCache   *OSSAccelIntegrityRuleCache
+	ossAccelIntegrityRuleMgr     *OSSAccelIntegrityRuleManager
+
 	// syncTaskLedger is the bounded LRU view of task ownership +
 	// terminal status, used by /syncTask/* and /syncNode/tasks (P2-4).
 	// Populated by Dispatch / DispatchN on send and by
@@ -582,6 +591,10 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.ossAccelAuditRuleMgr = NewOSSAccelAuditRuleManager(c)
 	c.ossAccelTrashPurgeRuleCache = NewOSSAccelTrashPurgeRuleCache()
 	c.ossAccelTrashPurgeRuleMgr = NewOSSAccelTrashPurgeRuleManager(c)
+	c.ossAccelFlushPolicyRuleCache = NewOSSAccelFlushPolicyRuleCache()
+	c.ossAccelFlushPolicyRuleMgr = NewOSSAccelFlushPolicyRuleManager(c)
+	c.ossAccelIntegrityRuleCache = NewOSSAccelIntegrityRuleCache()
+	c.ossAccelIntegrityRuleMgr = NewOSSAccelIntegrityRuleManager(c)
 	c.syncTaskLedger = NewSyncTaskLedger(SyncTaskLedgerCap)
 	c.benchRuleStore = NewBenchRuleStore()
 	c.benchRuleStore.BindCluster(c)

@@ -53,13 +53,15 @@ type ossAccelWalkVisitor func(mw *meta.MetaWrapper, parentIno uint64, path strin
 
 // ossAccelWalkXAttrKeys is the fixed set of xattrs fetched for every regular
 // file visited — covers every key any current or planned sweep consults
-// (state, pin, last-recall-time), fetched once per file rather than once per
-// sweep-specific concern.
+// (state, pin, last-recall-time, checksum, last-integrity-check-time),
+// fetched once per file rather than once per sweep-specific concern.
 var ossAccelWalkXAttrKeys = []string{
 	proto.XAttrKeyOSSAccelState,
 	proto.XAttrKeyOSSAccelPin,
 	proto.XAttrKeyOSSAccelLastRecallTime,
 	proto.XAttrKeyOSSAccelS3Key,
+	proto.XAttrKeyOSSAccelChecksum,
+	proto.XAttrKeyOSSAccelLastIntegrityCheckTime,
 }
 
 // walkOssAccelTree recursively walks the volume from its root, calling visit
