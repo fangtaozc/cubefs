@@ -108,6 +108,9 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelIntegrityRuleMgr != nil {
 			m.cluster.ossAccelIntegrityRuleMgr.Start()
 		}
+		if m.cluster.ossAccelBucketScanRuleMgr != nil {
+			m.cluster.ossAccelBucketScanRuleMgr.Start()
+		}
 	} else {
 		Warn(m.clusterName, fmt.Sprintf("clusterID[%v] leader is changed to %v",
 			m.clusterName, m.leaderInfo.addr))
@@ -151,6 +154,10 @@ func (m *Server) handleLeaderChange(leader uint64) {
 		if m.cluster.ossAccelIntegrityRuleMgr != nil {
 			m.cluster.ossAccelIntegrityRuleMgr.Stop()
 			m.cluster.ossAccelIntegrityRuleMgr = NewOSSAccelIntegrityRuleManager(m.cluster)
+		}
+		if m.cluster.ossAccelBucketScanRuleMgr != nil {
+			m.cluster.ossAccelBucketScanRuleMgr.Stop()
+			m.cluster.ossAccelBucketScanRuleMgr = NewOSSAccelBucketScanRuleManager(m.cluster)
 		}
 		m.metaReady = false
 		m.cluster.metaReady = false
@@ -412,6 +419,16 @@ func (m *Server) loadMetadata() {
 		panic(err)
 	}
 	log.LogInfo("action[loadOSSAccelIntegrityRules] end")
+
+	// 反向加速续(补两条发现路径): master owns the oss-accel bucket-scan
+	// rule store (one rule per volume). Mirrors loadOSSAccelChangelogRules'
+	// lifecycle.
+	log.LogInfo("action[loadOSSAccelBucketScanRules] begin")
+	m.cluster.ossAccelBucketScanRuleCache = NewOSSAccelBucketScanRuleCache()
+	if err = m.cluster.loadOSSAccelBucketScanRules(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadOSSAccelBucketScanRules] end")
 
 	// Phase 1: bench rule master raft persistence.
 	// See docs/plan/master/bench-rule-persistence.md. benchRuleStore is

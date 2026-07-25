@@ -144,7 +144,8 @@ func (mf *MetadataFsm) Apply(command []byte, index uint64) (resp interface{}, er
 				opSyncDeleteUserInfo, opSyncDeleteAKUser, opSyncDeleteVolUser, opSyncDeleteQuota, opSyncDeleteLcNode,
 				opSyncDeleteLcConf, opSyncDeleteLcTask, opSyncDeleteLcResult, opSyncS3QosDelete, opSyncDeleteDecommissionDisk,
 				opSyncDeleteSyncNode, opSyncDeleteSyncRule, opSyncDeleteBenchRule, opSyncDeleteOSSAccelChangelogRule, opSyncDeleteOSSAccelEvictionRule,
-			opSyncDeleteOSSAccelAuditRule, opSyncDeleteOSSAccelTrashPurgeRule, opSyncDeleteOSSAccelFlushPolicyRule, opSyncDeleteOSSAccelIntegrityRule:
+			opSyncDeleteOSSAccelAuditRule, opSyncDeleteOSSAccelTrashPurgeRule, opSyncDeleteOSSAccelFlushPolicyRule, opSyncDeleteOSSAccelIntegrityRule,
+				opSyncDeleteOSSAccelBucketScanRule:
 				deleteSet[cmdK] = util.Null{}
 			// NOTE: opSyncPutFollowerApiLimiterInfo, opSyncPutApiLimiterInfo need special handle?
 			default:
@@ -160,7 +161,8 @@ func (mf *MetadataFsm) Apply(command []byte, index uint64) (resp interface{}, er
 		opSyncDeleteLcConf, opSyncDeleteLcTask, opSyncDeleteLcResult, opSyncS3QosDelete, opSyncDeleteDecommissionDisk,
 		opSyncDeleteFlashNode, opSyncDeleteFlashGroup, opSyncDeleteFlashManualTask,
 		opSyncDeleteSyncNode, opSyncDeleteSyncRule, opSyncDeleteBenchRule, opSyncDeleteOSSAccelChangelogRule, opSyncDeleteOSSAccelEvictionRule,
-			opSyncDeleteOSSAccelAuditRule, opSyncDeleteOSSAccelTrashPurgeRule, opSyncDeleteOSSAccelFlushPolicyRule, opSyncDeleteOSSAccelIntegrityRule:
+			opSyncDeleteOSSAccelAuditRule, opSyncDeleteOSSAccelTrashPurgeRule, opSyncDeleteOSSAccelFlushPolicyRule, opSyncDeleteOSSAccelIntegrityRule,
+		opSyncDeleteOSSAccelBucketScanRule:
 		if err = mf.delKeyAndPutIndex(cmd.K, cmdMap); err != nil {
 			panic(err)
 		}

@@ -398,6 +398,17 @@ const (
 	opSyncAddOSSAccelIntegrityRule    uint32 = 0x8C
 	opSyncDeleteOSSAccelIntegrityRule uint32 = 0x8D
 	opSyncUpdateOSSAccelIntegrityRule uint32 = 0x8E
+
+	// 反向加速续(补两条发现路径): oss-accel bucket-scan rule persistence
+	// (0x8F-0x91) — see master/oss_accel_bucket_scan_rule_store.go. Values
+	// confirmed free via `grep -rh "uint32 = 0x" master/*.go` across ALL
+	// files, not just this one — this opSync* space is shared across
+	// const.go/sync_node.go/sync_rule_store.go/bench_rule_store.go and a
+	// const.go-only scan previously missed a real collision (see the
+	// FlushPolicyRule allocation's doc comment above for the incident).
+	opSyncAddOSSAccelBucketScanRule    uint32 = 0x8F
+	opSyncDeleteOSSAccelBucketScanRule uint32 = 0x90
+	opSyncUpdateOSSAccelBucketScanRule uint32 = 0x91
 )
 
 func init() {
@@ -492,6 +503,10 @@ func init() {
 		opSyncAddOSSAccelIntegrityRule,
 		opSyncDeleteOSSAccelIntegrityRule,
 		opSyncUpdateOSSAccelIntegrityRule,
+
+		opSyncAddOSSAccelBucketScanRule,
+		opSyncDeleteOSSAccelBucketScanRule,
+		opSyncUpdateOSSAccelBucketScanRule,
 	} {
 		if _, in := set[op]; in {
 			panic(op)

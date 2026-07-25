@@ -898,9 +898,9 @@ type ossAccelChangelogEvent struct {
 }
 
 // httpServiceOssAccelChangelogSync handles GET /ossAccelChangelogSync?vol=&prefix=&changelogKey=
-// M2 first vertical slice (DEC-M2-1/2; flat namespace only — DEC-M2-3
-// recursive mkdir is design-only, not implemented here, so a changelog key
-// containing "/" is rejected rather than silently mismaterialized).
+// M2 first vertical slice (DEC-M2-1/2, plus DEC-M2-3 recursive mkdir — a
+// changelog key containing "/" materializes its full directory chain via
+// ensureOssAccelParentDir, not rejected).
 //
 // Reads the volume's external S3 changelog object (NDJSON, one event per
 // line) from where the last sync left off (oss-accel.changelog.cursor xattr

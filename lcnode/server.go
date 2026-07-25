@@ -367,6 +367,8 @@ func (l *LcNode) handlePacket(conn net.Conn, p *proto.Packet, remoteAddr string)
 		err = l.opOssAccelFlushPolicy(conn, p)
 	case proto.OpLcNodeOssAccelIntegrity:
 		err = l.opOssAccelIntegrity(conn, p)
+	case proto.OpLcNodeOssAccelBucketScan:
+		err = l.opOssAccelBucketScan(conn, p)
 	default:
 		err = fmt.Errorf("%s unknown Opcode: %d, reqId: %d", remoteAddr,
 			p.Opcode, p.GetReqID())
@@ -435,6 +437,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelTrashPurge").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelTrashPurge))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelRegister").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelRegister))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

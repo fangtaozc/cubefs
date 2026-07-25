@@ -466,6 +466,57 @@ func (l *LcNode) opOssAccelFlushPolicy(conn net.Conn, p *proto.Packet) (err erro
 	return
 }
 
+// opOssAccelBucketScan handles OpLcNodeOssAccelBucketScan — the master-scheduled
+// AdminTask counterpart to the manual /ossAccelRegister prefix mode (see
+// master/oss_accel_bucket_scan_rule_manager.go). Same envelope shape as
+// opOssAccelAudit; shares runOssAccelRegisterForVol with the manual HTTP path.
+func (l *LcNode) opOssAccelBucketScan(conn net.Conn, p *proto.Packet) (err error) {
+	data := p.Data
+
+	responseAckOKToMaster(conn, p)
+
+	go func() {
+		var (
+			req       = &proto.OSSAccelBucketScanTaskRequest{}
+			resp      = &proto.OSSAccelBucketScanTaskResponse{}
+			adminTask = &proto.AdminTask{Request: req}
+		)
+
+		decoder := json.NewDecoder(bytes.NewBuffer(data))
+		decoder.UseNumber()
+		if derr := decoder.Decode(adminTask); derr != nil {
+			resp.LcNode = l.localServerAddr
+			resp.Done = true
+			resp.StartErr = derr.Error()
+			adminTask.Response = resp
+			l.respondToMaster(adminTask)
+			return
+		}
+		request := adminTask.Request.(*proto.OSSAccelBucketScanTaskRequest)
+
+		start := time.Now()
+		resp.VolName = request.VolName
+		resp.LcNode = l.localServerAddr
+		resp.StartTime = &start
+
+		materialized, skipped, errCount, runErr := l.runOssAccelRegisterForVol(request.VolName, nil, request.Prefix)
+		end := time.Now()
+		resp.EndTime = &end
+		resp.Done = true
+		resp.Materialized = materialized
+		resp.Skipped = skipped
+		resp.Errors = errCount
+		if runErr != nil {
+			resp.StartErr = runErr.Error()
+		}
+
+		adminTask.Response = resp
+		l.respondToMaster(adminTask)
+	}()
+
+	return
+}
+
 // opOssAccelIntegrity handles OpLcNodeOssAccelIntegrity — 系统层面收尾续
 // (补1+3): the master-scheduled AdminTask counterpart to the cold-tier
 // integrity verification sweep (see master/oss_accel_integrity_rule_manager.go).

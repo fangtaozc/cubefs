@@ -70,6 +70,9 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 	case proto.OpLcNodeOssAccelIntegrity:
 		response := task.Response.(*proto.OSSAccelIntegrityTaskResponse)
 		err = c.handleLcNodeOssAccelIntegrityResp(task.OperatorAddr, response)
+	case proto.OpLcNodeOssAccelBucketScan:
+		response := task.Response.(*proto.OSSAccelBucketScanTaskResponse)
+		err = c.handleLcNodeOssAccelBucketScanResp(task.OperatorAddr, response)
 	default:
 		err = fmt.Errorf(fmt.Sprintf("lc unknown operate code %v", task.OpCode))
 		goto errHandler
@@ -271,6 +274,34 @@ func (c *Cluster) handleLcNodeOssAccelIntegrityResp(nodeAddr string, resp *proto
 	}
 	c.ossAccelIntegrityRuleCache.Put(&updated)
 	log.LogInfof("handleLcNodeOssAccelIntegrityResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
+	return nil
+}
+
+// handleLcNodeOssAccelBucketScanResp records the real outcome of a
+// dispatched bucket-scan sweep — same shape as
+// handleLcNodeOssAccelFlushPolicyResp.
+func (c *Cluster) handleLcNodeOssAccelBucketScanResp(nodeAddr string, resp *proto.OSSAccelBucketScanTaskResponse) error {
+	if resp == nil {
+		return nil
+	}
+	rule := c.ossAccelBucketScanRuleCache.Get(resp.VolName)
+	if rule == nil {
+		log.LogInfof("handleLcNodeOssAccelBucketScanResp: vol(%v) rule no longer exists, dropping report from lcnode(%v)", resp.VolName, nodeAddr)
+		return nil
+	}
+	updated := *rule
+	updated.LastRunAt = time.Now()
+	if resp.StartErr != "" {
+		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
+	} else {
+		updated.LastRunResult = fmt.Sprintf("ok: materialized=%v skipped=%v errors=%v", resp.Materialized, resp.Skipped, resp.Errors)
+	}
+	if err := c.syncUpdateOSSAccelBucketScanRule(&updated); err != nil {
+		log.LogWarnf("handleLcNodeOssAccelBucketScanResp: vol(%v) persist result err: %v", resp.VolName, err)
+		return err
+	}
+	c.ossAccelBucketScanRuleCache.Put(&updated)
+	log.LogInfof("handleLcNodeOssAccelBucketScanResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
 

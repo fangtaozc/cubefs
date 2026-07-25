@@ -317,6 +317,14 @@ const (
 	OSSAccelIntegrityRuleGet    = "/ossAccelIntegrityRule/get"    // GET  ?name=<vol>
 	OSSAccelIntegrityRuleDelete = "/ossAccelIntegrityRule/delete" // POST ?name=<vol>
 
+	// OSSAccelBucketScanRule: 反向加速续(补两条发现路径) — per-volume periodic
+	// S3 prefix scan schedule, same granularity/auth model as
+	// OSSAccelChangelogRule. Body / query params documented in
+	// master/api_service_oss_accel_bucket_scan_rule.go.
+	OSSAccelBucketScanRuleSet    = "/ossAccelBucketScanRule/set"    // POST body: proto.OSSAccelBucketScanRule
+	OSSAccelBucketScanRuleGet    = "/ossAccelBucketScanRule/get"    // GET  ?name=<vol>
+	OSSAccelBucketScanRuleDelete = "/ossAccelBucketScanRule/delete" // POST ?name=<vol>
+
 	// SyncTask observability + lifecycle. Master-side ledger answers
 	// list / get; cancel + retry hit the dispatch layer.
 	SyncTaskList   = "/syncTask/list"   // GET  [?status=&ruleID=&owner=]

@@ -574,6 +574,17 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.OSSAccelIntegrityRuleDelete).
 		HandlerFunc(m.deleteOSSAccelIntegrityRule)
 
+	// 反向加速续(补两条发现路径) oss-accel bucket-scan rule (one schedule per volume).
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelBucketScanRuleSet).
+		HandlerFunc(m.setOSSAccelBucketScanRule)
+	router.NewRoute().Methods(http.MethodGet).
+		Path(proto.OSSAccelBucketScanRuleGet).
+		HandlerFunc(m.getOSSAccelBucketScanRule)
+	router.NewRoute().Methods(http.MethodPost).
+		Path(proto.OSSAccelBucketScanRuleDelete).
+		HandlerFunc(m.deleteOSSAccelBucketScanRule)
+
 	// syncnode management APIs — gated by the shared admin token
 	// middleware (SEC1). Empty token disables the check, preserving
 	// dev/test defaults.

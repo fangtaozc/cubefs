@@ -359,3 +359,54 @@ type OSSAccelIntegrityTaskResponse struct {
 	FullChecked  int
 	Mismatches   int
 }
+
+// 反向加速续(补两条发现路径): master-persisted schedule for periodically
+// scanning an operator-declared S3 prefix and materializing any key not yet
+// known to CubeFS — the "doesn't require the external writer to cooperate"
+// counterpart to M2's changelog sync (which DOES require the writer to
+// append a changelog entry). Mirrors OSSAccelAuditRule's shape/lifecycle
+// exactly (elapsed-time polling, one rule per volume). No in-flight flag —
+// see runOssAccelRegisterForVol's doc comment (lcnode/oss_accel_register.go)
+// for why overlapping sweeps self-heal here unlike flush-policy's
+// commit-cold race.
+
+// OSSAccelBucketScanRule is the master-persisted, per-volume periodic bucket
+// scan schedule. Prefix is REQUIRED (not optional like audit's) — the
+// operator must explicitly declare the scan boundary; there is no
+// whole-bucket scan mode, by design (see the marker/ownership discussion in
+// lcnode/oss_accel_audit.go for why an unscoped scan of a shared bucket is
+// unsafe).
+type OSSAccelBucketScanRule struct {
+	VolName         string    `json:"volName"`
+	Prefix          string    `json:"prefix"`
+	IntervalSeconds uint32    `json:"intervalSeconds"`
+	Enabled         bool      `json:"enabled"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+	LastRunAt       time.Time `json:"lastRunAt,omitempty"`
+	LastRunResult   string    `json:"lastRunResult,omitempty"`
+}
+
+// OSSAccelBucketScanTaskRequest is the AdminTask payload for a dispatched
+// bucket-scan sweep (OpLcNodeOssAccelBucketScan).
+type OSSAccelBucketScanTaskRequest struct {
+	MasterAddr string
+	LcNodeAddr string
+	VolName    string
+	Prefix     string
+}
+
+// OSSAccelBucketScanTaskResponse is what lcnode reports back after running a
+// bucket-scan sweep — mirrors runOssAccelRegisterForVol's own result shape
+// (lcnode/oss_accel_register.go).
+type OSSAccelBucketScanTaskResponse struct {
+	VolName      string
+	LcNode       string
+	StartTime    *time.Time
+	EndTime      *time.Time
+	Done         bool
+	StartErr     string
+	Materialized int
+	Skipped      int
+	Errors       int
+}

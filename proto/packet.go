@@ -161,6 +161,12 @@ const (
 	// range — 0x60-0x93 is occupied by unrelated datanode/metanode opcodes.
 	OpLcNodeOssAccelFlushPolicy uint8 = 0x94
 	OpLcNodeOssAccelIntegrity   uint8 = 0x95
+	// OpLcNodeOssAccelBucketScan: 反向加速续(补两条发现路径) — master-scheduled
+	// periodic prefix-scoped S3 bucket scan, materializing keys not yet known
+	// to CubeFS. Same AdminTask dispatch mechanism as the opcodes above,
+	// triggered by OSSAccelBucketScanRuleManager. 0x96 chosen from the same
+	// free byte range as 0x94/0x95.
+	OpLcNodeOssAccelBucketScan uint8 = 0x96
 
 	// backUp
 	OpBatchLockNormalExtent   uint8 = 0x57
@@ -787,6 +793,8 @@ func (p *Packet) GetOpMsg() (m string) {
 		m = "OpLcNodeOssAccelFlushPolicy"
 	case OpLcNodeOssAccelIntegrity:
 		m = "OpLcNodeOssAccelIntegrity"
+	case OpLcNodeOssAccelBucketScan:
+		m = "OpLcNodeOssAccelBucketScan"
 	case OpLcNodeSnapshotVerDel:
 		m = "OpLcNodeSnapshotVerDel"
 	case OpSyncNodeHeartbeat:

@@ -262,6 +262,11 @@ type Cluster struct {
 	ossAccelIntegrityRuleCache   *OSSAccelIntegrityRuleCache
 	ossAccelIntegrityRuleMgr     *OSSAccelIntegrityRuleManager
 
+	// ossAccelBucketScanRuleCache / ossAccelBucketScanRuleMgr: 反向加速续
+	// (补两条发现路径) — same cache/manager split, elapsed-time polling.
+	ossAccelBucketScanRuleCache *OSSAccelBucketScanRuleCache
+	ossAccelBucketScanRuleMgr   *OSSAccelBucketScanRuleManager
+
 	// syncTaskLedger is the bounded LRU view of task ownership +
 	// terminal status, used by /syncTask/* and /syncNode/tasks (P2-4).
 	// Populated by Dispatch / DispatchN on send and by
@@ -595,6 +600,8 @@ func newCluster(name string, leaderInfo *LeaderInfo, fsm *MetadataFsm, partition
 	c.ossAccelFlushPolicyRuleMgr = NewOSSAccelFlushPolicyRuleManager(c)
 	c.ossAccelIntegrityRuleCache = NewOSSAccelIntegrityRuleCache()
 	c.ossAccelIntegrityRuleMgr = NewOSSAccelIntegrityRuleManager(c)
+	c.ossAccelBucketScanRuleCache = NewOSSAccelBucketScanRuleCache()
+	c.ossAccelBucketScanRuleMgr = NewOSSAccelBucketScanRuleManager(c)
 	c.syncTaskLedger = NewSyncTaskLedger(SyncTaskLedgerCap)
 	c.benchRuleStore = NewBenchRuleStore()
 	c.benchRuleStore.BindCluster(c)
