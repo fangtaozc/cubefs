@@ -226,6 +226,19 @@ func (v *Volume) loadOSSMeta() {
 	} else {
 		v.metaLoader.storeOssAccelBackendCredential(cred)
 	}
+
+	// Same eager-store-after-setSynced treatment as the credential above, and
+	// for the same two reasons. It is not optional: cacheMetaLoader's lazy load
+	// only fires while synced==0, so a value that is never stored here would
+	// (a) stay nil forever after the first refresh and (b) never pick up an
+	// admin's mode change. Real-machine testing caught exactly that — a
+	// write-through mode set after ObjectNode had already refreshed was
+	// silently ignored.
+	if wt, werr := v.loadOssAccelWriteThroughFresh(); werr != nil {
+		log.LogWarnf("loadOSSMeta: refresh oss-accel write-through mode failed: volume(%s) err(%v)", v.name, werr)
+	} else {
+		v.metaLoader.storeOssAccelWriteThrough(wt)
+	}
 }
 
 func (v *Volume) Name() string {
@@ -387,6 +400,14 @@ func (v *Volume) ossAccelWriteThroughMode() string {
 	wt, err := v.metaLoader.loadOssAccelWriteThrough()
 	if err != nil {
 		log.LogWarnf("ossAccelWriteThroughMode: volume(%v) err(%v) — treating as %q", v.name, err, proto.OSSAccelWriteThroughOff)
+		return proto.OSSAccelWriteThroughOff
+	}
+	// cacheMetaLoader returns (nil, nil) when the value was never stored and
+	// synced is already set — reachable if a future edit drops the eager store
+	// in loadOSSMeta. Dereferencing here would panic in the S3 PUT path, so
+	// treat it as off (and say so) rather than trusting the invariant.
+	if wt == nil {
+		log.LogWarnf("ossAccelWriteThroughMode: volume(%v) write-through cache is unpopulated — treating as %q (loadOSSMeta should be storing it)", v.name, proto.OSSAccelWriteThroughOff)
 		return proto.OSSAccelWriteThroughOff
 	}
 	return wt.Mode
