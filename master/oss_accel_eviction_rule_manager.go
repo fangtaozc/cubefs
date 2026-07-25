@@ -23,6 +23,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -139,6 +140,10 @@ func (m *OSSAccelEvictionRuleManager) tick() {
 			continue
 		}
 		usageRatio := float64(vol.totalUsedSpace()) / float64(capacityBytes)
+		// 差距分析续(对照阿里云OSS加速器功能页): usageRatio 之前只在这里内部
+		// 判断用,从没导出成外部可查的指标——运维没法从外部看"这个卷离驱逐线
+		// 还有多远"。导出成本可忽略(每 tick 已经算出来的值,多发一次)。
+		exporter.NewGauge("oss_accel_usage_ratio").SetWithLabels(usageRatio, map[string]string{exporter.Vol: r.VolName})
 		if usageRatio < r.HighWatermarkRatio {
 			continue
 		}

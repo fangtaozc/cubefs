@@ -440,6 +440,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelRegister").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelRegister))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelPrefetch").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelPrefetch))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

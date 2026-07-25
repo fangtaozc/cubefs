@@ -534,14 +534,17 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	// data-corruption hazard, not just wasted work — real-machine testing
 	// found HasMigrationEk with expiredTime==0 can't distinguish
 	// "genuinely orphaned" from "a concurrent write still in progress" (see
-	// the discard-orphaned-slot comment below), so a second attempt's
-	// discard can land mid-write and corrupt the first attempt's
-	// swapped-in bytes. Acquire before any I/O; a loser waits for the
-	// winner via the same waitForConcurrentRecallWinner poll already used
-	// for post-error races below, rather than racing a second write. This
-	// is process-local (not the distributed lock the design doc
-	// deliberately avoids) — it only covers requests landing on this one
-	// lcnode.
+	// the discard-orphaned-slot comment in runOssAccelRecallForInode), so a
+	// second attempt's discard can land mid-write and corrupt the first
+	// attempt's swapped-in bytes. Acquire before any I/O; a loser waits for
+	// the winner via the same waitForConcurrentRecallWinner poll used for
+	// post-error races inside the core function, rather than racing a
+	// second write. This is process-local (not the distributed lock the
+	// design doc deliberately avoids) — it only covers requests landing on
+	// this one lcnode. Kept here (not inside the core function) because the
+	// eager prefetch sweep (lcnode/oss_accel_prefetch.go) acquires the SAME
+	// lock around its own call to the core function — the two callers race
+	// each other on the same inode just as two HTTP callers would.
 	recallKey := vol + "/" + strconv.FormatUint(ino, 10)
 	if aerr := l.ossAccelRecallLimit.Acquire(recallKey, 1); aerr != nil {
 		log.LogInfof("httpServiceOssAccelRecall: vol(%v) ino(%v) another recall already in flight on this lcnode — waiting for it instead of racing a second migration-write", vol, ino)
@@ -568,15 +571,60 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	}
 	defer s3Backend.Close()
 
+	off, got, wasCold, recallErr := l.runOssAccelRecallForInode(metaWrapper, extentClient, s3Backend, vol, path, ino, size, vsc, wantChecksum)
+	if recallErr != nil {
+		var httpErr *ossAccelRecallHTTPError
+		if errors.As(recallErr, &httpErr) {
+			http.Error(w, httpErr.msg, httpErr.status)
+			return
+		}
+		http.Error(w, recallErr.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
+		vol, ino, off, normalizeOssAccelKey(path), got, wasCold)
+	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v wasCold=%v\n", vol, ino, off, normalizeOssAccelKey(path), got, wasCold)
+}
+
+// ossAccelRecallHTTPError carries the specific HTTP status runOssAccelRecallForInode's
+// HTTP caller should surface for a given failure — the core function itself
+// has no HTTP concept, but some of its failure branches map to a specific
+// status other than a generic 500 (StatusTooEarly for a still-in-grace-period
+// migration slot, StatusGone for a confirmed-dangling cold reference).
+// Non-HTTP callers (the prefetch sweep) just treat any non-nil error as a
+// failure and don't need the status code.
+type ossAccelRecallHTTPError struct {
+	status int
+	msg    string
+}
+
+func (e *ossAccelRecallHTTPError) Error() string { return e.msg }
+
+// runOssAccelRecallForInode does the actual work of recall — S3 GET,
+// migration-write, checksum verify, atomic commit-hot, lastRecallTime stamp
+// — extracted unchanged from httpServiceOssAccelRecall so the new eager
+// prefetch sweep (lcnode/oss_accel_prefetch.go) can reuse the exact same
+// concurrency-safe logic instead of reimplementing it. Callers are
+// responsible for the per-(vol,ino) ossAccelRecallLimit gate themselves
+// (see the comment at httpServiceOssAccelRecall's Acquire call) — this
+// function assumes it already holds that gate.
+//
+// wasCold reports whether ino was actually in BlobStore storage class when
+// this call started (i.e. whether a real download+write happened, vs a
+// no-op on an already-hot inode).
+func (l *LcNode) runOssAccelRecallForInode(
+	metaWrapper *meta.MetaWrapper, extentClient *stream.ExtentClient, s3Backend backend.Backend,
+	vol, path string, ino uint64, size uint64, vsc uint32, wantChecksum string,
+) (off int, checksum string, wasCold bool, err error) {
 	before, gerr := metaWrapper.InodeGet_ll(ino)
 	if gerr != nil || before == nil {
-		http.Error(w, fmt.Sprintf("InodeGet_ll err: %v", gerr), http.StatusInternalServerError)
-		return
+		return 0, "", false, fmt.Errorf("InodeGet_ll err: %v", gerr)
 	}
 	isCold := before.StorageClass == proto.StorageClass_BlobStore
 	if isCold {
 		// AUDIT-1 marks a confirmed-dangling s3key ColdStateError before this
-		// handler ever runs. Without this check the code below still tries
+		// function ever runs. Without this check the code below still tries
 		// the recall: S3 Get fails fast, but then — because it can't tell
 		// "genuinely broken" apart from "lost a race with a concurrent
 		// winner" — it falls into waitForConcurrentRecallWinner and burns the
@@ -586,8 +634,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		// confirmed-dangling reference must fail immediately, before any of
 		// that machinery runs.
 		if stateAttr, serr := metaWrapper.XAttrGet_ll(ino, proto.XAttrKeyOSSAccelState); serr == nil && stateAttr.XAttrs[proto.XAttrKeyOSSAccelState] == proto.ColdStateError {
-			http.Error(w, fmt.Sprintf("ino(%v) cold data confirmed unrecoverable by a prior audit (dangling S3 reference) — not retryable without manual repair", ino), http.StatusGone)
-			return
+			return 0, "", false, &ossAccelRecallHTTPError{status: http.StatusGone, msg: fmt.Sprintf("ino(%v) cold data confirmed unrecoverable by a prior audit (dangling S3 reference) — not retryable without manual repair", ino)}
 		}
 	}
 	if isCold && before.HasMigrationEk {
@@ -597,10 +644,9 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 			// expiredTime). A migration-write now would append alongside it rather
 			// than replacing it — a real data-corruption risk. Refuse; the caller
 			// (client cold-read gate) surfaces a retryable error.
-			http.Error(w, fmt.Sprintf(
+			return 0, "", false, &ossAccelRecallHTTPError{status: http.StatusTooEarly, msg: fmt.Sprintf(
 				"not yet safe to recall: inode(%v) still has a pending delayed-release migration slot (from a prior tier-out); retry once its grace period ends (expires %v)",
-				ino, before.MigrationExtentKeyExpiredTime), http.StatusTooEarly)
-			return
+				ino, before.MigrationExtentKeyExpiredTime)}
 		}
 		// expiredTime <= now with a non-empty slot means the slot is safe to
 		// discard, covering two distinct cases:
@@ -625,8 +671,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		log.LogWarnf("ossAccelRecall: discarding expired/orphaned migration slot (expiredTime=%v, now=%v) ino(%v)",
 			before.MigrationExtentKeyExpiredTime, time.Now(), ino)
 		if derr := metaWrapper.DeleteMigrationExtentKey(ino, path); derr != nil {
-			http.Error(w, fmt.Sprintf("failed to discard expired/orphaned migration slot: %v", derr), http.StatusInternalServerError)
-			return
+			return 0, "", false, fmt.Errorf("failed to discard expired/orphaned migration slot: %v", derr)
 		}
 	}
 	// writeStorageClass/isMigration: BlobStore case writes into the migration slot
@@ -640,8 +685,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	}
 
 	if err = extentClient.OpenStream(ino, false, false, ""); err != nil {
-		http.Error(w, fmt.Sprintf("OpenStream err: %v", err), http.StatusBadRequest)
-		return
+		return 0, "", false, fmt.Errorf("OpenStream err: %v", err)
 	}
 	defer extentClient.CloseStream(ino)
 
@@ -670,8 +714,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		recallErr = nil
 	}
 	if recallErr != nil {
-		http.Error(w, recallErr.Error(), http.StatusInternalServerError)
-		return
+		return 0, "", false, recallErr
 	}
 
 	if isCold {
@@ -683,8 +726,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 				log.LogWarnf("ossAccelRecall: commit lost a concurrent recall race (commit err: %v) but ino(%v) reached StorageClass(%v) — treating as success",
 					cerr, ino, vsc)
 			} else {
-				http.Error(w, fmt.Sprintf("commit-hot UpdateExtentKeyAfterMigration err: %v", cerr), http.StatusInternalServerError)
-				return
+				return 0, "", false, fmt.Errorf("commit-hot UpdateExtentKeyAfterMigration err: %v", cerr)
 			}
 		}
 	}
@@ -701,9 +743,7 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		log.LogWarnf("ossAccelRecall: vol(%v) ino(%v) failed to stamp lastRecallTime: %v", vol, ino, serr)
 	}
 
-	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
-		vol, ino, off, s3key, got, isCold)
-	fmt.Fprintf(w, "ok: vol=%v ino=%v written=%v s3key=%v checksum=sha256:%v wasCold=%v\n", vol, ino, off, s3key, got, isCold)
+	return off, got, isCold, nil
 }
 
 // concurrentRecallWaitBound is how long a losing recall waits for a concurrent
