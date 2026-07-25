@@ -64,6 +64,15 @@ import (
 // existing recall path (lcnode/oss_accel.go, AUDIT-1) — a subsequent read
 // attempt fails fast with a distinguishable error instead of hanging or
 // silently returning corrupt bytes.
+//
+// 形态收敛 EXCEPTION: on a volume whose backing bucket is externally owned
+// (role=readonly), a mismatch is DETECTED and REPORTED but NOT marked. Two
+// reasons: against a bucket someone else writes, a changed checksum most
+// likely means the owner legitimately updated the object rather than that it
+// rotted; and ColdStateError has no clearing path for a committed-cold file
+// (nothing writes ColdStateClean without a hot copy to re-flush), so a false
+// positive there is a permanent read-block, not a recoverable warning. The
+// MismatchesUnmarked counter reports exactly how many took this path.
 
 // ossAccelIntegrityBatchConcurrency bounds how many full-tier downloads run
 // at once — real S3 egress bandwidth, same wait-for-a-slot semantics as
@@ -80,26 +89,50 @@ type ossAccelIntegrityCandidate struct {
 	lastCheck time.Time
 }
 
+// ossAccelIntegrityResult is what one sweep found. Grouped into a struct
+// rather than grown to a fifth naked int return — MismatchesUnmarked was the
+// point at which positional returns stopped being readable at the call site.
+type ossAccelIntegrityResult struct {
+	CheapChecked int
+	FullChecked  int
+	// Mismatches counts every mismatch DETECTED, marked or not — unchanged
+	// meaning from before 形态收敛.
+	Mismatches int
+	// MismatchesUnmarked ⊆ Mismatches: detected but deliberately not marked
+	// ColdStateError because the bucket is externally owned (role=readonly).
+	MismatchesUnmarked int
+}
+
 // runOssAccelIntegrityForVol builds this volume's meta/S3 clients and runs
 // one integrity sweep — mirrors runOssAccelAuditForVol's construction
 // pattern.
-func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount uint32) (cheapChecked, fullChecked, mismatches int, err error) {
+func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount uint32) (result ossAccelIntegrityResult, err error) {
 	defer ossAccelObserve("integrity", vol, &err)()
 	mw, berr := l.buildVolMetaWrapper(vol)
 	if berr != nil {
-		return 0, 0, 0, berr
+		return result, berr
 	}
 	defer mw.Close()
 
 	s3Cfg, err := loadOssAccelS3Config(mw, vol)
 	if err != nil {
-		return 0, 0, 0, err
+		return result, err
 	}
 	s3Backend, err := s3.New(s3Cfg)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("s3 backend init err: %v", err)
+		return result, fmt.Errorf("s3 backend init err: %v", err)
 	}
 	defer s3Backend.Close()
+
+	// 形态收敛: decides whether a detected mismatch gets marked ColdStateError.
+	// Uses the externally-owned predicate, NOT the write predicate — a secondary
+	// shares a collectively-owned bucket and must keep marking; only readonly
+	// suppresses. Loaded once per sweep.
+	roleCfg, rcerr := loadOssAccelRoleConfig(mw)
+	if rcerr != nil {
+		return result, rcerr
+	}
+	markMismatch := !ossAccelBucketExternallyOwned(roleCfg)
 
 	var candidates []ossAccelIntegrityCandidate
 	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
@@ -127,25 +160,28 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 		return nil
 	})
 	if werr != nil {
-		return 0, 0, 0, fmt.Errorf("walkOssAccelTree err: %v", werr)
+		return result, fmt.Errorf("walkOssAccelTree err: %v", werr)
 	}
 	if len(candidates) == 0 {
-		return 0, 0, 0, nil
+		return result, nil
 	}
 
 	ctx := context.Background()
 
 	// Cheap tier: every candidate, sequential, zero-download.
 	for _, c := range candidates {
-		cheapChecked++
+		result.CheapChecked++
 		match, cerr := ossAccelCheapChecksumMatches(ctx, s3Backend, c.s3key, c.checksum)
 		if cerr != nil {
 			log.LogWarnf("runOssAccelIntegrityForVol: vol(%v) cheap-check ino(%v) s3key(%v) err: %v", vol, c.ino, c.s3key, cerr)
 			continue // Stat failure is inconclusive, not evidence of corruption — same "safe by default" as isOssAccelOwnedS3Key
 		}
 		if !match {
-			mismatches++
-			markOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key, "cheap(metadata)")
+			result.Mismatches++
+			if !markMismatch {
+				result.MismatchesUnmarked++
+			}
+			reportOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key, "cheap(metadata)", markMismatch)
 		}
 	}
 
@@ -180,16 +216,19 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 					}
 					if !match {
 						batchMismatches[i] = true
-						markOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key, fmt.Sprintf("full(expected=%v actual=%v)", c.checksum, actual))
+						reportOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key, fmt.Sprintf("full(expected=%v actual=%v)", c.checksum, actual), markMismatch)
 					}
 				}(i, c)
 			}
 			wg.Wait()
 
 			for i := range batch {
-				fullChecked++
+				result.FullChecked++
 				if batchMismatches[i] {
-					mismatches++
+					result.Mismatches++
+					if !markMismatch {
+						result.MismatchesUnmarked++
+					}
 				}
 				// Stamp regardless of outcome — rotation must advance even on
 				// a mismatch, or a permanently-corrupt file would monopolize
@@ -203,7 +242,7 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 		}
 	}
 
-	return cheapChecked, fullChecked, mismatches, nil
+	return result, nil
 }
 
 // ossAccelCheapChecksumMatches HEADs key (no body download) and compares its
@@ -246,12 +285,22 @@ func ossAccelFullChecksumMatches(ctx context.Context, s3Backend backend.Backend,
 	return actual == wantChecksum, actual, nil
 }
 
-// markOssAccelIntegrityMismatch marks ino ColdStateError and logs the
-// specifics — see the package-level doc comment above for why this is the
-// complete action, not a partial one.
-func markOssAccelIntegrityMismatch(mw *meta.MetaWrapper, ino uint64, path, s3key, detail string) {
-	if serr := mw.BatchSetXAttr_ll(ino, map[string]string{proto.XAttrKeyOSSAccelState: proto.ColdStateError}); serr != nil {
-		log.LogWarnf("markOssAccelIntegrityMismatch: ino(%v) path(%v) s3key(%v) failed to mark ColdStateError: %v", ino, path, s3key, serr)
+// reportOssAccelIntegrityMismatch logs a detected mismatch and, when mark is
+// true, marks ino ColdStateError — see the package-level doc comment above for
+// why marking is the complete action rather than a partial one, and for why
+// an externally-owned bucket (role=readonly) suppresses it.
+//
+// Named "report" rather than "mark" precisely because marking is now
+// conditional: a caller reading `mark...(...)` would reasonably assume the
+// mark always happens.
+func reportOssAccelIntegrityMismatch(mw *meta.MetaWrapper, ino uint64, path, s3key, detail string, mark bool) {
+	if !mark {
+		log.LogWarnf("reportOssAccelIntegrityMismatch: checksum mismatch ino(%v) path(%v) s3key(%v) detail(%v) — NOT marking ColdStateError: bucket is externally owned (role=readonly), so a mismatch is more likely a legitimate update by the bucket's owner than corruption, and ColdStateError is unclearable for a committed-cold file",
+			ino, path, s3key, detail)
+		return
 	}
-	log.LogErrorf("markOssAccelIntegrityMismatch: checksum mismatch ino(%v) path(%v) s3key(%v) detail(%v) — marked ColdStateError", ino, path, s3key, detail)
+	if serr := mw.BatchSetXAttr_ll(ino, map[string]string{proto.XAttrKeyOSSAccelState: proto.ColdStateError}); serr != nil {
+		log.LogWarnf("reportOssAccelIntegrityMismatch: ino(%v) path(%v) s3key(%v) failed to mark ColdStateError: %v", ino, path, s3key, serr)
+	}
+	log.LogErrorf("reportOssAccelIntegrityMismatch: checksum mismatch ino(%v) path(%v) s3key(%v) detail(%v) — marked ColdStateError", ino, path, s3key, detail)
 }

@@ -17,7 +17,7 @@
 // (GET /ossAccelRegister, 手动触发)。两者共用同一个执行核心
 // runOssAccelRegisterForVol,和 changelog sync 用的是**同一套物化逻辑**
 // (materializeOssAccelChangelogEvent, lcnode/oss_accel.go) ——这里不重新
-//实现物化,只是给它接上两个新的候选发现来源。
+// 实现物化,只是给它接上两个新的候选发现来源。
 //
 // changelog sync 的候选自带外部写入方上报的 checksum;这两条新路径没有
 // 这个上报(外部系统根本不知道 CubeFS 存在,更不会算好 sha256 写进

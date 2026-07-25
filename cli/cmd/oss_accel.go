@@ -50,12 +50,12 @@ const (
 	cmdOssAccelRoleUse = "role [COMMAND]"
 
 	cmdOssAccelRoleSetUse   = "set [volname]"
-	cmdOssAccelRoleSetShort = "set the volume's M4 write role (primary or secondary)"
+	cmdOssAccelRoleSetShort = "set the volume's write role (primary, secondary, or readonly)"
 	cmdOssAccelRoleGetUse   = "get [volname]"
-	cmdOssAccelRoleGetShort = "show the volume's M4 write role, if configured"
+	cmdOssAccelRoleGetShort = "show the volume's write role, if configured"
 	cmdOssAccelRoleDelUse   = "delete [volname]"
 	cmdOssAccelRoleDelShort = "remove the volume's role config (falls back to unrestricted primary)"
-	cmdOssAccelRoleShort    = "Manage a volume's M4 multi-cluster write role (primary/secondary)"
+	cmdOssAccelRoleShort    = "Manage a volume's write role: who may mutate the shared S3 bucket (primary/secondary/readonly)"
 )
 
 func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
@@ -324,11 +324,24 @@ func newOssAccelRoleSetCmd(client *master.MasterClient) *cobra.Command {
 		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			volName := args[0]
-			if role != proto.OSSAccelRolePrimary && role != proto.OSSAccelRoleSecondary {
-				stdout("set oss-accel role failed: --role must be %q or %q\n", proto.OSSAccelRolePrimary, proto.OSSAccelRoleSecondary)
+			if !proto.IsValidOSSAccelRole(role) {
+				stdout("set oss-accel role failed: --role must be %q, %q, or %q\n",
+					proto.OSSAccelRolePrimary, proto.OSSAccelRoleSecondary, proto.OSSAccelRoleReadOnly)
 				return
 			}
-			cfg := proto.OSSAccelRoleConfig{Role: role, OwnedPrefixes: ownedPrefixes}
+			// 形态收敛: canonicalize before storing, so `role get` shows what is
+			// actually enforced rather than something lcnode silently rewrites on
+			// read. Prefixes match S3 KEYS, which have no leading slash — a stored
+			// "/ckpt" used to match nothing at all and quietly block every write.
+			canonical := canonicalOssAccelOwnedPrefixes(ownedPrefixes)
+			if len(ownedPrefixes) > 0 && !sameStringSlice(canonical, ownedPrefixes) {
+				stdout("note: --owned-prefix normalized %v -> %v (S3 keys have no leading slash)\n", ownedPrefixes, canonical)
+			}
+			if len(canonical) > 0 && role != proto.OSSAccelRoleSecondary {
+				stdout("warning: --owned-prefix is ignored for role=%v (only role=%v consults it); storing it anyway so a later switch to secondary can reuse it\n",
+					role, proto.OSSAccelRoleSecondary)
+			}
+			cfg := proto.OSSAccelRoleConfig{Role: role, OwnedPrefixes: canonical}
 			raw, err := json.Marshal(cfg)
 			if err != nil {
 				stdout("marshal oss-accel role config failed: %v\n", err)
@@ -347,9 +360,50 @@ func newOssAccelRoleSetCmd(client *master.MasterClient) *cobra.Command {
 			stdout("vol[%v] oss-accel role set:\n%v\n", volName, string(raw))
 		},
 	}
-	cmd.Flags().StringVar(&role, "role", "", "primary or secondary (required)")
-	cmd.Flags().StringSliceVar(&ownedPrefixes, "owned-prefix", nil, "path prefix this cluster may still write for despite role=secondary (repeatable); ignored for role=primary")
+	cmd.Flags().StringVar(&role, "role", "", "primary, secondary, or readonly (required). primary: unrestricted. secondary: another CubeFS cluster owns the bucket's other prefixes; writes allowed only under --owned-prefix. readonly: the bucket belongs to an external system — all writes and all destructive housekeeping (orphan quarantine, rename-drift relocate, trash purge) are refused, detection still runs and reports")
+	cmd.Flags().StringSliceVar(&ownedPrefixes, "owned-prefix", nil, "S3 KEY prefix this cluster may still write despite role=secondary (repeatable). No leading slash — write \"ckpt/\", not \"/ckpt\". Matched at path-segment boundaries, so \"ckpt\" covers \"ckpt/...\" but not \"ckptx/...\". Ignored for role=primary and role=readonly")
 	return cmd
+}
+
+// canonicalOssAccelOwnedPrefixes mirrors lcnode's normalizeOssAccelOwnedPrefixes
+// (lcnode/oss_accel_role.go) — kept as a small local copy rather than exported
+// from lcnode, since cli importing lcnode for four lines of string handling
+// would be a much worse dependency than the duplication. Both sides normalize,
+// so a mismatch degrades to "stored form is uglier than enforced form", never
+// to a difference in what is enforced.
+func canonicalOssAccelOwnedPrefixes(prefixes []string) []string {
+	if len(prefixes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(prefixes))
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		p = strings.TrimPrefix(strings.TrimSpace(p), "/")
+		if p == "" {
+			continue
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func newOssAccelRoleGetCmd(client *master.MasterClient) *cobra.Command {

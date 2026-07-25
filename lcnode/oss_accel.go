@@ -134,50 +134,36 @@ func loadOssAccelS3ConfigFromEnv() (*s3.Config, error) {
 	}, nil
 }
 
-// loadOssAccelRoleConfig returns this volume's M4 write role. Absent
-// xattr (the normal, pre-M4 case) returns OSSAccelRolePrimary with no
+// loadOssAccelRoleConfig returns this volume's write role — a thin I/O
+// wrapper around parseOssAccelRoleConfig (lcnode/oss_accel_role.go), which
+// holds all the parsing/normalization logic and is unit-tested there.
+//
+// Absent xattr (the normal, pre-M4 case) returns OSSAccelRolePrimary with no
 // OwnedPrefixes — unrestricted, matching every volume's behavior before this
-// xattr existed. Returns a non-nil error only when the xattr is present but
-// malformed — callers must NOT fall back silently in that case (same
-// discipline as loadOssAccelS3ConfigFromVol: a broken config should be loud,
-// not quietly ignored).
+// xattr existed.
+//
+// A metanode READ FAILURE is a hard error, deliberately unlike
+// sdk/ossaccel.LoadBackendConfig which falls back to env on error: config
+// RESOLUTION may fall back to a default, a safety GATE may not. Assuming
+// "unrestricted primary" because we couldn't read the role is exactly the
+// silent permissive window this gate exists to close. Do not "fix" this for
+// symmetry with the backend loader.
+//
+// Note the two non-error cases are kept distinct from that failure: a root
+// inode with NO xattrs at all returns len(xattrs)==0 with err==nil (metanode
+// only appends an XAttrInfo for inodes that have an extendTree entry — see
+// metanode/partition_op_extend.go's BatchGetXAttr), which is the normal state
+// of nearly every volume. Collapsing that into the error branch would block
+// writes cluster-wide.
 func loadOssAccelRoleConfig(mw *meta.MetaWrapper) (*proto.OSSAccelRoleConfig, error) {
-	def := &proto.OSSAccelRoleConfig{Role: proto.OSSAccelRolePrimary}
 	xattrs, err := mw.BatchGetXAttr([]uint64{proto.RootIno}, []string{proto.XAttrKeyOSSAccelRoleConfig})
-	if err != nil || len(xattrs) == 0 {
-		return def, nil
+	if err != nil {
+		return nil, fmt.Errorf("oss-accel role config read failed on vol root inode: %v (refusing to assume unrestricted primary)", err)
 	}
-	raw := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelRoleConfig]
-	if raw == "" {
-		return def, nil
+	if len(xattrs) == 0 {
+		return defaultOssAccelRoleConfig(), nil // root inode has no xattrs at all — normal unconfigured volume
 	}
-	var cfg proto.OSSAccelRoleConfig
-	if jerr := json.Unmarshal([]byte(raw), &cfg); jerr != nil {
-		return nil, fmt.Errorf("oss-accel per-vol role config on root inode is not valid JSON: %v", jerr)
-	}
-	if cfg.Role != proto.OSSAccelRolePrimary && cfg.Role != proto.OSSAccelRoleSecondary {
-		return nil, fmt.Errorf("oss-accel per-vol role config has invalid role %q (want %q or %q)",
-			cfg.Role, proto.OSSAccelRolePrimary, proto.OSSAccelRoleSecondary)
-	}
-	return &cfg, nil
-}
-
-// ossAccelWriteAllowed reports whether this volume's role config permits
-// writing/tiering-out the given S3 key. Primary is always allowed; secondary
-// is allowed only under one of its delegated OwnedPrefixes (see
-// proto.OSSAccelRoleConfig doc comment) — same strings.HasPrefix idiom
-// already used for changelog rule prefix matching (below,
-// runOssAccelChangelogSync).
-func ossAccelWriteAllowed(cfg *proto.OSSAccelRoleConfig, s3key string) bool {
-	if cfg.Role != proto.OSSAccelRoleSecondary {
-		return true
-	}
-	for _, p := range cfg.OwnedPrefixes {
-		if strings.HasPrefix(s3key, p) {
-			return true
-		}
-	}
-	return false
+	return parseOssAccelRoleConfig(xattrs[0].XAttrs[proto.XAttrKeyOSSAccelRoleConfig])
 }
 
 // normalizeOssAccelKey maps a POSIX path to the S3 object key. The key equals
@@ -227,10 +213,23 @@ func (l *LcNode) httpServiceOssAccelFlush(w http.ResponseWriter, r *http.Request
 
 	s3key, checksum, err := l.runOssAccelFlushForVol(vol, path, ino, size, sc, vsc, asc)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		httpErrorOssAccel(w, err)
 		return
 	}
 	fmt.Fprintf(w, "ok: vol=%v ino=%v size=%v s3key=%v checksum=%v\n", vol, ino, size, s3key, checksum)
+}
+
+// httpErrorOssAccel maps an oss-accel operation error to an HTTP response,
+// surfacing a role refusal as 403 rather than burying it in a generic 500.
+// The distinction matters operationally: 500 means "we tried and something
+// broke", 403 means "we declined by policy and nothing was attempted" — and
+// a caller (or a test) has no other way to tell those apart.
+func httpErrorOssAccel(w http.ResponseWriter, err error) {
+	if errors.Is(err, errOssAccelWriteForbidden) {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusInternalServerError)
 }
 
 // runOssAccelFlushForVol builds this volume's meta/extent/S3 clients and runs
@@ -258,15 +257,16 @@ func (l *LcNode) runOssAccelFlushForVol(vol, path string, ino, size uint64, sc, 
 	defer metaWrapper.Close()
 	defer extentClient.Close()
 
-	// M4 write role gate — checked before touching S3 or reading any hot-layer
-	// bytes (fail-fast: a rejected secondary write leaves no trace, not a
-	// write-then-reject). See proto.OSSAccelRoleConfig doc comment.
+	// Write role gate — checked before touching S3 or reading any hot-layer
+	// bytes (fail-fast: a rejected write leaves no trace, not a
+	// write-then-reject). See proto.OSSAccelRoleConfig doc comment. This is the
+	// precedent every other gated mutation follows: load once, check early.
 	roleCfg, err := loadOssAccelRoleConfig(metaWrapper)
 	if err != nil {
 		return "", "", err
 	}
-	if !ossAccelWriteAllowed(roleCfg, s3key) {
-		return "", "", fmt.Errorf("vol(%v) is role=%v and s3key(%v) is not under any OwnedPrefixes — write rejected", vol, roleCfg.Role, s3key)
+	if !ossAccelKeyWriteAllowed(roleCfg, s3key) {
+		return "", "", ossAccelWriteForbiddenErrf(roleCfg, vol, "flush", s3key)
 	}
 
 	// Per-vol backend override lives on this vol's own root inode, so the S3
@@ -335,14 +335,26 @@ func (l *LcNode) runOssAccelFlushForVol(vol, path string, ino, size uint64, sc, 
 
 	// M4: announce this write on the shared changelog so other clusters
 	// tailing the SAME bucket (M2's existing httpServiceOssAccelChangelogSync,
-	// unchanged) can discover it. Reaching this point already means the role
-	// gate above allowed the write for this scope, regardless of whether this
-	// volume's OWN role is literally "primary" or a secondary's delegated
-	// OwnedPrefixes — either way this cluster is the authority for this key
-	// right now. Best-effort: the flush itself already fully succeeded (bytes
-	// durable in S3, xattr recorded) by this point, so a changelog-append
-	// failure is logged, not surfaced as a request failure — matches the
-	// existing best-effort discipline for the lastRecallTime xattr stamp in
+	// unchanged) can discover it.
+	//
+	// 形态收敛: this Put targets the shared changelog object at the BUCKET ROOT,
+	// which sits outside any OwnedPrefixes by construction — so it needs the
+	// bucket-level permission (ossAccelBucketWriteAllowed), NOT the per-key one.
+	// No separate check is written here because the composition already
+	// guarantees it: ossAccelKeyWriteAllowed has ossAccelBucketWriteAllowed as
+	// its base case, so the gate at the top of this function has already
+	// established bucket-level permission by the time we reach this line. A
+	// readonly volume never gets here at all (its flush is refused before any
+	// S3 work), while a secondary writing inside its own OwnedPrefixes DOES get
+	// here and DOES announce — which is the intended behavior, and the reason
+	// the two predicates are separate rather than one. If this call ever gains a
+	// second caller that is not already behind the key gate, that caller must
+	// check ossAccelBucketWriteAllowed itself.
+	//
+	// Best-effort: the flush itself already fully succeeded (bytes durable in
+	// S3, xattr recorded) by this point, so a changelog-append failure is
+	// logged, not surfaced as a request failure — matches the existing
+	// best-effort discipline for the lastRecallTime xattr stamp in
 	// httpServiceOssAccelRecall.
 	if aerr := appendOssAccelChangelogEvent(ctx, s3Backend, defaultOssAccelChangelogKey, s3key, size, checksum); aerr != nil {
 		log.LogWarnf("ossAccelFlush: vol(%v) ino(%v) s3key(%v) failed to append changelog event: %v", vol, ino, s3key, aerr)
@@ -1063,6 +1075,23 @@ func (l *LcNode) httpServiceOssAccelRelocate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// 形态收敛: relocate DELETES one object and CREATES another, so authority is
+	// required over BOTH keys — checking only newKey would let a secondary
+	// delete another cluster's object, checking only oldKey would let it plant
+	// one in someone else's prefix. Checked before the S3 client is even built
+	// (same fail-fast precedent as flush).
+	roleCfg, rcerr := loadOssAccelRoleConfig(metaWrapper)
+	if rcerr != nil {
+		http.Error(w, rcerr.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, k := range []string{oldKey, newKey} {
+		if !ossAccelKeyWriteAllowed(roleCfg, k) {
+			httpErrorOssAccel(w, ossAccelWriteForbiddenErrf(roleCfg, vol, "relocate", k))
+			return
+		}
+	}
+
 	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -1094,16 +1123,38 @@ func (l *LcNode) httpServiceOssAccelRelocate(w http.ResponseWriter, r *http.Requ
 // leftover from a previous relocate attempt for a DIFFERENT inode).
 var errOssAccelRelocateConflict = errors.New("oss-accel: relocate target key already exists in S3")
 
+// ossAccelRelocateTargetOccupied probes whether newKey already holds an object.
+// Read-only (a single Head), extracted from runOssAccelRelocate so audit's
+// Direction C can classify drift as clean-vs-conflicting WITHOUT performing the
+// relocate — needed for the readonly form, where drift must still be detected
+// and reported but never acted on. runOssAccelRelocate still calls this itself,
+// so its behavior and error contract are unchanged.
+func ossAccelRelocateTargetOccupied(ctx context.Context, s3Backend backend.Backend, newKey string) (bool, error) {
+	if _, _, _, herr := s3Backend.Head(ctx, newKey); herr == nil {
+		return true, nil
+	} else if herr != backend.ErrKeyNotFound {
+		return false, fmt.Errorf("s3 head newKey err: %v", herr)
+	}
+	return false, nil
+}
+
 // runOssAccelRelocate moves the S3 object backing ino from oldKey to newKey
 // and updates the oss-accel.s3key xattr to match. Fail-closed (returns
 // errOssAccelRelocateConflict) rather than clobbering an existing object at
 // newKey. Shared by the manual /ossAccelRelocate endpoint and the audit's
 // Direction C rename-drift auto-detect (runOssAccelAudit).
+//
+// Does NOT check the write role itself — both callers gate before calling
+// (the manual handler checks both keys before building the S3 client; audit
+// Direction C checks both keys in its decide step). Kept that way so this
+// stays a pure "do the move" primitive with one job.
 func runOssAccelRelocate(ctx context.Context, metaWrapper *meta.MetaWrapper, s3Backend backend.Backend, ino uint64, oldKey, newKey string) error {
-	if _, _, _, herr := s3Backend.Head(ctx, newKey); herr == nil {
+	occupied, perr := ossAccelRelocateTargetOccupied(ctx, s3Backend, newKey)
+	if perr != nil {
+		return perr
+	}
+	if occupied {
 		return fmt.Errorf("%w: key(%v)", errOssAccelRelocateConflict, newKey)
-	} else if herr != backend.ErrKeyNotFound {
-		return fmt.Errorf("s3 head newKey err: %v", herr)
 	}
 
 	if rerr := s3Backend.Rename(ctx, oldKey, newKey); rerr != nil {

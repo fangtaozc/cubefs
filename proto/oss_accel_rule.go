@@ -183,18 +183,27 @@ type OSSAccelAuditTaskRequest struct {
 
 // OSSAccelAuditTaskResponse is what lcnode reports back after running the
 // task — mirrors runOssAccelAudit's own result shape (lcnode/oss_accel_audit.go).
+// 形态收敛 added the *Refused/*Unmarked counters. They exist so a scheduled
+// audit against a readonly volume reports "found N, refused to act on N"
+// rather than looking identical to "found nothing" — the distinction is the
+// only externally visible evidence that the gate worked. JSON-additive, so a
+// mixed-version master/lcnode pair degrades to zero rather than breaking.
 type OSSAccelAuditTaskResponse struct {
-	VolName    string
-	LcNode     string
-	StartTime  *time.Time
-	EndTime    *time.Time
-	Done       bool
-	StartErr   string
-	Dangling   int
-	Orphans    int
-	Quarantined int
-	Relocated  int
-	DriftConflicts int
+	VolName          string
+	LcNode           string
+	StartTime        *time.Time
+	EndTime          *time.Time
+	Done             bool
+	StartErr         string
+	Dangling         int
+	DanglingUnmarked int
+	Orphans          int
+	Quarantined      int
+	OrphanRefused    int
+	DriftDetected    int
+	Relocated        int
+	DriftConflicts   int
+	DriftRefused     int
 }
 
 // OSSAccelTrashPurgeRule is the master-persisted, per-volume trash purge
@@ -235,6 +244,10 @@ type OSSAccelTrashPurgeTaskResponse struct {
 	Done      bool
 	StartErr  string
 	Purged    int
+	// Refused: eligible for permanent deletion (aged past retention) but
+	// declined by the volume's write role — 形态收敛. Distinguishes "the gate
+	// protected someone else's objects" from "the trash was empty".
+	Refused int
 }
 
 // 系统层面收尾续(补1+3): master-persisted schedules for the two remaining
@@ -322,7 +335,10 @@ type OSSAccelFlushPolicyTaskResponse struct {
 //
 // A mismatch (either tier) only marks the file proto.ColdStateError — see
 // runOssAccelIntegrityForVol's doc comment for why there is no attempt at
-// automatic repair.
+// automatic repair. EXCEPT on a volume with Role==OSSAccelRoleReadOnly, where
+// a mismatch is detected and reported but NOT marked (the bucket's owner may
+// have legitimately updated the object, and ColdStateError is unclearable for
+// a committed-cold file) — see OSSAccelRoleReadOnly's doc comment.
 type OSSAccelIntegrityRule struct {
 	VolName         string    `json:"volName"`
 	Prefix          string    `json:"prefix,omitempty"`
@@ -357,7 +373,12 @@ type OSSAccelIntegrityTaskResponse struct {
 	StartErr     string
 	CheapChecked int
 	FullChecked  int
-	Mismatches   int
+	// Mismatches counts every mismatch DETECTED (marked or not) — meaning
+	// unchanged by 形态收敛.
+	Mismatches int
+	// MismatchesUnmarked ⊆ Mismatches: detected but not marked ColdStateError
+	// because the bucket is externally owned (role=readonly).
+	MismatchesUnmarked int
 }
 
 // 反向加速续(补两条发现路径): master-persisted schedule for periodically

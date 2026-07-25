@@ -62,7 +62,7 @@ func ossAccelObserve(op, vol string, errp *error) func() {
 	return func() {
 		metric.SetWithLabels(*errp, map[string]string{exporter.Vol: vol})
 		if *errp != nil {
-			exporter.NewCounter("action_" + op + "_failed").AddWithLabels(1, map[string]string{exporter.Vol: vol})
+			exporter.NewCounter("action_"+op+"_failed").AddWithLabels(1, map[string]string{exporter.Vol: vol})
 		}
 	}
 }
@@ -108,7 +108,7 @@ func ossAccelObserveHTTP(op string, next http.HandlerFunc) http.HandlerFunc {
 		}
 		metric.SetWithLabels(errForMetric, map[string]string{exporter.Vol: vol})
 		if failed {
-			exporter.NewCounter("action_" + op + "_failed").AddWithLabels(1, map[string]string{exporter.Vol: vol})
+			exporter.NewCounter("action_"+op+"_failed").AddWithLabels(1, map[string]string{exporter.Vol: vol})
 		}
 	}
 }

@@ -153,9 +153,13 @@ func (l *LcNode) httpServiceOssAccelAudit(w http.ResponseWriter, r *http.Request
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v orphansConsidered=%v quarantined=%v relocated=%v driftConflicts=%v\ndanglingKeys=%v\nquarantinedKeys=%v\nrelocatedKeys=%v\ndriftConflictKeys=%v\n",
-		vol, prefix, len(result.DanglingKeys), len(result.OrphanCandidateKeys), len(result.QuarantinedKeys), len(result.RelocatedKeys), len(result.DriftConflictKeys),
-		result.DanglingKeys, result.QuarantinedKeys, result.RelocatedKeys, result.DriftConflictKeys)
+	fmt.Fprintf(w, "ok: vol=%v prefix=%v dangling=%v danglingUnmarked=%v orphansConsidered=%v quarantined=%v orphanRefused=%v driftDetected=%v relocated=%v driftConflicts=%v driftRefused=%v\ndanglingKeys=%v\nquarantinedKeys=%v\norphanRefusedKeys=%v\ndriftDetectedKeys=%v\nrelocatedKeys=%v\ndriftConflictKeys=%v\ndriftRefusedKeys=%v\n",
+		vol, prefix,
+		len(result.DanglingKeys), len(result.DanglingUnmarkedKeys),
+		len(result.OrphanCandidateKeys), len(result.QuarantinedKeys), len(result.OrphanRefusedKeys),
+		len(result.DriftDetectedKeys), len(result.RelocatedKeys), len(result.DriftConflictKeys), len(result.DriftRefusedKeys),
+		result.DanglingKeys, result.QuarantinedKeys, result.OrphanRefusedKeys,
+		result.DriftDetectedKeys, result.RelocatedKeys, result.DriftConflictKeys, result.DriftRefusedKeys)
 }
 
 // runOssAccelAuditForVol builds this volume's meta/S3 clients and runs one
@@ -181,19 +185,50 @@ func (l *LcNode) runOssAccelAuditForVol(vol, prefix string, graceHours uint64) (
 	}
 	defer s3Backend.Close()
 
-	return runOssAccelAudit(metaWrapper, s3Backend, prefix, time.Duration(graceHours)*time.Hour)
+	// 形态收敛: role config is loaded ONCE here (one BatchGetXAttr per audit),
+	// then evaluated per candidate inside the sweep as a pure string compare —
+	// never re-read inside the tree walk or the per-key loops.
+	roleCfg, rcerr := loadOssAccelRoleConfig(metaWrapper)
+	if rcerr != nil {
+		return ossAccelAuditResult{}, rcerr
+	}
+
+	return runOssAccelAudit(metaWrapper, s3Backend, roleCfg, prefix, time.Duration(graceHours)*time.Hour)
 }
 
 // ossAccelAuditResult carries not just counts but the actual affected keys —
 // an operator (or a caller cleaning up after a mis-scoped run, as real-
 // machine testing needed to do once) needs to know WHICH files, not just
 // how many.
+//
+// 形态收敛 added the *Refused/*Unmarked fields. They are not cosmetic: without
+// them "the gate correctly refused this" and "there was nothing to do" are
+// indistinguishable from outside, which would make the read-only form
+// impossible to actually verify (a test asserting only "no mutation happened"
+// passes either way).
 type ossAccelAuditResult struct {
-	DanglingKeys        []string
-	OrphanCandidateKeys []string
-	QuarantinedKeys     []string
-	RelocatedKeys       []string
-	DriftConflictKeys   []string
+	DanglingKeys []string
+	// DanglingUnmarkedKeys ⊆ DanglingKeys: detected, but ColdStateError was NOT
+	// written because the bucket is externally owned (readonly form) — the
+	// object is missing from someone else's bucket, which is their business,
+	// and ColdStateError is an unclearable read-block.
+	DanglingUnmarkedKeys []string
+	OrphanCandidateKeys  []string
+	QuarantinedKeys      []string
+	// OrphanRefusedKeys ⊆ OrphanCandidateKeys: genuinely eligible for
+	// quarantine (aged past grace, owner-marked, unreferenced) but refused by
+	// the write role.
+	OrphanRefusedKeys []string
+	// DriftDetectedKeys is every rename-drift found, appended BEFORE any
+	// decision — so it is populated identically whether the drift was then
+	// relocated, found conflicting, or refused. This is what makes "readonly
+	// keeps all detection" structural rather than incidental.
+	DriftDetectedKeys []string
+	RelocatedKeys     []string
+	DriftConflictKeys []string
+	// DriftRefusedKeys ⊆ DriftDetectedKeys: drift that would have been
+	// relocated but the write role forbade one of the two keys involved.
+	DriftRefusedKeys []string
 }
 
 // runOssAccelAudit does the single tree-walk + single bucket-list pass
@@ -203,7 +238,7 @@ type ossAccelAuditResult struct {
 // happened without going through the manual /ossAccelRelocate endpoint —
 // see runOssAccelRelocate's doc comment for why auto-fixing this is safe
 // (fail-closed conflict check, never overwrites).
-func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix string, orphanGrace time.Duration) (result ossAccelAuditResult, err error) {
+func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, roleCfg *proto.OSSAccelRoleConfig, prefix string, orphanGrace time.Duration) (result ossAccelAuditResult, err error) {
 	ctx := context.Background()
 	knownKeys := make(map[string]struct{})
 	// inode/name pairs whose s3key needs an existence check — collected
@@ -239,30 +274,59 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 			return nil
 		}
 
-		// Direction C: rename-drift auto-fix. Only within prefix on BOTH
-		// ends — a file renamed from inside prefix to outside it is out of
-		// this call's jurisdiction; leave it for whichever audit call
-		// covers the destination, don't let a side effect escape the
-		// caller-declared scope.
+		// Direction C: rename-drift. Only within prefix on BOTH ends — a file
+		// renamed from inside prefix to outside it is out of this call's
+		// jurisdiction; leave it for whichever audit call covers the
+		// destination, don't let a side effect escape the caller-declared
+		// scope.
+		//
+		// 形态收敛 restructured this into detect → decide → act. Detection
+		// records unconditionally, so drift is reported identically whether it
+		// then gets relocated, found conflicting, or refused by the write role.
 		if expectedKey := normalizeOssAccelKey(path); expectedKey != s3key && strings.HasPrefix(expectedKey, prefix) {
-			switch rerr := runOssAccelRelocate(ctx, mw, s3Backend, info.Inode, s3key, expectedKey); {
-			case rerr == nil:
-				log.LogInfof("runOssAccelAudit: auto-relocated drifted key ino(%v) %v -> %v (path=%v)", info.Inode, s3key, expectedKey, path)
-				result.RelocatedKeys = append(result.RelocatedKeys, expectedKey)
-				// The old key no longer exists (Rename moved it) — Direction
-				// A's dangling-check below must use the NEW key for this
-				// candidate, or it would find the old key "missing" and
-				// wrongly flag a file this audit call just fixed.
-				s3key = expectedKey
-			case errors.Is(rerr, errOssAccelRelocateConflict):
-				result.DriftConflictKeys = append(result.DriftConflictKeys, s3key)
-				log.LogWarnf("runOssAccelAudit: drift target already occupied, not relocating ino(%v) %v -> %v: %v", info.Inode, s3key, expectedKey, rerr)
+			// --- detect (unconditional) ---
+			result.DriftDetectedKeys = append(result.DriftDetectedKeys, s3key)
+
+			// --- decide ---
+			// A relocate deletes s3key and creates expectedKey, so authority
+			// over BOTH is required (see the manual endpoint's identical check).
+			refusedKey := ""
+			for _, k := range []string{s3key, expectedKey} {
+				if !ossAccelKeyWriteAllowed(roleCfg, k) {
+					refusedKey = k
+					break
+				}
+			}
+			switch {
+			case refusedKey != "":
+				result.DriftRefusedKeys = append(result.DriftRefusedKeys, s3key)
+				log.LogWarnf("runOssAccelAudit: drift detected but relocate refused by write role ino(%v) %v -> %v (role=%v, forbidden key=%v) — reporting only",
+					info.Inode, s3key, expectedKey, roleCfg.Role, refusedKey)
+				// s3key deliberately NOT reassigned: without the rename the old
+				// key still exists in the bucket, so Direction A won't flag it
+				// dangling, and it stays in knownKeys under the old key below so
+				// Direction B won't flag it orphaned either.
 			default:
-				// e.g. transient S3/network error, or oldKey itself already
-				// missing (genuinely dangling, not just drifted) — leave
-				// s3key unchanged and let Direction A's own existence check
-				// below make the call.
-				log.LogWarnf("runOssAccelAudit: drift relocate attempt failed ino(%v) %v -> %v: %v", info.Inode, s3key, expectedKey, rerr)
+				// --- act ---
+				switch rerr := runOssAccelRelocate(ctx, mw, s3Backend, info.Inode, s3key, expectedKey); {
+				case rerr == nil:
+					log.LogInfof("runOssAccelAudit: auto-relocated drifted key ino(%v) %v -> %v (path=%v)", info.Inode, s3key, expectedKey, path)
+					result.RelocatedKeys = append(result.RelocatedKeys, expectedKey)
+					// The old key no longer exists (Rename moved it) — Direction
+					// A's dangling-check below must use the NEW key for this
+					// candidate, or it would find the old key "missing" and
+					// wrongly flag a file this audit call just fixed.
+					s3key = expectedKey
+				case errors.Is(rerr, errOssAccelRelocateConflict):
+					result.DriftConflictKeys = append(result.DriftConflictKeys, s3key)
+					log.LogWarnf("runOssAccelAudit: drift target already occupied, not relocating ino(%v) %v -> %v: %v", info.Inode, s3key, expectedKey, rerr)
+				default:
+					// e.g. transient S3/network error, or oldKey itself already
+					// missing (genuinely dangling, not just drifted) — leave
+					// s3key unchanged and let Direction A's own existence check
+					// below make the call.
+					log.LogWarnf("runOssAccelAudit: drift relocate attempt failed ino(%v) %v -> %v: %v", info.Inode, s3key, expectedKey, rerr)
+				}
 			}
 		}
 
@@ -290,11 +354,24 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 	}
 
 	// Direction A: dangling references — unambiguous, mark immediately.
+	//
+	// 形态收敛: the mark is suppressed when the bucket is externally owned. Note
+	// this uses the externally-owned predicate, NOT the write predicate: a
+	// secondary shares a collectively-owned bucket, so a missing object there is
+	// a genuine fault worth marking even for a prefix this cluster may not
+	// write. Only readonly (bucket belongs to an outside system) suppresses it.
+	markDangling := !ossAccelBucketExternallyOwned(roleCfg)
 	for _, c := range toCheck {
 		if _, ok := s3Keys[c.s3key]; ok {
 			continue
 		}
 		result.DanglingKeys = append(result.DanglingKeys, c.s3key)
+		if !markDangling {
+			result.DanglingUnmarkedKeys = append(result.DanglingUnmarkedKeys, c.s3key)
+			log.LogWarnf("runOssAccelAudit: dangling reference ino(%v) s3key(%v) — object missing in S3, NOT marking ColdStateError (role=%v, bucket externally owned: the owner may have legitimately removed or moved it, and ColdStateError is unclearable for a committed-cold file)",
+				c.ino, c.s3key, roleCfg.Role)
+			continue
+		}
 		log.LogErrorf("runOssAccelAudit: dangling reference ino(%v) s3key(%v) — object missing in S3, marking ColdStateError", c.ino, c.s3key)
 		if serr := mw.BatchSetXAttr_ll(c.ino, map[string]string{proto.XAttrKeyOSSAccelState: proto.ColdStateError}); serr != nil {
 			log.LogWarnf("runOssAccelAudit: ino(%v) failed to mark ColdStateError: %v", c.ino, serr)
@@ -319,6 +396,16 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, prefix st
 			continue
 		}
 		result.OrphanCandidateKeys = append(result.OrphanCandidateKeys, key)
+		// 形态收敛: quarantine is a destructive S3 mutation (CopyObject +
+		// DeleteObject) — gated. Reported as refused rather than silently
+		// skipped, so an operator on a readonly volume still sees exactly which
+		// keys audit believes are orphaned and could act on them out-of-band.
+		if !ossAccelKeyWriteAllowed(roleCfg, key) {
+			result.OrphanRefusedKeys = append(result.OrphanRefusedKeys, key)
+			log.LogWarnf("runOssAccelAudit: orphan candidate key(%v) (age %v, owner-marked, unreferenced) NOT quarantined — refused by write role %v; reporting only",
+				key, now.Sub(mtime), roleCfg.Role)
+			continue
+		}
 		trashKey := ossAccelTrashPrefix + key
 		if rerr := s3Backend.Rename(ctx, key, trashKey); rerr != nil {
 			log.LogWarnf("runOssAccelAudit: failed to quarantine orphan key(%v) -> %v: %v", key, trashKey, rerr)

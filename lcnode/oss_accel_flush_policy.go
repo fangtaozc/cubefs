@@ -90,6 +90,26 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 		return 0, 0, 0, 0, fmt.Errorf("GetVolumeSimpleInfo err: %v", verr)
 	}
 
+	// 形态收敛 pre-flight: without this, a role that forbids writing the bucket
+	// still walks the whole tree and attempts a flush per candidate, each of
+	// which is refused — and the loop below counts every refusal as errors++,
+	// so master's LastRunResult would report "errors=N" indistinguishable from
+	// real S3 failures on every single sweep, forever. Bail once, loudly, with
+	// clean zero counters instead.
+	//
+	// Bucket-level (not per-key) on purpose: a SECONDARY with delegated
+	// OwnedPrefixes must still run the sweep, since some of its candidates are
+	// legitimately writable — those get the per-key check inside
+	// runOssAccelFlushForVol as usual.
+	roleCfg, rcerr := loadOssAccelRoleConfig(mw)
+	if rcerr != nil {
+		return 0, 0, 0, 0, rcerr
+	}
+	if !ossAccelBucketWriteAllowed(roleCfg) {
+		log.LogWarnf("runOssAccelFlushPolicyForVol: vol(%v) role=%v forbids writing the bucket — skipping sweep entirely (no candidates attempted, not an error)", vol, roleCfg.Role)
+		return 0, 0, 0, 0, nil
+	}
+
 	idleThreshold := time.Duration(minIdleHours) * time.Hour
 	now := time.Now()
 

@@ -184,15 +184,23 @@ const XAttrKeyOSSAccelRoleConfig = "oss-accel.role"
 
 // OSSAccelRoleConfig is the JSON shape stored at XAttrKeyOSSAccelRoleConfig.
 //
-// OwnedPrefixes is only consulted when Role==OSSAccelRoleSecondary: paths
+// OwnedPrefixes is only consulted when Role==OSSAccelRoleSecondary: keys
 // under one of these prefixes are still writable by THIS cluster (a
 // secondary can be the delegated primary for a sub-scope — e.g. the
-// project charter's own example, cluster B is secondary for /datasets but
-// primary for /ckpt). Empty OwnedPrefixes on a secondary blocks ALL writes
-// for this volume. OwnedPrefixes on a primary is meaningless and ignored
-// (a primary is already unrestricted) — kept unset rather than validated
-// away, since a future switch from primary to secondary can reuse whatever
-// was already configured.
+// project charter's own example, cluster B is secondary for datasets/ but
+// primary for ckpt/). Empty OwnedPrefixes on a secondary blocks ALL writes
+// for this volume. OwnedPrefixes is meaningless and ignored for BOTH
+// OSSAccelRolePrimary (already unrestricted) and OSSAccelRoleReadOnly
+// (never writable) — kept rather than validated away, since a later switch
+// to secondary can reuse whatever was already configured.
+//
+// Prefixes are matched against the S3 KEY, which has no leading slash
+// (see normalizeOssAccelKey in lcnode) — write "ckpt/", NOT "/ckpt". A
+// leading slash used to make a prefix match nothing at all, silently
+// blocking every write on the volume; it is now stripped on both the CLI
+// write path and the lcnode read path. Matching is path-segment aware:
+// "ckpt" matches the key "ckpt" and anything under "ckpt/", but NOT
+// "ckptx/...".
 type OSSAccelRoleConfig struct {
 	Role          string   `json:"role"`
 	OwnedPrefixes []string `json:"ownedPrefixes,omitempty"`
@@ -207,4 +215,34 @@ const (
 	// OSSAccelRoleConfig.OwnedPrefixes — consumes via changelog tailing
 	// (M2's existing httpServiceOssAccelChangelogSync, unchanged) instead.
 	OSSAccelRoleSecondary = "secondary"
+	// OSSAccelRoleReadOnly: the bucket belongs to an EXTERNAL system, not to
+	// any CubeFS cluster. Distinct from a secondary with no OwnedPrefixes,
+	// which forbids the same set of writes but means something different:
+	// secondary says "another CubeFS cluster owns this prefix, the bucket is
+	// still collectively ours", readonly says "nobody here owns any of it".
+	//
+	// That difference drives two behaviors beyond the write gate:
+	//   - Destructive housekeeping (orphan quarantine, rename-drift
+	//     relocate, trash purge) is refused rather than performed. Detection
+	//     still runs and still reports, so an operator sees dangling
+	//     references / orphan candidates / drift without oss-accel acting on
+	//     someone else's bucket.
+	//   - A checksum mismatch is NOT marked ColdStateError. Against an
+	//     externally-written bucket a mismatch most likely means the owner
+	//     legitimately updated the object, and ColdStateError is an
+	//     unclearable read-block for a committed-cold file (nothing writes
+	//     ColdStateClean without a hot copy to re-flush).
+	OSSAccelRoleReadOnly = "readonly"
 )
+
+// IsValidOSSAccelRole reports whether role is one of the three known values.
+// Shared by lcnode's config loader and the cfs-cli setter so the accepted
+// set can never drift between the write path and the enforcement path.
+func IsValidOSSAccelRole(role string) bool {
+	switch role {
+	case OSSAccelRolePrimary, OSSAccelRoleSecondary, OSSAccelRoleReadOnly:
+		return true
+	default:
+		return false
+	}
+}

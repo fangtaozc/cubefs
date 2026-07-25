@@ -178,8 +178,9 @@ func (c *Cluster) handleLcNodeOssAccelAuditResp(nodeAddr string, resp *proto.OSS
 	if resp.StartErr != "" {
 		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
 	} else {
-		updated.LastRunResult = fmt.Sprintf("ok: dangling=%v orphans=%v quarantined=%v relocated=%v driftConflicts=%v",
-			resp.Dangling, resp.Orphans, resp.Quarantined, resp.Relocated, resp.DriftConflicts)
+		updated.LastRunResult = fmt.Sprintf("ok: dangling=%v danglingUnmarked=%v orphans=%v quarantined=%v orphanRefused=%v driftDetected=%v relocated=%v driftConflicts=%v driftRefused=%v",
+			resp.Dangling, resp.DanglingUnmarked, resp.Orphans, resp.Quarantined, resp.OrphanRefused,
+			resp.DriftDetected, resp.Relocated, resp.DriftConflicts, resp.DriftRefused)
 	}
 	if err := c.syncUpdateOSSAccelAuditRule(&updated); err != nil {
 		log.LogWarnf("handleLcNodeOssAccelAuditResp: vol(%v) persist result err: %v", resp.VolName, err)
@@ -206,7 +207,7 @@ func (c *Cluster) handleLcNodeOssAccelTrashPurgeResp(nodeAddr string, resp *prot
 	if resp.StartErr != "" {
 		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
 	} else {
-		updated.LastRunResult = fmt.Sprintf("ok: purged=%v", resp.Purged)
+		updated.LastRunResult = fmt.Sprintf("ok: purged=%v refused=%v", resp.Purged, resp.Refused)
 	}
 	if err := c.syncUpdateOSSAccelTrashPurgeRule(&updated); err != nil {
 		log.LogWarnf("handleLcNodeOssAccelTrashPurgeResp: vol(%v) persist result err: %v", resp.VolName, err)
@@ -266,7 +267,8 @@ func (c *Cluster) handleLcNodeOssAccelIntegrityResp(nodeAddr string, resp *proto
 	if resp.StartErr != "" {
 		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
 	} else {
-		updated.LastRunResult = fmt.Sprintf("ok: cheapChecked=%v fullChecked=%v mismatches=%v", resp.CheapChecked, resp.FullChecked, resp.Mismatches)
+		updated.LastRunResult = fmt.Sprintf("ok: cheapChecked=%v fullChecked=%v mismatches=%v mismatchesUnmarked=%v",
+			resp.CheapChecked, resp.FullChecked, resp.Mismatches, resp.MismatchesUnmarked)
 	}
 	if err := c.syncUpdateOSSAccelIntegrityRule(&updated); err != nil {
 		log.LogWarnf("handleLcNodeOssAccelIntegrityResp: vol(%v) persist result err: %v", resp.VolName, err)

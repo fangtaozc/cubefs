@@ -349,10 +349,14 @@ func (l *LcNode) opOssAccelAudit(conn net.Conn, p *proto.Packet) (err error) {
 		resp.EndTime = &end
 		resp.Done = true
 		resp.Dangling = len(result.DanglingKeys)
+		resp.DanglingUnmarked = len(result.DanglingUnmarkedKeys)
 		resp.Orphans = len(result.OrphanCandidateKeys)
 		resp.Quarantined = len(result.QuarantinedKeys)
+		resp.OrphanRefused = len(result.OrphanRefusedKeys)
+		resp.DriftDetected = len(result.DriftDetectedKeys)
 		resp.Relocated = len(result.RelocatedKeys)
 		resp.DriftConflicts = len(result.DriftConflictKeys)
+		resp.DriftRefused = len(result.DriftRefusedKeys)
 		if runErr != nil {
 			resp.StartErr = runErr.Error()
 		}
@@ -398,11 +402,12 @@ func (l *LcNode) opOssAccelTrashPurge(conn net.Conn, p *proto.Packet) (err error
 		resp.LcNode = l.localServerAddr
 		resp.StartTime = &start
 
-		purged, runErr := l.runOssAccelTrashPurgeForVol(request.VolName, request.Prefix, uint64(request.RetentionHours))
+		purged, refused, runErr := l.runOssAccelTrashPurgeForVol(request.VolName, request.Prefix, uint64(request.RetentionHours))
 		end := time.Now()
 		resp.EndTime = &end
 		resp.Done = true
 		resp.Purged = len(purged)
+		resp.Refused = len(refused)
 		if runErr != nil {
 			resp.StartErr = runErr.Error()
 		}
@@ -550,13 +555,14 @@ func (l *LcNode) opOssAccelIntegrity(conn net.Conn, p *proto.Packet) (err error)
 		resp.LcNode = l.localServerAddr
 		resp.StartTime = &start
 
-		cheapChecked, fullChecked, mismatches, runErr := l.runOssAccelIntegrityForVol(request.VolName, request.Prefix, request.FullSampleCount)
+		result, runErr := l.runOssAccelIntegrityForVol(request.VolName, request.Prefix, request.FullSampleCount)
 		end := time.Now()
 		resp.EndTime = &end
 		resp.Done = true
-		resp.CheapChecked = cheapChecked
-		resp.FullChecked = fullChecked
-		resp.Mismatches = mismatches
+		resp.CheapChecked = result.CheapChecked
+		resp.FullChecked = result.FullChecked
+		resp.Mismatches = result.Mismatches
+		resp.MismatchesUnmarked = result.MismatchesUnmarked
 		if runErr != nil {
 			resp.StartErr = runErr.Error()
 		}
