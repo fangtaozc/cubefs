@@ -1825,10 +1825,16 @@ func (v *Volume) ossAccelWriteThroughHook(inode, size uint64, path string) error
 	case http.StatusForbidden:
 		// The volume's write role forbids writing this key (role=readonly, or a
 		// secondary outside its OwnedPrefixes). Not a transport failure and not
-		// something a retry fixes — surfaced distinctly so an operator reading
-		// logs sees policy, not breakage.
+		// something a retry fixes.
+		//
+		// Return an *ErrorCode rather than a syscall errno: errorResponse
+		// (objectnode/api_handler.go) maps syscall.EPERM to FileDeleteLock
+		// ("Operation not permitted"), which is the object-LOCK error and would
+		// point an operator at entirely the wrong feature — real-machine testing
+		// surfaced exactly that confusion. An *ErrorCode is passed through
+		// verbatim, so a policy refusal reads as AccessDenied/403.
 		log.LogWarnf("ossAccelWriteThroughHook: flush refused by write role volume(%v) inode(%v) path(%v): %v", v.name, inode, path, string(body))
-		return syscall.EPERM
+		return AccessDenied
 	default:
 		log.LogErrorf("ossAccelWriteThroughHook: flush failed volume(%v) inode(%v) path(%v) status(%v): %v", v.name, inode, path, resp.StatusCode, string(body))
 		return syscall.EIO
