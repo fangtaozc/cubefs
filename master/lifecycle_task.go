@@ -267,8 +267,8 @@ func (c *Cluster) handleLcNodeOssAccelIntegrityResp(nodeAddr string, resp *proto
 	if resp.StartErr != "" {
 		updated.LastRunResult = fmt.Sprintf("error: %v", resp.StartErr)
 	} else {
-		updated.LastRunResult = fmt.Sprintf("ok: cheapChecked=%v fullChecked=%v mismatches=%v mismatchesUnmarked=%v",
-			resp.CheapChecked, resp.FullChecked, resp.Mismatches, resp.MismatchesUnmarked)
+		updated.LastRunResult = fmt.Sprintf("ok: cheapChecked=%v fullChecked=%v mismatches=%v mismatchesUnmarked=%v mismatchesRefreshed=%v",
+			resp.CheapChecked, resp.FullChecked, resp.Mismatches, resp.MismatchesUnmarked, resp.MismatchesRefreshed)
 	}
 	if err := c.syncUpdateOSSAccelIntegrityRule(&updated); err != nil {
 		log.LogWarnf("handleLcNodeOssAccelIntegrityResp: vol(%v) persist result err: %v", resp.VolName, err)

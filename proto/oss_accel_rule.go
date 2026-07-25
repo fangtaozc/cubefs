@@ -379,6 +379,11 @@ type OSSAccelIntegrityTaskResponse struct {
 	// MismatchesUnmarked ⊆ Mismatches: detected but not marked ColdStateError
 	// because the bucket is externally owned (role=readonly).
 	MismatchesUnmarked int
+	// MismatchesRefreshed ⊆ Mismatches: 差距分析续(漂移自动刷新) — the remote
+	// object's mtime proved it was rewritten after our last flush, so the cold
+	// reference was refreshed to follow that legitimate external update rather
+	// than flagged as corruption.
+	MismatchesRefreshed int
 }
 
 // 反向加速续(补两条发现路径): master-persisted schedule for periodically

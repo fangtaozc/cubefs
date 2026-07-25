@@ -347,6 +347,51 @@ func (v *Volume) OSSAccelBackendCredential() (ak, sk string, allowed bool) {
 	return cred.AK, cred.SK, cred.Allowed
 }
 
+// loadOssAccelWriteThroughFresh reads this volume's write-through mode from the
+// volume-root xattr. Like the backend credential above, "not configured" is not
+// an error — it is the normal, cacheable result for every volume that hasn't
+// turned this on.
+//
+// A present-but-unparsable or unknown value resolves to "off" rather than an
+// error: this is consulted on the S3 PUT hot path, and a typo in an admin
+// setting must not start failing writes. It is logged loudly instead.
+func (v *Volume) loadOssAccelWriteThroughFresh() (*ossAccelWriteThroughSetting, error) {
+	off := &ossAccelWriteThroughSetting{Mode: proto.OSSAccelWriteThroughOff}
+	info, err := v.mw.XAttrGet_ll(proto.RootIno, proto.XAttrKeyOSSAccelWriteThrough)
+	if err != nil {
+		return nil, err
+	}
+	raw := info.Get(proto.XAttrKeyOSSAccelWriteThrough)
+	if len(raw) == 0 {
+		return off, nil
+	}
+	var cfg proto.OSSAccelWriteThroughConfig
+	if jerr := json.Unmarshal(raw, &cfg); jerr != nil {
+		log.LogWarnf("loadOssAccelWriteThroughFresh: volume(%v) %v is not valid JSON (%v) — treating as %q",
+			v.name, proto.XAttrKeyOSSAccelWriteThrough, jerr, proto.OSSAccelWriteThroughOff)
+		return off, nil
+	}
+	if !proto.IsValidOSSAccelWriteThroughMode(cfg.Mode) {
+		log.LogWarnf("loadOssAccelWriteThroughFresh: volume(%v) unknown write-through mode %q — treating as %q",
+			v.name, cfg.Mode, proto.OSSAccelWriteThroughOff)
+		return off, nil
+	}
+	return &ossAccelWriteThroughSetting{Mode: cfg.Mode}, nil
+}
+
+// ossAccelWriteThroughMode returns the volume's effective write-through mode,
+// via the same cache as bucket policy/ACL/CORS/lock — never a metanode round
+// trip on the PUT path. Any error resolving it degrades to "off": failing to
+// read an accelerator setting must not fail the write itself.
+func (v *Volume) ossAccelWriteThroughMode() string {
+	wt, err := v.metaLoader.loadOssAccelWriteThrough()
+	if err != nil {
+		log.LogWarnf("ossAccelWriteThroughMode: volume(%v) err(%v) — treating as %q", v.name, err, proto.OSSAccelWriteThroughOff)
+		return proto.OSSAccelWriteThroughOff
+	}
+	return wt.Mode
+}
+
 func (v *Volume) getInodeFromPath(path string) (inode uint64, err error) {
 	if path == "/" {
 		return volumeRootInode, nil
@@ -890,6 +935,14 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 	updateDentryCache(parentId, invisibleTempDataInode.Inode, DefaultFileMode, lastPathItem.Name, v.name)
 	putAttrCache(attr, v.name)
 
+	// 差距分析续(同步预热): the object is now visible, so this is the earliest
+	// point at which flushing it to the cold backend flushes what a reader
+	// would see. In sync mode a failure fails the PUT — otherwise "sync" would
+	// be a lie and the client would believe the data is durable in S3.
+	if wterr := v.applyOssAccelWriteThrough(invisibleTempDataInode.Inode, uint64(finalInode.Size), fixedPath); wterr != nil {
+		return nil, wterr
+	}
+
 	return fsInfo, nil
 }
 
@@ -1414,6 +1467,15 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 
 	log.LogDebugf("CompleteMultipart: meta complete multipart: volume(%v) multipartID(%v) path(%v) parentID(%v) inode(%v) etagValue(%v)",
 		v.name, multipartID, path, parentId, finalInode.Inode, etagValue)
+
+	// 差距分析续(同步预热): multipart's parts were written earlier, but the
+	// object's identity (this inode, this size, this path) only exists once
+	// CompleteMultipart has merged them — so this, not WritePart, is the point
+	// where there is something to flush.
+	if wterr := v.applyOssAccelWriteThrough(completeInodeInfo.Inode, size, path); wterr != nil {
+		return nil, wterr
+	}
+
 	// create file info
 	fInfo := &FSFileInfo{
 		Path:       path,
@@ -1678,6 +1740,108 @@ func (v *Volume) ossAccelColdReadGate(inode uint64) error {
 	default:
 		log.LogErrorf("ossAccelColdReadGate: recall failed volume(%v) inode(%v) s3key(%v) status(%v): %v", v.name, inode, s3key, resp.StatusCode, string(body))
 		return syscall.EIO
+	}
+}
+
+// ossAccelWriteThroughHook pushes a just-written object to the oss-accel cold
+// backend by calling lcnode's /ossAccelFlush — the write-side counterpart to
+// ossAccelColdReadGate above, deliberately built the same way (same HTTP
+// client, same admin token, same "mover not configured = no-op" early return,
+// same Replica_HDD storage-class placeholders since ObjectNode does not retain
+// the volume's VolStorageClass/AllowedStorageClass).
+//
+// Why via lcnode rather than uploading to S3 directly from here, which would
+// avoid a read-back of the bytes we just wrote:
+//   - the per-volume write ROLE gate (readonly / secondary+OwnedPrefixes) lives
+//     inside lcnode's flush. A direct upload from ObjectNode would bypass it
+//     entirely, silently re-opening exactly the hole that gate exists to close.
+//   - ObjectNode's backend-config loader (sdk/ossaccel) has no environment
+//     fallback — only lcnode composes the per-vol xattr override with the
+//     deployment-global OSS_ACCEL_S3_* config. On an env-configured volume
+//     ObjectNode cannot even resolve which bucket to write.
+//
+// The cost of that choice, stated plainly: the bytes make a second trip
+// (ObjectNode → datanodes → lcnode → S3) instead of being tee'd out of the
+// incoming stream. In sync mode that shows up directly as PUT latency.
+//
+// Note `path` here is the POSIX path — lcnode derives the S3 key from it via
+// normalizeOssAccelKey. This differs from ossAccelColdReadGate above, which
+// passes the already-derived s3key in its own `path` parameter.
+func (v *Volume) ossAccelWriteThroughHook(inode, size uint64, path string) error {
+	if ossAccelMoverAddr == "" {
+		return nil
+	}
+	if size == 0 {
+		// Nothing to tier out, and flush would just do a zero-byte Put.
+		return nil
+	}
+
+	url := fmt.Sprintf("http://%s/ossAccelFlush?vol=%s&ino=%d&size=%d&sc=%d&vsc=%d&asc=%d&path=%s",
+		ossAccelMoverAddr, v.name, inode, size,
+		proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD, proto.StorageClass_Replica_HDD,
+		path)
+
+	req, rerr := http.NewRequest(http.MethodGet, url, nil)
+	if rerr != nil {
+		log.LogErrorf("ossAccelWriteThroughHook: volume(%v) inode(%v) path(%v) build request err: %v", v.name, inode, path, rerr)
+		return syscall.EIO
+	}
+	if ossAccelAdminToken != "" {
+		req.Header.Set("Authorization", "Bearer "+ossAccelAdminToken)
+	}
+	resp, herr := ossAccelHTTPClient.Do(req)
+	if herr != nil {
+		log.LogErrorf("ossAccelWriteThroughHook: volume(%v) inode(%v) path(%v) mover request err: %v", v.name, inode, path, herr)
+		return syscall.EIO
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		log.LogInfof("ossAccelWriteThroughHook: flush success volume(%v) inode(%v) path(%v) resp(%v)", v.name, inode, path, string(body))
+		return nil
+	case http.StatusForbidden:
+		// The volume's write role forbids writing this key (role=readonly, or a
+		// secondary outside its OwnedPrefixes). Not a transport failure and not
+		// something a retry fixes — surfaced distinctly so an operator reading
+		// logs sees policy, not breakage.
+		log.LogWarnf("ossAccelWriteThroughHook: flush refused by write role volume(%v) inode(%v) path(%v): %v", v.name, inode, path, string(body))
+		return syscall.EPERM
+	default:
+		log.LogErrorf("ossAccelWriteThroughHook: flush failed volume(%v) inode(%v) path(%v) status(%v): %v", v.name, inode, path, resp.StatusCode, string(body))
+		return syscall.EIO
+	}
+}
+
+// applyOssAccelWriteThrough runs the write-through hook according to the
+// volume's configured mode. Called from the S3 write paths right after the
+// object becomes visible (applyInodeToDEntry), so the object it flushes is the
+// one a reader would now see.
+//
+// Returns an error ONLY in sync mode: that is the whole distinction between the
+// two modes. In async mode a failure is logged and swallowed, because the PUT
+// has already been acked — reporting it would be reporting a failure the
+// caller can no longer act on.
+func (v *Volume) applyOssAccelWriteThrough(inode, size uint64, path string) error {
+	switch v.ossAccelWriteThroughMode() {
+	case proto.OSSAccelWriteThroughSync:
+		if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
+			log.LogErrorf("applyOssAccelWriteThrough: volume(%v) inode(%v) path(%v) sync write-through failed, failing the write: %v",
+				v.name, inode, path, err)
+			return err
+		}
+		return nil
+	case proto.OSSAccelWriteThroughAsync:
+		go func() {
+			if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
+				log.LogWarnf("applyOssAccelWriteThrough: volume(%v) inode(%v) path(%v) async write-through failed (write already acked; the object still reaches the cold tier via the flush policy): %v",
+					v.name, inode, path, err)
+			}
+		}()
+		return nil
+	default: // off
+		return nil
 	}
 }
 

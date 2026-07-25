@@ -87,6 +87,11 @@ type ossAccelIntegrityCandidate struct {
 	s3key     string
 	checksum  string // bare hex, sha256: prefix already stripped
 	lastCheck time.Time
+	// flushedAt is the raw RFC3339 XAttrKeyOSSAccelFlushedAt value ("" when
+	// the file predates that xattr) — the discriminator input for
+	// classifyOssAccelMismatch. Kept raw rather than pre-parsed so the
+	// "unparsable is as uninformative as missing" rule lives in one place.
+	flushedAt string
 }
 
 // ossAccelIntegrityResult is what one sweep found. Grouped into a struct
@@ -101,6 +106,13 @@ type ossAccelIntegrityResult struct {
 	// MismatchesUnmarked ⊆ Mismatches: detected but deliberately not marked
 	// ColdStateError because the bucket is externally owned (role=readonly).
 	MismatchesUnmarked int
+	// MismatchesRefreshed ⊆ Mismatches: the remote object's mtime proved it was
+	// rewritten AFTER our last flush, so this was a legitimate external update
+	// and the cold reference was refreshed to follow it instead of being
+	// flagged. Without this counter, "we followed an external update" and "we
+	// did nothing" look identical from outside — the same reason the *Refused
+	// counters exist.
+	MismatchesRefreshed int
 }
 
 // runOssAccelIntegrityForVol builds this volume's meta/S3 clients and runs
@@ -156,7 +168,10 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 				lastCheck = parsed
 			}
 		}
-		candidates = append(candidates, ossAccelIntegrityCandidate{path: path, ino: info.Inode, s3key: s3key, checksum: checksum, lastCheck: lastCheck})
+		candidates = append(candidates, ossAccelIntegrityCandidate{
+			path: path, ino: info.Inode, s3key: s3key, checksum: checksum, lastCheck: lastCheck,
+			flushedAt: xattrs[proto.XAttrKeyOSSAccelFlushedAt],
+		})
 		return nil
 	})
 	if werr != nil {
@@ -171,17 +186,44 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 	// Cheap tier: every candidate, sequential, zero-download.
 	for _, c := range candidates {
 		result.CheapChecked++
-		match, cerr := ossAccelCheapChecksumMatches(ctx, s3Backend, c.s3key, c.checksum)
+		obs, cerr := ossAccelObserveS3Object(ctx, s3Backend, c.s3key)
 		if cerr != nil {
 			log.LogWarnf("runOssAccelIntegrityForVol: vol(%v) cheap-check ino(%v) s3key(%v) err: %v", vol, c.ino, c.s3key, cerr)
 			continue // Stat failure is inconclusive, not evidence of corruption — same "safe by default" as isOssAccelOwnedS3Key
 		}
-		if !match {
-			result.Mismatches++
+		if !obs.Conclusive || obs.Matches(c.checksum) {
+			continue
+		}
+		result.Mismatches++
+
+		// 差距分析续(漂移自动刷新): a mismatch alone doesn't say WHY. Use the
+		// remote mtime vs our own flushedAt to tell "the owner rewrote it"
+		// apart from "it rotted", instead of assuming one of them.
+		switch classifyOssAccelMismatch(c.flushedAt, obs.Mtime) {
+		case ossAccelMismatchExternalUpdate:
+			if rerr := refreshOssAccelDriftedCold(mw, c.ino, c.s3key, obs); rerr != nil {
+				log.LogWarnf("runOssAccelIntegrityForVol: vol(%v) ino(%v) s3key(%v) external update detected (remote mtime %v > flushedAt %v) but refresh failed: %v — leaving the stale cold reference in place rather than half-updating it",
+					vol, c.ino, c.s3key, obs.Mtime, c.flushedAt, rerr)
+				continue
+			}
+			result.MismatchesRefreshed++
+			log.LogInfof("runOssAccelIntegrityForVol: vol(%v) ino(%v) path(%v) s3key(%v) followed external update (remote mtime %v > flushedAt %v): checksum/size refreshed, no download needed",
+				vol, c.ino, c.path, c.s3key, obs.Mtime, c.flushedAt)
+		case ossAccelMismatchUninterpretable:
+			// No usable flushedAt — most likely a cold file written before that
+			// xattr existed. Fall back to the pre-existing behavior rather than
+			// guessing; the file gets a flushedAt on its next flush.
 			if !markMismatch {
 				result.MismatchesUnmarked++
 			}
-			reportOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key, "cheap(metadata)", markMismatch)
+			reportOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key,
+				fmt.Sprintf("cheap(metadata); no usable oss-accel.flushedAt (%q) so external-update vs corruption is undecidable", c.flushedAt), markMismatch)
+		default: // ossAccelMismatchSuspectCorruption
+			if !markMismatch {
+				result.MismatchesUnmarked++
+			}
+			reportOssAccelIntegrityMismatch(mw, c.ino, c.path, c.s3key,
+				fmt.Sprintf("cheap(metadata); remote mtime %v is NOT newer than flushedAt %v, so nothing rewrote it since we did", obs.Mtime, c.flushedAt), markMismatch)
 		}
 	}
 
@@ -245,26 +287,124 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 	return result, nil
 }
 
-// ossAccelCheapChecksumMatches HEADs key (no body download) and compares its
-// "syncnode-sha256" user-metadata against wantChecksum. A missing metadata
-// value (e.g. the best-effort multipart stamp failed at flush time — see
-// httpServiceOssAccelFlush's doc comment) has nothing to compare, so it
-// reports a match rather than a false mismatch — absence of evidence is not
-// evidence of corruption.
-func ossAccelCheapChecksumMatches(ctx context.Context, s3Backend backend.Backend, key, wantChecksum string) (bool, error) {
+// ossAccelS3Observation is what a single cheap (HeadObject) probe learned
+// about the remote object. 差距分析续(漂移自动刷新) replaced the old
+// bool-returning ossAccelCheapChecksumMatches with this: collapsing the probe
+// to "matches / doesn't match" at the bottom threw away the two things needed
+// to INTERPRET a mismatch — the object's mtime (is it newer than our flush?)
+// and its current checksum/size (what would we refresh TO?). Both were already
+// being fetched and discarded.
+type ossAccelS3Observation struct {
+	// Checksum is the remote object's own recorded sha256 (bare hex, from the
+	// syncnode-sha256 user metadata). Empty when the object carries none.
+	Checksum string
+	Size     int64
+	// Mtime is the remote object's last-modified time, from the same clock
+	// that stamped XAttrKeyOSSAccelFlushedAt at flush time.
+	Mtime time.Time
+	// Conclusive is false when the probe cannot support ANY conclusion:
+	// the backend doesn't expose metadata, or the object records no checksum.
+	// Callers must treat !Conclusive as "no evidence either way" — never as a
+	// match and never as a mismatch.
+	Conclusive bool
+}
+
+// Matches reports whether the remote object's checksum equals wantChecksum.
+// Only meaningful when Conclusive.
+func (o ossAccelS3Observation) Matches(wantChecksum string) bool {
+	return o.Checksum == wantChecksum
+}
+
+// ossAccelObserveS3Object HEADs key (no body download) and returns what the
+// remote side says about it. A missing checksum metadata value (e.g. the
+// best-effort multipart stamp failed at flush time — see
+// httpServiceOssAccelFlush's doc comment) yields Conclusive=false rather than
+// a false mismatch: absence of evidence is not evidence of corruption.
+func ossAccelObserveS3Object(ctx context.Context, s3Backend backend.Backend, key string) (ossAccelS3Observation, error) {
 	stater, ok := s3Backend.(backend.Stater)
 	if !ok {
-		return true, nil // backend doesn't support metadata passthrough — nothing to check, matches isOssAccelOwnedS3Key's fail-open direction
+		// Backend doesn't support metadata passthrough — nothing to check,
+		// matches isOssAccelOwnedS3Key's fail-open direction.
+		return ossAccelS3Observation{}, nil
 	}
 	st, err := stater.Stat(ctx, key)
 	if err != nil {
-		return false, err
+		return ossAccelS3Observation{}, err
 	}
 	got := st.RawMetadata[backend.SHA256MetadataKey]
 	if got == "" {
-		return true, nil
+		return ossAccelS3Observation{Size: st.Size, Mtime: st.Mtime}, nil
 	}
-	return got == wantChecksum, nil
+	return ossAccelS3Observation{Checksum: got, Size: st.Size, Mtime: st.Mtime, Conclusive: true}, nil
+}
+
+// ossAccelMismatchVerdict is how the sweep decided to interpret one mismatch.
+type ossAccelMismatchVerdict int
+
+const (
+	// ossAccelMismatchUninterpretable: no flushedAt recorded (a cold file that
+	// predates that xattr), so "newer than our write" cannot be evaluated.
+	// Falls back to the pre-existing mark/don't-mark behavior.
+	ossAccelMismatchUninterpretable ossAccelMismatchVerdict = iota
+	// ossAccelMismatchExternalUpdate: the remote object was modified AFTER our
+	// last flush — somebody else legitimately rewrote it. Refresh to follow.
+	ossAccelMismatchExternalUpdate
+	// ossAccelMismatchSuspectCorruption: nothing wrote the object since we did,
+	// yet the content no longer matches. Do NOT silently follow it.
+	ossAccelMismatchSuspectCorruption
+)
+
+// classifyOssAccelMismatch applies the flushedAt-vs-Mtime discriminator. Split
+// out as a pure function so the truth table is unit-testable without S3 or a
+// metanode (see oss_accel_integrity_test.go).
+func classifyOssAccelMismatch(flushedAtRaw string, remoteMtime time.Time) ossAccelMismatchVerdict {
+	if flushedAtRaw == "" {
+		return ossAccelMismatchUninterpretable
+	}
+	flushedAt, perr := time.Parse(time.RFC3339, flushedAtRaw)
+	if perr != nil {
+		// An unparsable value is no better evidence than a missing one.
+		return ossAccelMismatchUninterpretable
+	}
+	if remoteMtime.IsZero() {
+		return ossAccelMismatchUninterpretable
+	}
+	if remoteMtime.After(flushedAt) {
+		return ossAccelMismatchExternalUpdate
+	}
+	return ossAccelMismatchSuspectCorruption
+}
+
+// refreshOssAccelDriftedCold follows a confirmed external update: point the
+// inode's recorded checksum/size at whatever the remote object now holds.
+//
+// ZERO DOWNLOAD — the new size and checksum both come from the cheap probe's
+// Stat. That is the whole reason this path is worth having: the bucket-scan
+// discovery path already refreshes externally-overwritten objects, but pays a
+// full GET + re-hash per key per sweep to do it.
+//
+// Reuses refreshOssAccelChangelogOverwrite (lcnode/oss_accel.go), which is
+// already the single implementation of "an external writer replaced the object
+// at this key, update our cold reference" — the changelog-sync and
+// bucket-scan paths both go through it. Two things it deliberately does NOT
+// do, which this wrapper must therefore handle itself:
+//   - it leaves oss-accel.state alone, so a file a PREVIOUS sweep marked
+//     ColdStateError would stay unreadable even after a successful refresh;
+//     reset to clean explicitly.
+//   - it doesn't touch flushedAt, so the same update would be re-judged on
+//     every subsequent sweep; advance it to the observed mtime.
+func refreshOssAccelDriftedCold(mw *meta.MetaWrapper, ino uint64, s3key string, obs ossAccelS3Observation) error {
+	if _, err := refreshOssAccelChangelogOverwrite(mw, ino, ossAccelChangelogEvent{
+		Key:      s3key,
+		Size:     uint64(obs.Size),
+		Checksum: obs.Checksum,
+	}); err != nil {
+		return err
+	}
+	return mw.BatchSetXAttr_ll(ino, map[string]string{
+		proto.XAttrKeyOSSAccelState:     proto.ColdStateClean,
+		proto.XAttrKeyOSSAccelFlushedAt: obs.Mtime.UTC().Format(time.RFC3339),
+	})
 }
 
 // ossAccelFullChecksumMatches downloads key in full and re-hashes it — the

@@ -27,12 +27,29 @@ type ossMetaLoader interface {
 	loadCORS() (cors *CORSConfiguration, err error)
 	loadObjectLock() (config *ObjectLockConfig, err error)
 	loadOssAccelBackendCredential() (cred *ossAccelBackendCredential, err error)
+	loadOssAccelWriteThrough() (wt *ossAccelWriteThroughSetting, err error)
 	storePolicy(p *Policy)
 	storeACL(p *AccessControlPolicy)
 	storeCORS(cors *CORSConfiguration)
 	storeObjectLock(config *ObjectLockConfig)
 	storeOssAccelBackendCredential(cred *ossAccelBackendCredential)
+	storeOssAccelWriteThrough(wt *ossAccelWriteThroughSetting)
 	setSynced()
+}
+
+// ossAccelWriteThroughSetting is the cached per-volume write-through mode
+// (proto.XAttrKeyOSSAccelWriteThrough). Cached for the same reason as the
+// other five entries here: it is consulted on EVERY S3 PUT, and reading a
+// volume-root xattr per PUT would put a metanode round trip in the write hot
+// path.
+//
+// A separate cached value rather than a field on ossAccelBackendCredential:
+// they come from different xattrs and answer different questions (where/whether
+// the backend credential may authenticate, vs when to push a write to the
+// backend). Never nil once loaded — Mode=="off" is a meaningful cached result,
+// distinct from "not loaded yet".
+type ossAccelWriteThroughSetting struct {
+	Mode string
 }
 
 // ossAccelBackendCredential is the cached result of resolving a volume's
@@ -64,11 +81,13 @@ type OSSMeta struct {
 	corsConfig           *CORSConfiguration
 	lockConfig           *ObjectLockConfig
 	ossAccelBackendCred  *ossAccelBackendCredential
+	ossAccelWriteThrough *ossAccelWriteThroughSetting
 	policyLock           sync.RWMutex
 	aclLock              sync.RWMutex
 	corsLock             sync.RWMutex
 	objectLock           sync.RWMutex
 	ossAccelBackendMutex sync.RWMutex
+	ossAccelWTMutex      sync.RWMutex
 }
 
 func (c *cacheMetaLoader) loadPolicy() (p *Policy, err error) {
@@ -190,6 +209,29 @@ func (c *cacheMetaLoader) storeOssAccelBackendCredential(cred *ossAccelBackendCr
 	c.om.ossAccelBackendMutex.Unlock()
 }
 
+func (c *cacheMetaLoader) loadOssAccelWriteThrough() (wt *ossAccelWriteThroughSetting, err error) {
+	c.om.ossAccelWTMutex.RLock()
+	wt = c.om.ossAccelWriteThrough
+	c.om.ossAccelWTMutex.RUnlock()
+	if wt == nil && atomic.LoadInt32(c.synced) == 0 {
+		ret, err, _ := c.sf.Do("ossAccelWriteThrough", func() (interface{}, error) {
+			return c.sml.loadOssAccelWriteThrough()
+		})
+		if err != nil {
+			return nil, err
+		}
+		wt = ret.(*ossAccelWriteThroughSetting)
+		c.storeOssAccelWriteThrough(wt)
+	}
+	return
+}
+
+func (c *cacheMetaLoader) storeOssAccelWriteThrough(wt *ossAccelWriteThroughSetting) {
+	c.om.ossAccelWTMutex.Lock()
+	c.om.ossAccelWriteThrough = wt
+	c.om.ossAccelWTMutex.Unlock()
+}
+
 func (c *cacheMetaLoader) setSynced() {
 	atomic.StoreInt32(c.synced, 1)
 }
@@ -231,6 +273,14 @@ func (s *strictMetaLoader) loadOssAccelBackendCredential() (*ossAccelBackendCred
 }
 
 func (s *strictMetaLoader) storeOssAccelBackendCredential(cred *ossAccelBackendCredential) {
+	// do nothing
+}
+
+func (s *strictMetaLoader) loadOssAccelWriteThrough() (*ossAccelWriteThroughSetting, error) {
+	return s.v.loadOssAccelWriteThroughFresh()
+}
+
+func (s *strictMetaLoader) storeOssAccelWriteThrough(wt *ossAccelWriteThroughSetting) {
 	// do nothing
 }
 

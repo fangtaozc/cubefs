@@ -563,6 +563,7 @@ func (l *LcNode) opOssAccelIntegrity(conn net.Conn, p *proto.Packet) (err error)
 		resp.FullChecked = result.FullChecked
 		resp.Mismatches = result.Mismatches
 		resp.MismatchesUnmarked = result.MismatchesUnmarked
+		resp.MismatchesRefreshed = result.MismatchesRefreshed
 		if runErr != nil {
 			resp.StartErr = runErr.Error()
 		}

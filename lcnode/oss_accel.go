@@ -48,6 +48,7 @@ import (
 	"github.com/cubefs/cubefs/sdk/ossaccel"
 	"github.com/cubefs/cubefs/syncnode/backend"
 	"github.com/cubefs/cubefs/syncnode/backend/s3"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -312,22 +313,36 @@ func (l *LcNode) runOssAccelFlushForVol(vol, path string, ino, size uint64, sc, 
 	}
 
 	// Two-phase check: HEAD the freshly written object and verify size.
-	headSize, _, _, headErr := s3Backend.Head(ctx, s3key)
+	// 差距分析续(漂移自动刷新): this Head's mtime is now kept rather than
+	// discarded — it becomes XAttrKeyOSSAccelFlushedAt. Using S3's OWN
+	// timestamp for our write, instead of a local time.Now(), makes the later
+	// "is S3's mtime newer than our flush?" comparison immune to clock skew
+	// between lcnode and the S3 endpoint: both sides of that comparison then
+	// come from the same clock.
+	headSize, _, headMtime, headErr := s3Backend.Head(ctx, s3key)
 	if headErr != nil {
 		return "", "", fmt.Errorf("s3 head verify err: %v", headErr)
 	}
 	if headSize != int64(size) {
 		return "", "", fmt.Errorf("s3 size mismatch: local(%v) remote(%v)", size, headSize)
 	}
+	// Fall back to local time only if the backend gave us nothing usable — a
+	// missing flushedAt would make every future mismatch on this file
+	// uninterpretable, which is worse than a slightly skewed one.
+	if headMtime.IsZero() {
+		headMtime = time.Now()
+		log.LogWarnf("ossAccelFlush: vol(%v) s3key(%v) backend returned zero mtime on verify Head; recording local time as flushedAt (drift discrimination for this file may be skew-sensitive)", vol, s3key)
+	}
 
 	// Record the cold reference in xattrs (extendTree). State stays clean; the
 	// inode remains a hot Replica until a later slice flips the class.
 	checksum = proto.ChecksumPrefixSHA256 + putRes.Checksum
 	attrs := map[string]string{
-		proto.XAttrKeyOSSAccelS3Key:    s3key,
-		proto.XAttrKeyOSSAccelChecksum: checksum,
-		proto.XAttrKeyOSSAccelSize:     strconv.FormatUint(size, 10),
-		proto.XAttrKeyOSSAccelState:    proto.ColdStateClean,
+		proto.XAttrKeyOSSAccelS3Key:     s3key,
+		proto.XAttrKeyOSSAccelChecksum:  checksum,
+		proto.XAttrKeyOSSAccelSize:      strconv.FormatUint(size, 10),
+		proto.XAttrKeyOSSAccelState:     proto.ColdStateClean,
+		proto.XAttrKeyOSSAccelFlushedAt: headMtime.UTC().Format(time.RFC3339),
 	}
 	if err = metaWrapper.BatchSetXAttr_ll(ino, attrs); err != nil {
 		return "", "", fmt.Errorf("set oss-accel xattr err: %v", err)
@@ -593,6 +608,23 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		http.Error(w, recallErr.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// 差距分析续(命中信号): wasCold was already computed and logged but never
+	// exported. Splitting the recall count by it is the cheapest real signal
+	// available — "a read that genuinely had to download from S3" vs "a read
+	// that reached the mover but found the inode already hot" (a concurrent
+	// winner got there first, or a caller that didn't need to ask).
+	//
+	// This is NOT a cache hit rate, and must not be presented as one: a read
+	// that never went cold never contacts the mover at all, so the overwhelming
+	// majority of hits are invisible here. A real hit rate needs client-side
+	// read-path instrumentation (kernel client / FUSE / ObjectNode), which is
+	// deliberately out of scope for this round.
+	recallOutcome := "warm"
+	if wasCold {
+		recallOutcome = "cold"
+	}
+	exporter.NewCounter("action_recall_"+recallOutcome).AddWithLabels(1, map[string]string{exporter.Vol: vol})
 
 	log.LogInfof("ossAccelRecall success: vol(%v) ino(%v) written(%v) s3key(%v) sha256(%v) wasCold(%v)",
 		vol, ino, off, normalizeOssAccelKey(path), got, wasCold)

@@ -62,6 +62,7 @@ var ossAccelWalkXAttrKeys = []string{
 	proto.XAttrKeyOSSAccelS3Key,
 	proto.XAttrKeyOSSAccelChecksum,
 	proto.XAttrKeyOSSAccelLastIntegrityCheckTime,
+	proto.XAttrKeyOSSAccelFlushedAt,
 }
 
 // walkOssAccelTree recursively walks the volume from its root, calling visit

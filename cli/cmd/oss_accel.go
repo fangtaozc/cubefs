@@ -56,6 +56,16 @@ const (
 	cmdOssAccelRoleDelUse   = "delete [volname]"
 	cmdOssAccelRoleDelShort = "remove the volume's role config (falls back to unrestricted primary)"
 	cmdOssAccelRoleShort    = "Manage a volume's write role: who may mutate the shared S3 bucket (primary/secondary/readonly)"
+
+	cmdOssAccelWTUse = "write-through [COMMAND]"
+
+	cmdOssAccelWTSetUse   = "set [volname]"
+	cmdOssAccelWTSetShort = "set the volume's write-through mode (off, async, or sync)"
+	cmdOssAccelWTGetUse   = "get [volname]"
+	cmdOssAccelWTGetShort = "show the volume's write-through mode, if configured"
+	cmdOssAccelWTDelUse   = "delete [volname]"
+	cmdOssAccelWTDelShort = "remove the volume's write-through config (falls back to off)"
+	cmdOssAccelWTShort    = "Manage a volume's S3-gateway write-through mode: push newly PUT objects to the cold backend at write time (off/async/sync)"
 )
 
 func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
@@ -66,7 +76,8 @@ func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
 		Aliases: []string{"ossaccel"},
 	}
 	proto.InitBufferPool(32768)
-	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client), newOssAccelRoleCmd(client))
+	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client), newOssAccelRoleCmd(client),
+		newOssAccelWriteThroughCmd(client))
 	return cmd
 }
 
@@ -458,6 +469,127 @@ func newOssAccelRoleDeleteCmd(client *master.MasterClient) *cobra.Command {
 				return
 			}
 			stdout("vol[%v] oss-accel role config removed — falls back to unrestricted %q\n", volName, proto.OSSAccelRolePrimary)
+		},
+	}
+	return cmd
+}
+
+// 差距分析续(同步预热): admin entry point for the per-volume write-through mode
+// (proto.OSSAccelWriteThroughConfig) — same VOLUME ROOT xattr mechanism as
+// newOssAccelBackendCmd/newOssAccelRoleCmd above, mirrored structurally.
+//
+// Kept as a separate xattr from the backend override on purpose; see
+// proto.XAttrKeyOSSAccelWriteThrough's doc comment for why folding it into
+// oss-accel.backend would break env-configured volumes.
+func newOssAccelWriteThroughCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     cmdOssAccelWTUse,
+		Short:   cmdOssAccelWTShort,
+		Args:    cobra.MinimumNArgs(0),
+		Aliases: []string{"writethrough", "wt"},
+	}
+	cmd.AddCommand(
+		newOssAccelWriteThroughSetCmd(client),
+		newOssAccelWriteThroughGetCmd(client),
+		newOssAccelWriteThroughDeleteCmd(client),
+	)
+	return cmd
+}
+
+func newOssAccelWriteThroughSetCmd(client *master.MasterClient) *cobra.Command {
+	var mode string
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelWTSetUse,
+		Short: cmdOssAccelWTSetShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			if !proto.IsValidOSSAccelWriteThroughMode(mode) {
+				stdout("set oss-accel write-through failed: --mode must be %q, %q, or %q\n",
+					proto.OSSAccelWriteThroughOff, proto.OSSAccelWriteThroughAsync, proto.OSSAccelWriteThroughSync)
+				return
+			}
+			cfg := proto.OSSAccelWriteThroughConfig{Mode: mode}
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				stdout("marshal oss-accel write-through config failed: %v\n", err)
+				return
+			}
+			mw, err := newOssAccelVolMetaWrapper(client, volName)
+			if err != nil {
+				stdout("NewMetaWrapper failed: %v\n", err)
+				return
+			}
+			defer mw.Close()
+			if err = mw.XAttrSet_ll(proto.RootIno, []byte(proto.XAttrKeyOSSAccelWriteThrough), raw); err != nil {
+				stdout("set oss-accel write-through config failed: %v\n", err)
+				return
+			}
+			stdout("vol[%v] oss-accel write-through set:\n%v\n", volName, string(raw))
+			if mode == proto.OSSAccelWriteThroughSync {
+				stdout("note: sync mode makes a failed cold-backend upload fail the S3 PUT, and adds the upload to PUT latency\n")
+			}
+			if mode != proto.OSSAccelWriteThroughOff {
+				stdout("note: applies to S3-gateway (ObjectNode) writes only — POSIX writes still reach the cold tier via the flush policy\n")
+			}
+		},
+	}
+	cmd.Flags().StringVar(&mode, "mode", "", "off, async, or sync (required). off: cold backend written only by the flush policy. async: ack the PUT first, flush in the background (PUT latency unchanged). sync: ack only after the cold-backend upload succeeds; a failed upload fails the PUT")
+	return cmd
+}
+
+func newOssAccelWriteThroughGetCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelWTGetUse,
+		Short: cmdOssAccelWTGetShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			mw, err := newOssAccelVolMetaWrapper(client, volName)
+			if err != nil {
+				stdout("NewMetaWrapper failed: %v\n", err)
+				return
+			}
+			defer mw.Close()
+			info, err := mw.XAttrGet_ll(proto.RootIno, proto.XAttrKeyOSSAccelWriteThrough)
+			if err != nil {
+				stdout("get oss-accel write-through config failed: %v\n", err)
+				return
+			}
+			raw := info.Get(proto.XAttrKeyOSSAccelWriteThrough)
+			if len(raw) == 0 {
+				stdout("vol[%v] has no oss-accel write-through config — defaults to %q\n", volName, proto.OSSAccelWriteThroughOff)
+				return
+			}
+			var cfg proto.OSSAccelWriteThroughConfig
+			if err = json.Unmarshal(raw, &cfg); err != nil {
+				stdout("vol[%v] oss-accel write-through config is not valid JSON: %v\nraw: %v\n", volName, err, string(raw))
+				return
+			}
+			stdout("vol[%v] oss-accel write-through:\n%v\n", volName, string(raw))
+		},
+	}
+	return cmd
+}
+
+func newOssAccelWriteThroughDeleteCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelWTDelUse,
+		Short: cmdOssAccelWTDelShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			mw, err := newOssAccelVolMetaWrapper(client, volName)
+			if err != nil {
+				stdout("NewMetaWrapper failed: %v\n", err)
+				return
+			}
+			defer mw.Close()
+			if err = mw.XAttrDel_ll(proto.RootIno, proto.XAttrKeyOSSAccelWriteThrough); err != nil {
+				stdout("delete oss-accel write-through config failed: %v\n", err)
+				return
+			}
+			stdout("vol[%v] oss-accel write-through config removed — falls back to %q\n", volName, proto.OSSAccelWriteThroughOff)
 		},
 	}
 	return cmd

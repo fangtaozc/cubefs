@@ -172,6 +172,33 @@ const XAttrKeyOSSAccelLastRecallTime = "oss-accel.lastRecallTime"
 // every cold object instead of re-checking the same few every time.
 const XAttrKeyOSSAccelLastIntegrityCheckTime = "oss-accel.lastIntegrityCheckTime"
 
+// XAttrKeyOSSAccelFlushedAt (差距分析续/漂移自动刷新, RFC3339) records when THIS
+// cluster last wrote the object at XAttrKeyOSSAccelS3Key. Written by flush
+// alongside the s3key/checksum/size/state group (lcnode/oss_accel.go), so it
+// costs no extra RPC.
+//
+// It exists for exactly one purpose: to make a checksum mismatch
+// INTERPRETABLE. Compared against the S3 object's own Mtime (LastModified —
+// see syncnode/backend.Stat), it discriminates the two explanations a
+// mismatch otherwise has no way to tell apart:
+//
+//	S3 Mtime  > flushedAt  →  somebody wrote the object AFTER us, i.e. a
+//	                          legitimate external update → refresh our
+//	                          recorded checksum/size to match.
+//	S3 Mtime <= flushedAt  →  nobody wrote it since we did, yet the content
+//	                          no longer matches → possible silent corruption
+//	                          → mark, don't silently follow it.
+//
+// Absent (every cold file that predates this xattr) means the mismatch is
+// UNINTERPRETABLE, and the integrity sweep must fall back to its previous
+// behavior rather than guess in either direction. Such files acquire the
+// field on their next flush.
+//
+// Note this is distinct from XAttrKeyOSSAccelLastRecallTime and
+// XAttrKeyOSSAccelLastIntegrityCheckTime, which record when WE acted on the
+// file; this one is a claim about the OBJECT's version lineage.
+const XAttrKeyOSSAccelFlushedAt = "oss-accel.flushedAt"
+
 // XAttrKeyOSSAccelRoleConfig is the M4 (multi-cluster) per-volume write role,
 // stored on the VOLUME ROOT inode alongside XAttrKeyOSSAccelBackendConfig —
 // same storage mechanism, same reasoning: a role is a deployment-level
@@ -234,6 +261,70 @@ const (
 	//     ColdStateClean without a hot copy to re-flush).
 	OSSAccelRoleReadOnly = "readonly"
 )
+
+// XAttrKeyOSSAccelWriteThrough is the 差距分析续(同步预热) per-volume
+// write-through mode, on the VOLUME ROOT inode. JSON shape
+// OSSAccelWriteThroughConfig. Absent = OSSAccelWriteThroughOff, i.e. zero
+// behavior change for every existing volume.
+//
+// Deliberately its OWN xattr rather than a field on OSSAccelBackendConfig,
+// even though both are volume-root oss-accel config. Reason: LoadBackendConfig
+// returns nil when oss-accel.backend is absent, and lcnode only then falls
+// back to the deployment-global OSS_ACCEL_S3_* environment config. Setting the
+// backend xattr merely to carry a write-through mode would force the operator
+// to also fill in endpoint/bucket/region, which would OVERRIDE that env
+// fallback — turning a working env-configured volume into a misconfigured one
+// as a side effect of enabling write-through. Separate keys keep the two
+// concerns independently settable.
+const XAttrKeyOSSAccelWriteThrough = "oss-accel.writeThrough"
+
+// OSSAccelWriteThroughConfig is the JSON shape stored at
+// XAttrKeyOSSAccelWriteThrough.
+type OSSAccelWriteThroughConfig struct {
+	Mode string `json:"mode"`
+}
+
+// OSSAccelWriteThrough* are the modes for OSSAccelWriteThroughConfig.Mode.
+//
+// Scope note: write-through only applies to writes that arrive through
+// CubeFS's own S3 gateway (ObjectNode). POSIX writes (kernel client / FUSE)
+// are a completely separate process and data path, and a POSIX write() cannot
+// wait on an S3 upload — those still reach the cold tier only via the
+// scheduled flush policy. This matches how the feature works in comparable
+// products, where the accelerator IS the object gateway.
+const (
+	// OSSAccelWriteThroughOff: no flush at write time. The object reaches the
+	// cold backend only when a flush policy or a manual flush picks it up.
+	// Default when unconfigured.
+	OSSAccelWriteThroughOff = "off"
+	// OSSAccelWriteThroughAsync: ack the PUT as soon as CubeFS has the data,
+	// then flush to the cold backend in the background. PUT latency is
+	// unchanged. Narrows the existing "acked but not yet in S3" window from
+	// however long the flush policy's interval is (hours) down to seconds —
+	// a strict improvement over off, not a new risk.
+	OSSAccelWriteThroughAsync = "async"
+	// OSSAccelWriteThroughSync: do not ack the PUT until the cold-backend
+	// upload has succeeded; a failed upload fails the PUT. Costs roughly a
+	// second full pass over the object's bytes (CubeFS write, then lcnode
+	// reads it back and uploads), so PUT latency rises accordingly.
+	//
+	// Note this still does not make the cold copy authoritative — CubeFS's own
+	// replicated tier remains the primary. It guarantees "durable in the cold
+	// backend at ack time", not "the local copy is disposable".
+	OSSAccelWriteThroughSync = "sync"
+)
+
+// IsValidOSSAccelWriteThroughMode reports whether mode is a known value.
+// Shared by the cfs-cli setter and ObjectNode's reader so the accepted set
+// cannot drift between them.
+func IsValidOSSAccelWriteThroughMode(mode string) bool {
+	switch mode {
+	case OSSAccelWriteThroughOff, OSSAccelWriteThroughAsync, OSSAccelWriteThroughSync:
+		return true
+	default:
+		return false
+	}
+}
 
 // IsValidOSSAccelRole reports whether role is one of the three known values.
 // Shared by lcnode's config loader and the cfs-cli setter so the accepted
