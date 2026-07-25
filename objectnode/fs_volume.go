@@ -943,6 +943,13 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 		Inode:      finalInode.Inode,
 	}
 
+	// 差距分析续(同步预热): sync mode flushes BEFORE publishing, so a failure
+	// leaves nothing visible — see ossAccelWriteThroughSyncBeforePublish for why
+	// failing after applyInodeToDEntry corrupts the dentry.
+	if err = v.ossAccelWriteThroughSyncBeforePublish(invisibleTempDataInode.Inode, uint64(finalInode.Size), fixedPath); err != nil {
+		return
+	}
+
 	// apply new inode to dentry
 	err = v.applyInodeToDEntry(parentId, lastPathItem.Name, invisibleTempDataInode.Inode, false,
 		fixedPath, invisibleTempDataInode.StorageClass)
@@ -956,13 +963,7 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 	updateDentryCache(parentId, invisibleTempDataInode.Inode, DefaultFileMode, lastPathItem.Name, v.name)
 	putAttrCache(attr, v.name)
 
-	// 差距分析续(同步预热): the object is now visible, so this is the earliest
-	// point at which flushing it to the cold backend flushes what a reader
-	// would see. In sync mode a failure fails the PUT — otherwise "sync" would
-	// be a lie and the client would believe the data is durable in S3.
-	if wterr := v.applyOssAccelWriteThrough(invisibleTempDataInode.Inode, uint64(finalInode.Size), fixedPath); wterr != nil {
-		return nil, wterr
-	}
+	v.ossAccelWriteThroughAsyncAfterPublish(invisibleTempDataInode.Inode, uint64(finalInode.Size), fixedPath)
 
 	return fsInfo, nil
 }
@@ -1445,6 +1446,12 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 		return nil, err
 	}
 
+	// 差距分析续(同步预热): sync mode flushes BEFORE publishing — same ordering
+	// requirement as PutObject (see ossAccelWriteThroughSyncBeforePublish).
+	if err = v.ossAccelWriteThroughSyncBeforePublish(completeInodeInfo.Inode, size, path); err != nil {
+		return
+	}
+
 	// apply new inode to dentry
 	if err = v.applyInodeToDEntry(parentId, filename, completeInodeInfo.Inode, true,
 		path, completeInodeInfo.StorageClass); err != nil {
@@ -1493,9 +1500,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 	// object's identity (this inode, this size, this path) only exists once
 	// CompleteMultipart has merged them — so this, not WritePart, is the point
 	// where there is something to flush.
-	if wterr := v.applyOssAccelWriteThrough(completeInodeInfo.Inode, size, path); wterr != nil {
-		return nil, wterr
-	}
+	v.ossAccelWriteThroughAsyncAfterPublish(completeInodeInfo.Inode, size, path)
 
 	// create file info
 	fInfo := &FSFileInfo{
@@ -1841,35 +1846,55 @@ func (v *Volume) ossAccelWriteThroughHook(inode, size uint64, path string) error
 	}
 }
 
-// applyOssAccelWriteThrough runs the write-through hook according to the
-// volume's configured mode. Called from the S3 write paths right after the
-// object becomes visible (applyInodeToDEntry), so the object it flushes is the
-// one a reader would now see.
+// ossAccelWriteThroughSyncBeforePublish runs the write-through flush in SYNC
+// mode only, and must be called BEFORE the object is published
+// (applyInodeToDEntry). No-op in off/async mode.
 //
-// Returns an error ONLY in sync mode: that is the whole distinction between the
-// two modes. In async mode a failure is logged and swallowed, because the PUT
-// has already been acked — reporting it would be reporting a failure the
-// caller can no longer act on.
-func (v *Volume) applyOssAccelWriteThrough(inode, size uint64, path string) error {
-	switch v.ossAccelWriteThroughMode() {
-	case proto.OSSAccelWriteThroughSync:
-		if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
-			log.LogErrorf("applyOssAccelWriteThrough: volume(%v) inode(%v) path(%v) sync write-through failed, failing the write: %v",
-				v.name, inode, path, err)
-			return err
-		}
-		return nil
-	case proto.OSSAccelWriteThroughAsync:
-		go func() {
-			if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
-				log.LogWarnf("applyOssAccelWriteThrough: volume(%v) inode(%v) path(%v) async write-through failed (write already acked; the object still reaches the cold tier via the flush policy): %v",
-					v.name, inode, path, err)
-			}
-		}()
-		return nil
-	default: // off
+// The placement is load-bearing, not incidental. The S3 write paths install a
+// deferred cleanup that unlinks and evicts the temp inode whenever they return
+// a non-nil error. Failing sync write-through AFTER publishing therefore
+// destroys the inode the freshly-created dentry now points at, leaving a
+// dangling entry that stats as mode 0 / size 0 and 404s through the S3 API —
+// real-machine testing produced exactly that. Flushing before publish means a
+// failure is a clean failure: the caller's error triggers the normal temp-inode
+// cleanup, and nothing was ever visible.
+//
+// It also happens to be the more honest reading of "sync": the object does not
+// become visible until it is durable in the cold backend. Flushing an unlinked
+// temp inode works because lcnode's flush addresses the inode directly and
+// derives the S3 key from the path it is given — it never resolves the path.
+func (v *Volume) ossAccelWriteThroughSyncBeforePublish(inode, size uint64, path string) error {
+	if v.ossAccelWriteThroughMode() != proto.OSSAccelWriteThroughSync {
 		return nil
 	}
+	if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
+		log.LogErrorf("ossAccelWriteThroughSyncBeforePublish: volume(%v) inode(%v) path(%v) sync write-through failed, failing the write before it becomes visible: %v",
+			v.name, inode, path, err)
+		return err
+	}
+	return nil
+}
+
+// ossAccelWriteThroughAsyncAfterPublish fires the write-through flush in ASYNC
+// mode only, and is called AFTER the object is published. No-op in off/sync
+// mode.
+//
+// Async goes after publish for the mirror-image reason: its failure is
+// swallowed (the PUT is already acked, so an error has nobody to report to), so
+// it cannot trigger the temp-inode cleanup — but if it ran before publish and
+// the publish then failed for an unrelated reason, we would have pushed an
+// object to the bucket that no CubeFS inode references. Running it after publish
+// means anything it uploads is genuinely part of a committed object.
+func (v *Volume) ossAccelWriteThroughAsyncAfterPublish(inode, size uint64, path string) {
+	if v.ossAccelWriteThroughMode() != proto.OSSAccelWriteThroughAsync {
+		return
+	}
+	go func() {
+		if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
+			log.LogWarnf("ossAccelWriteThroughAsyncAfterPublish: volume(%v) inode(%v) path(%v) async write-through failed (write already acked; the object still reaches the cold tier via the flush policy): %v",
+				v.name, inode, path, err)
+		}
+	}()
 }
 
 func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, storageClass uint32) (err error) {
