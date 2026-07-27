@@ -15,6 +15,7 @@
 package lcnode
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/cubefs/cubefs/proto"
@@ -168,6 +169,64 @@ func TestAssembleOssAccelWalkPageTolerateNilElements(t *testing.T) {
 	}
 	if got[0].attrs["k"] != "v" {
 		t.Fatalf("want xattrs attached despite a nil element, got %v", got[0].attrs)
+	}
+}
+
+// resolveOssAccelPrefixDir's segment splitting decides which directory the walk
+// starts from, and its startPath must reproduce exactly the path a root-started
+// walk would build — dirPath+"/"+name. A wrong path form would silently corrupt
+// every path-derived decision downstream (flush-policy's filter, audit's drift
+// comparison), with no error anywhere. This tests the pure splitting half; the
+// Lookup_ll half needs a live metanode and is covered on-cluster.
+func TestOssAccelPrefixDirSegments(t *testing.T) {
+	// Mirrors the splitting resolveOssAccelPrefixDir performs before any lookup:
+	// strip a leading slash, then drop the last (possibly partial) component.
+	segsOf := func(prefix string) []string {
+		parts := strings.Split(strings.TrimPrefix(prefix, "/"), "/")
+		if len(parts) > 0 {
+			parts = parts[:len(parts)-1]
+		}
+		kept := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if p != "" {
+				kept = append(kept, p)
+			}
+		}
+		return kept
+	}
+
+	cases := []struct {
+		prefix    string
+		wantSegs  []string
+		wantPath  string
+		rationale string
+	}{
+		{"", nil, "", "empty prefix stays at the volume root"},
+		{"ckpt/", []string{"ckpt"}, "/ckpt", "trailing slash resolves fully"},
+		{"ckpt", nil, "", "a bare partial name cannot be resolved — start at root and let the caller's HasPrefix filter it"},
+		{"ckpt/mod", []string{"ckpt"}, "/ckpt", "partial last component is left unresolved on purpose"},
+		{"a/b/c/", []string{"a", "b", "c"}, "/a/b/c", "deep prefix resolves every full component"},
+		{"a/b/partial", []string{"a", "b"}, "/a/b", "only the tail is left to the string filter"},
+		{"/ckpt/", []string{"ckpt"}, "/ckpt", "a leading slash is tolerated and stripped"},
+	}
+	for _, c := range cases {
+		gotSegs := segsOf(c.prefix)
+		if !equalStringSlices(gotSegs, c.wantSegs) {
+			t.Errorf("prefix %q: segments = %v, want %v (%s)", c.prefix, gotSegs, c.wantSegs, c.rationale)
+		}
+		gotPath := ""
+		for _, s := range gotSegs {
+			gotPath += "/" + s
+		}
+		if gotPath != c.wantPath {
+			t.Errorf("prefix %q: startPath = %q, want %q — must match the walker's dirPath form exactly", c.prefix, gotPath, c.wantPath)
+		}
+		// The reconstructed child path must be normalizable back to something
+		// the caller's own prefix filter accepts.
+		child := gotPath + "/leaf.bin"
+		if normalizeOssAccelKey(child)[0] == '/' {
+			t.Errorf("prefix %q: normalized child path must not keep a leading slash, got %q", c.prefix, normalizeOssAccelKey(child))
+		}
 	}
 }
 

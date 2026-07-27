@@ -114,12 +114,24 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 	now := time.Now()
 
 	var candidates []ossAccelFlushPolicyCandidate
-	werr := walkOssAccelTree(mw, "flushPolicy", func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
-		// Same prefix-scoping idiom as runOssAccelAudit's Direction B scan
-		// (lcnode/oss_accel_audit.go): a plain HasPrefix on the file's
-		// would-be s3key (path with the leading "/" normalized away, since
-		// this candidate has never been flushed and so has no real s3key
-		// xattr yet).
+	// Subtree-scoped walk when a prefix is set. This sweep is the ONLY one of
+	// the six for which that is safe: its candidates have never been tiered out
+	// and so carry no oss-accel.s3key, which is precisely why its filter below
+	// compares the CURRENT PATH — making "start at the prefix's directory"
+	// exactly equivalent to "walk everything and filter". See
+	// walkOssAccelTreeUnderPathPrefix's doc comment for why the s3key-filtering
+	// sweeps must not do this (for audit it would quarantine live data).
+	walk := func(visit ossAccelWalkVisitor) error {
+		if prefix == "" {
+			return walkOssAccelTree(mw, "flushPolicy", visit)
+		}
+		return walkOssAccelTreeUnderPathPrefix(mw, "flushPolicy", prefix, visit)
+	}
+	werr := walk(func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+		// Retained even when the walk is already subtree-scoped: the prefix's
+		// last component is a string prefix that may be a partial name
+		// ("d1/f1" matching f1/f10/f100), which resolveOssAccelPrefixDir
+		// deliberately does not resolve. This is the second gate that handles it.
 		if prefix != "" && !strings.HasPrefix(normalizeOssAccelKey(path), prefix) {
 			return nil
 		}
