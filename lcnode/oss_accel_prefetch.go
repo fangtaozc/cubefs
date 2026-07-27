@@ -110,7 +110,7 @@ func (l *LcNode) runOssAccelPrefetchForVol(vol, path, prefix string, vsc uint32,
 		}
 		candidates = append(candidates, ossAccelPrefetchCandidate{path: path, ino: ino, size: info.Size, checksum: checksum})
 	} else {
-		werr := walkOssAccelTree(metaWrapper, func(mw *meta.MetaWrapper, parentIno uint64, walkPath string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+		werr := walkOssAccelTree(metaWrapper, "prefetch", func(mw *meta.MetaWrapper, parentIno uint64, walkPath string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 			s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]
 			if s3key == "" || !strings.HasPrefix(s3key, prefix) {
 				return nil // not oss-accel-managed under this prefix — irrelevant, don't count

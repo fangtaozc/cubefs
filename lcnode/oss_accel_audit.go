@@ -250,7 +250,7 @@ func runOssAccelAudit(mw *meta.MetaWrapper, s3Backend backend.Backend, roleCfg *
 	}
 	var toCheck []danglingCandidate
 
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, "audit", func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]
 		if s3key == "" || !strings.HasPrefix(s3key, prefix) {
 			// The prefix scopes BOTH sides of the diff — a file whose

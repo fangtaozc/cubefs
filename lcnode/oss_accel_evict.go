@@ -79,7 +79,7 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 	usageRatioAfter = ossAccelVolUsageRatio(mw)
 
 	var candidates []ossAccelEvictCandidate
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, "evict", func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		if xattrs[proto.XAttrKeyOSSAccelPin] == "true" {
 			return nil
 		}

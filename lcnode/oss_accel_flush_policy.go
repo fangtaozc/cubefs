@@ -114,7 +114,7 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 	now := time.Now()
 
 	var candidates []ossAccelFlushPolicyCandidate
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, "flushPolicy", func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		// Same prefix-scoping idiom as runOssAccelAudit's Direction B scan
 		// (lcnode/oss_accel_audit.go): a plain HasPrefix on the file's
 		// would-be s3key (path with the leading "/" normalized away, since

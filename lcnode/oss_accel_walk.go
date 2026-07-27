@@ -23,18 +23,21 @@
 // this is lcnode-internal periodic maintenance, not a master-dispatched
 // RuleTask scan).
 //
-// Not optimized for huge namespaces: this is a full tree walk on every
-// invocation, the same scaling characteristic lc_scanner.go itself has. If
-// the managed namespace grows large enough for this to matter, the fix is an
-// index, not a smarter walk — not attempted here.
+// Still a full tree walk on every invocation — the asymptotic fix is an index,
+// not a smarter walk, and that remains unattempted. But the per-file constant
+// factor has been cut: metadata for a whole directory page is fetched in two
+// batched RPCs instead of two RPCs PER FILE (see walkOssAccelDir). Six sweeps
+// now share this walker, so that constant mattered.
 package lcnode
 
 import (
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util/log"
 )
 
 // ossAccelWalkPageSize mirrors lc_scanner.go's defaultReadDirLimit.
@@ -71,13 +74,50 @@ var ossAccelWalkXAttrKeys = []string{
 // (kept explicit at the call site rather than silently skipped here, so a
 // sweep's own logging/counters see pinned files as "considered, excluded"
 // rather than the walker hiding them entirely).
-func walkOssAccelTree(mw *meta.MetaWrapper, visit ossAccelWalkVisitor) error {
-	return walkOssAccelDir(mw, proto.RootIno, "", visit)
+// sweep names the calling sweep, for the one summary log line emitted per walk.
+// Six sweeps share this walker and several can be scheduled on the same lcnode,
+// so an unlabeled line would be unattributable — and the whole point of the
+// line is to make walk cost measurable per sweep.
+func walkOssAccelTree(mw *meta.MetaWrapper, sweep string, visit ossAccelWalkVisitor) error {
+	stats := &ossAccelWalkStats{start: time.Now()}
+	err := walkOssAccelDir(mw, proto.RootIno, "", stats, visit)
+	stats.log(sweep, err)
+	return err
 }
 
-func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, dirPath string, visit ossAccelWalkVisitor) error {
+// ossAccelWalkStats is the per-walk cost summary. Deliberately counting pages
+// rather than RPCs: pages are what the batching changed, so "files per page" is
+// the number that shows whether batching is actually being exercised (a tree of
+// tiny directories gets little benefit no matter how large the volume is —
+// that distinction is exactly what decides whether parallel descent is worth
+// adding next).
+type ossAccelWalkStats struct {
+	start time.Time
+	dirs  int
+	files int
+	pages int
+}
+
+func (s *ossAccelWalkStats) log(sweep string, err error) {
+	elapsed := time.Since(s.start)
+	perPage := 0.0
+	if s.pages > 0 {
+		perPage = float64(s.files) / float64(s.pages)
+	}
+	if err != nil {
+		log.LogWarnf("ossAccelWalk[%v]: aborted after dirs(%v) files(%v) pages(%v) in %v: %v",
+			sweep, s.dirs, s.files, s.pages, elapsed, err)
+		return
+	}
+	log.LogInfof("ossAccelWalk[%v]: dirs(%v) files(%v) pages(%v) filesPerPage(%.1f) elapsed(%v)",
+		sweep, s.dirs, s.files, s.pages, perPage, elapsed)
+}
+
+func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, dirPath string, stats *ossAccelWalkStats, visit ossAccelWalkVisitor) error {
+	stats.dirs++
 	marker := ""
 	for {
+		stats.pages++
 		children, err := mw.ReadDirLimit_ll(dirIno, marker, ossAccelWalkPageSize)
 		if err != nil && err != syscall.ENOENT {
 			return err
@@ -92,24 +132,31 @@ func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, dirPath string, visit 
 			children = children[1:]
 		}
 
+		// Two passes over the page. Directories recurse immediately, exactly as
+		// before, so depth-first order is unchanged. Regular files are collected
+		// first and their metadata fetched in TWO batched RPCs for the whole page
+		// instead of two per file — mw.BatchInodeGet and mw.BatchGetXAttr both
+		// group by meta partition internally (sdk/meta/api.go), so a 1000-file
+		// page costs ~2×(number of MPs) round trips rather than 2000.
+		//
+		// visit is still called once per file in the page's original order, with
+		// the same arguments as before, so none of the six sweeps needed to
+		// change — and the skip semantics are preserved exactly: a file whose
+		// inode raced away is dropped, and a file with no xattrs at all gets an
+		// empty (non-nil) map.
+		files := make([]proto.Dentry, 0, len(children))
 		for _, child := range children {
-			childPath := dirPath + "/" + child.Name
 			if os.FileMode(child.Type).IsDir() {
-				if werr := walkOssAccelDir(mw, child.Inode, childPath, visit); werr != nil {
+				if werr := walkOssAccelDir(mw, child.Inode, dirPath+"/"+child.Name, stats, visit); werr != nil {
 					return werr
 				}
 				continue
 			}
-			info, gerr := mw.InodeGet_ll(child.Inode)
-			if gerr != nil || info == nil {
-				continue // raced away (deleted between ReadDirLimit_ll and InodeGet_ll) — skip, not fatal
-			}
-			xattrs, xerr := mw.BatchGetXAttr([]uint64{child.Inode}, ossAccelWalkXAttrKeys)
-			attrs := map[string]string{}
-			if xerr == nil && len(xattrs) > 0 {
-				attrs = xattrs[0].XAttrs
-			}
-			if verr := visit(mw, dirIno, childPath, child.Name, info, attrs); verr != nil {
+			files = append(files, child)
+		}
+		stats.files += len(files)
+		for _, entry := range fetchOssAccelWalkPage(mw, files) {
+			if verr := visit(mw, dirIno, dirPath+"/"+entry.dentry.Name, entry.dentry.Name, entry.info, entry.attrs); verr != nil {
 				return verr
 			}
 		}
@@ -120,4 +167,87 @@ func walkOssAccelDir(mw *meta.MetaWrapper, dirIno uint64, dirPath string, visit 
 		}
 		marker = children[childrenNr-1].Name
 	}
+}
+
+// ossAccelWalkPageEntry pairs a dentry with the metadata fetched for it.
+type ossAccelWalkPageEntry struct {
+	dentry proto.Dentry
+	info   *proto.InodeInfo
+	attrs  map[string]string
+}
+
+// fetchOssAccelWalkPage does the two batched metadata RPCs for one directory
+// page and hands back the results in the page's original order.
+func fetchOssAccelWalkPage(mw *meta.MetaWrapper, files []proto.Dentry) []ossAccelWalkPageEntry {
+	if len(files) == 0 {
+		return nil
+	}
+	inodes := make([]uint64, 0, len(files))
+	for _, f := range files {
+		inodes = append(inodes, f.Inode)
+	}
+	// BatchInodeGet has no error return: it drops whatever it could not fetch,
+	// which assembleOssAccelWalkPage then treats as "raced away".
+	infos := mw.BatchInodeGet(inodes)
+	// A BatchGetXAttr error is not fatal — it degrades every file in this page
+	// to "no xattrs", the same thing the old per-file code did when its
+	// single-inode call failed. Logged rather than swallowed silently, since at
+	// page granularity one failure now costs up to a whole page of attrs.
+	xattrs, xerr := mw.BatchGetXAttr(inodes, ossAccelWalkXAttrKeys)
+	if xerr != nil {
+		log.LogWarnf("fetchOssAccelWalkPage: BatchGetXAttr failed for %v inode(s), treating the page as having no oss-accel xattrs: %v",
+			len(inodes), xerr)
+		xattrs = nil
+	}
+	return assembleOssAccelWalkPage(files, infos, xattrs)
+}
+
+// assembleOssAccelWalkPage joins a directory page's dentries with the batched
+// inode and xattr results.
+//
+// Split out as a pure function because this join is where the batching's real
+// hazards live, and they are invisible in a small test volume:
+//   - BOTH batch APIs return results that are UNORDERED and MAY BE SHORTER than
+//     the input. BatchGetXAttr only emits an entry for inodes that have an
+//     extendTree record at all (metanode/partition_op_extend.go), so every file
+//     with no xattrs is simply absent; BatchInodeGet fans out one goroutine per
+//     meta partition and collects over a channel. Matching by slice index instead
+//     of by inode number would silently attach one file's metadata to another —
+//     which for these sweeps means acting on the wrong file.
+//   - Output order must stay the page's dentry order, because that is what the
+//     pre-batching walker produced and the sweeps' logs/results were read
+//     against.
+//
+// A file whose inode is missing is dropped (it was deleted between the readdir
+// and the fetch). A file whose xattrs are missing gets an empty, non-nil map.
+func assembleOssAccelWalkPage(files []proto.Dentry, infos []*proto.InodeInfo, xattrs []*proto.XAttrInfo) []ossAccelWalkPageEntry {
+	infoByIno := make(map[uint64]*proto.InodeInfo, len(infos))
+	for _, info := range infos {
+		if info != nil {
+			infoByIno[info.Inode] = info
+		}
+	}
+	attrsByIno := make(map[uint64]map[string]string, len(xattrs))
+	for _, x := range xattrs {
+		if x != nil {
+			attrsByIno[x.Inode] = x.XAttrs
+		}
+	}
+
+	out := make([]ossAccelWalkPageEntry, 0, len(files))
+	for _, f := range files {
+		info, ok := infoByIno[f.Inode]
+		if !ok {
+			continue // raced away between ReadDirLimit_ll and the batch fetch
+		}
+		attrs := attrsByIno[f.Inode]
+		if attrs == nil {
+			// Preserve the pre-batching contract: visitors index this map
+			// directly, so it must never be nil even when the file has no
+			// xattrs at all (the common case for an unmanaged file).
+			attrs = map[string]string{}
+		}
+		out = append(out, ossAccelWalkPageEntry{dentry: f, info: info, attrs: attrs})
+	}
+	return out
 }

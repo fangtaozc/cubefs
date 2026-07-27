@@ -147,7 +147,7 @@ func (l *LcNode) runOssAccelIntegrityForVol(vol, prefix string, fullSampleCount 
 	markMismatch := !ossAccelBucketExternallyOwned(roleCfg)
 
 	var candidates []ossAccelIntegrityCandidate
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, "integrity", func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]
 		if s3key == "" {
 			return nil // never tiered out — nothing cold to verify

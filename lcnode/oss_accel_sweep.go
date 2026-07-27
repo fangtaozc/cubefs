@@ -49,7 +49,7 @@ func (l *LcNode) runOssAccelPlaceholderSweep(vol string, ttlSeconds uint32) (swe
 	defer mw.Close()
 
 	deadline := time.Now().Add(-time.Duration(ttlSeconds) * time.Second)
-	werr := walkOssAccelTree(mw, func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+	werr := walkOssAccelTree(mw, "placeholderSweep", func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 		if os.FileMode(info.Mode).IsDir() {
 			return nil
 		}
