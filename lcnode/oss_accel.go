@@ -52,48 +52,47 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
-// Environment variables carrying the mover-side external S3 cold-tier config.
-// Kept out of any committed config file; injected into the lcnode pod (k8s
-// secret / daemonset env). The AK/SK are read by the s3 backend itself via the
-// *Env fields below, so they never pass through this package's variables.
-const (
-	envOssAccelS3Endpoint      = "OSS_ACCEL_S3_ENDPOINT"
-	envOssAccelS3Region        = "OSS_ACCEL_S3_REGION"
-	envOssAccelS3Bucket        = "OSS_ACCEL_S3_BUCKET"
-	envOssAccelS3PathStyle     = "OSS_ACCEL_S3_PATH_STYLE" // "true" for MinIO/Ceph RGW
-	envOssAccelS3SkipTLSVerify = "OSS_ACCEL_S3_SKIP_TLS_VERIFY"
-	// Names of the env vars holding the credentials (indirection keeps the
-	// secret values inside the s3 backend, out of this package).
-	envNameOssAccelS3AK = "OSS_ACCEL_S3_AK"
-	envNameOssAccelS3SK = "OSS_ACCEL_S3_SK"
-)
-
-// loadOssAccelS3Config builds the s3 backend config for vol. Checks the
-// volume's own per-vol override first (proto.XAttrKeyOSSAccelBackendConfig on
-// proto.RootIno — see proto/oss_accel.go), falling back to the lcnode
-// process's global OSS_ACCEL_S3_* environment when the volume has no
-// override (zero behavior change for every deployment that never sets one).
+// loadOssAccelS3Config builds the s3 backend config for vol, from that
+// volume's own configuration ONLY (proto.XAttrKeyOSSAccelBackendConfig on
+// proto.RootIno — see proto/oss_accel.go). A volume with no cold backend
+// configured is an error, not a fallback.
 //
-// A volume WITH an override that fails to parse or is missing a required
-// field is a hard error, never a silent fallback to global config — a
-// misconfigured per-vol override must not quietly start writing to the
-// wrong (deployment-global) bucket.
+// There used to be a deployment-global fallback (OSS_ACCEL_S3_ENDPOINT /
+// _BUCKET / … in the lcnode process env) that any unconfigured volume
+// silently inherited. That was removed on purpose: it meant a volume nobody
+// had configured would quietly start writing its cold data into whatever
+// bucket the deployment happened to point at, and the blast radius of a
+// forgotten configuration step was invisible until someone looked in the
+// bucket. Requiring an explicit per-volume bucket makes "which bucket does
+// this volume tier into" answerable from the volume alone, and makes the
+// unconfigured case fail loudly on the first flush instead of succeeding
+// into the wrong place.
+//
+// Credentials are unaffected and still come from the process environment:
+// the per-vol config stores only the NAMES of the env vars (or a named
+// profile in the mounted shared-credentials file), never secret values.
+// sdk/ossaccel defaults those names to OSS_ACCEL_S3_AK / _SK, so a per-vol
+// config that omits them still resolves the deployment's credentials.
 func loadOssAccelS3Config(mw *meta.MetaWrapper, vol string) (*s3.Config, error) {
-	if cfg, err := loadOssAccelS3ConfigFromVol(mw); cfg != nil || err != nil {
-		return cfg, err
+	cfg, err := loadOssAccelS3ConfigFromVol(mw)
+	if err != nil {
+		return nil, err
 	}
-	return loadOssAccelS3ConfigFromEnv()
+	if cfg == nil {
+		return nil, fmt.Errorf("oss-accel cold backend not configured for vol(%v): set it with "+
+			"`cfs-cli oss-accel backend set %v --endpoint <ep> --bucket <bucket> [--region <r>]` "+
+			"(there is no deployment-wide default bucket — every volume must name its own)", vol, vol)
+	}
+	return cfg, nil
 }
 
 // loadOssAccelS3ConfigFromVol returns (nil, nil) when the volume has no
-// oss-accel.backend override on its root inode (the normal, unconfigured
-// case — caller falls back to global env). Returns (nil, non-nil error) when
-// an override is present but malformed/incomplete — caller must NOT fall
-// back in that case. Returns (non-nil, nil) on a valid override.
+// oss-accel.backend config on its root inode, (nil, non-nil) when one is
+// present but malformed/incomplete, and (non-nil, nil) on a valid one.
 //
 // The xattr read + parse + defaulting itself lives in sdk/ossaccel (shared
 // with objectnode's backend-credential auth bridge, which needs the same
-// per-vol override without importing this package).
+// per-vol config without importing this package).
 func loadOssAccelS3ConfigFromVol(mw *meta.MetaWrapper) (*s3.Config, error) {
 	cfg, err := ossaccel.LoadBackendConfig(mw)
 	if cfg == nil || err != nil {
@@ -111,30 +110,6 @@ func loadOssAccelS3ConfigFromVol(mw *meta.MetaWrapper) (*s3.Config, error) {
 	}, nil
 }
 
-// loadOssAccelS3ConfigFromEnv is the pre-existing global-config path
-// (deployment-wide OSS_ACCEL_S3_* env vars), unchanged.
-func loadOssAccelS3ConfigFromEnv() (*s3.Config, error) {
-	endpoint := os.Getenv(envOssAccelS3Endpoint)
-	bucket := os.Getenv(envOssAccelS3Bucket)
-	region := os.Getenv(envOssAccelS3Region)
-	if endpoint == "" || bucket == "" {
-		return nil, fmt.Errorf("oss-accel S3 not configured: set %s and %s in lcnode env, or set %s on the volume's root inode",
-			envOssAccelS3Endpoint, envOssAccelS3Bucket, proto.XAttrKeyOSSAccelBackendConfig)
-	}
-	if region == "" {
-		region = "us-east-1" // harmless default for S3-compatible stores
-	}
-	return &s3.Config{
-		Endpoint:           endpoint,
-		Region:             region,
-		Bucket:             bucket,
-		AccessKeyEnv:       envNameOssAccelS3AK,
-		SecretKeyEnv:       envNameOssAccelS3SK,
-		UsePathStyle:       os.Getenv(envOssAccelS3PathStyle) == "true",
-		InsecureSkipVerify: os.Getenv(envOssAccelS3SkipTLSVerify) == "true",
-	}, nil
-}
-
 // loadOssAccelRoleConfig returns this volume's write role — a thin I/O
 // wrapper around parseOssAccelRoleConfig (lcnode/oss_accel_role.go), which
 // holds all the parsing/normalization logic and is unit-tested there.
@@ -143,12 +118,10 @@ func loadOssAccelS3ConfigFromEnv() (*s3.Config, error) {
 // OwnedPrefixes — unrestricted, matching every volume's behavior before this
 // xattr existed.
 //
-// A metanode READ FAILURE is a hard error, deliberately unlike
-// sdk/ossaccel.LoadBackendConfig which falls back to env on error: config
-// RESOLUTION may fall back to a default, a safety GATE may not. Assuming
-// "unrestricted primary" because we couldn't read the role is exactly the
-// silent permissive window this gate exists to close. Do not "fix" this for
-// symmetry with the backend loader.
+// A metanode READ FAILURE is a hard error. Assuming "unrestricted primary"
+// because we couldn't read the role is exactly the silent permissive window
+// this gate exists to close. (sdk/ossaccel.LoadBackendConfig now treats read
+// failures the same way, for a related reason — see its comment.)
 //
 // Note the two non-error cases are kept distinct from that failure: a root
 // inode with NO xattrs at all returns len(xattrs)==0 with err==nil (metanode

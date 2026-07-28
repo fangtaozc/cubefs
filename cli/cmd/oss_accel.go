@@ -24,8 +24,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// M2 收尾阶段 O: a proper admin entry point for oss-accel's per-volume cold
-// backend override (proto.OSSAccelBackendConfig, lcnode/oss_accel.go
+// M2 收尾阶段 O: a proper admin entry point for oss-accel's per-volume
+// cold backend config (proto.OSSAccelBackendConfig, lcnode/oss_accel.go
 // loadOssAccelS3ConfigFromVol), replacing the hand-rolled throwaway xattr
 // tool used during M1/M2 verification. This is a VOLUME ROOT xattr, not a
 // master-persisted object — there's no master HTTP endpoint for it (nor
@@ -39,13 +39,16 @@ const (
 	cmdOssAccelShort      = "Manage oss-accel (object-store accelerator) settings"
 	cmdOssAccelBackendUse = "backend [COMMAND]"
 
+	// "override" wording deliberately dropped: there is no deployment-wide
+	// default bucket to override any more. This IS the volume's cold backend,
+	// and a volume without one cannot use oss-accel at all.
 	cmdOssAccelBackendSetUse   = "set [volname]"
-	cmdOssAccelBackendSetShort = "set the volume's per-vol cold S3 backend override"
+	cmdOssAccelBackendSetShort = "set the volume's cold S3 backend (required before oss-accel can be used on it)"
 	cmdOssAccelBackendGetUse   = "get [volname]"
-	cmdOssAccelBackendGetShort = "show the volume's per-vol cold S3 backend override, if any"
+	cmdOssAccelBackendGetShort = "show the volume's cold S3 backend"
 	cmdOssAccelBackendDelUse   = "delete [volname]"
-	cmdOssAccelBackendDelShort = "remove the volume's per-vol override (falls back to the mover's global env config)"
-	cmdOssAccelBackendShort    = "Manage a volume's per-vol cold S3 backend override"
+	cmdOssAccelBackendDelShort = "remove the volume's cold S3 backend (disables oss-accel for it)"
+	cmdOssAccelBackendShort    = "Manage a volume's cold S3 backend"
 
 	cmdOssAccelRoleUse = "role [COMMAND]"
 
@@ -233,7 +236,7 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 				stdout("set oss-accel backend config failed: %v\n", err)
 				return
 			}
-			stdout("vol[%v] oss-accel backend override set:\n%v\n", volName, string(raw))
+			stdout("vol[%v] oss-accel cold backend set:\n%v\n", volName, string(raw))
 		},
 	}
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint (required)")
@@ -269,15 +272,17 @@ func newOssAccelBackendGetCmd(client *master.MasterClient) *cobra.Command {
 			}
 			raw := info.Get(proto.XAttrKeyOSSAccelBackendConfig)
 			if len(raw) == 0 {
-				stdout("vol[%v] has no oss-accel backend override — falls back to the mover's global env config\n", volName)
+				stdout("vol[%v] has no oss-accel cold backend configured — oss-accel is unusable on it until one is set "+
+					"(there is no deployment-wide default bucket):\n"+
+					"  cfs-cli oss-accel backend set %v --endpoint <ep> --bucket <bucket> [--region <r>]\n", volName, volName)
 				return
 			}
 			var cfg proto.OSSAccelBackendConfig
 			if err = json.Unmarshal(raw, &cfg); err != nil {
-				stdout("vol[%v] oss-accel backend override is not valid JSON: %v\nraw: %v\n", volName, err, string(raw))
+				stdout("vol[%v] oss-accel cold backend config is not valid JSON: %v\nraw: %v\n", volName, err, string(raw))
 				return
 			}
-			stdout("vol[%v] oss-accel backend override:\n%v\n", volName, string(raw))
+			stdout("vol[%v] oss-accel cold backend:\n%v\n", volName, string(raw))
 		},
 	}
 	return cmd
@@ -300,7 +305,9 @@ func newOssAccelBackendDeleteCmd(client *master.MasterClient) *cobra.Command {
 				stdout("delete oss-accel backend config failed: %v\n", err)
 				return
 			}
-			stdout("vol[%v] oss-accel backend override removed — falls back to the mover's global env config\n", volName)
+			stdout("vol[%v] oss-accel cold backend removed — oss-accel is now unusable on this volume "+
+				"(no deployment-wide default to fall back to); already-tiered cold files can no longer be recalled "+
+				"until a backend is set again\n", volName)
 		},
 	}
 	return cmd
@@ -478,7 +485,7 @@ func newOssAccelRoleDeleteCmd(client *master.MasterClient) *cobra.Command {
 // (proto.OSSAccelWriteThroughConfig) — same VOLUME ROOT xattr mechanism as
 // newOssAccelBackendCmd/newOssAccelRoleCmd above, mirrored structurally.
 //
-// Kept as a separate xattr from the backend override on purpose; see
+// Kept as a separate xattr from the backend config on purpose; see
 // proto.XAttrKeyOSSAccelWriteThrough's doc comment for why folding it into
 // oss-accel.backend would break env-configured volumes.
 func newOssAccelWriteThroughCmd(client *master.MasterClient) *cobra.Command {

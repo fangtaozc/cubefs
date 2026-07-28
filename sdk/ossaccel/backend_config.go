@@ -35,19 +35,31 @@ const (
 	DefaultSecretKeyEnv = "OSS_ACCEL_S3_SK"
 )
 
-// LoadBackendConfig returns this volume's oss-accel S3 backend override
+// LoadBackendConfig returns this volume's oss-accel S3 backend config
 // (proto.XAttrKeyOSSAccelBackendConfig on proto.RootIno), or (nil, nil) when
-// the volume has no override configured — the normal, unconfigured case.
-// Returns (nil, non-nil error) when an override is present but
-// malformed/incomplete; callers must not silently fall back to a
-// deployment-global default in that case — a misconfigured per-vol override
-// must not quietly resolve to the wrong bucket/credentials.
+// the volume has none — which is NOT a fallback case: there is no
+// deployment-wide default bucket, so lcnode turns (nil, nil) into a hard
+// "not configured for this volume" error. Returns (nil, non-nil error) when
+// the config is present but malformed/incomplete, or when it could not be
+// read at all.
 //
-// Region/AccessKeyEnv/SecretKeyEnv are defaulted here when the override
+// Region/AccessKeyEnv/SecretKeyEnv are defaulted here when the config
 // doesn't specify its own, so every caller sees the same resolved values.
 func LoadBackendConfig(mw *meta.MetaWrapper) (*proto.OSSAccelBackendConfig, error) {
 	xattrs, err := mw.BatchGetXAttr([]uint64{proto.RootIno}, []string{proto.XAttrKeyOSSAccelBackendConfig})
-	if err != nil || len(xattrs) == 0 {
+	// A metanode READ FAILURE must not be reported as "no config". It used to
+	// be folded in with the empty case because "no config" meant "fall back to
+	// the deployment-global bucket", which was a survivable answer. Now that
+	// "no config" is a hard error telling the operator to go configure the
+	// volume, conflating the two would print exactly the wrong diagnostic for
+	// a volume that IS configured and merely had a transient read failure.
+	if err != nil {
+		return nil, fmt.Errorf("oss-accel backend config read failed on vol root inode: %v", err)
+	}
+	// len(xattrs)==0 genuinely means "this inode has no xattrs at all" —
+	// metanode only appends an XAttrInfo for inodes with an extendTree entry,
+	// so this is the normal state of an unconfigured volume, not a failure.
+	if len(xattrs) == 0 {
 		return nil, nil
 	}
 	raw := xattrs[0].XAttrs[proto.XAttrKeyOSSAccelBackendConfig]
