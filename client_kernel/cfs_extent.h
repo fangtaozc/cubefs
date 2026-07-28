@@ -214,6 +214,13 @@ bool cfs_extent_cache_get_end(struct cfs_extent_cache *cache, u64 offset,
 			      struct cfs_packet_extent *extent);
 void cfs_extent_cache_truncate(struct cfs_extent_cache *cache, loff_t size);
 int cfs_extent_cache_refresh(struct cfs_extent_cache *cache, bool force);
+/* True when the cached extent map covers nothing at all. A read of any offset
+ * of such an inode is served entirely from zero-filled holes (see the
+ * io_info->hole branch in cfs_extent_read_pages) — which is the correct answer
+ * for a genuinely sparse file and silent data corruption for a file whose
+ * bytes were moved to a cold tier. cfs_oss_accel_gate uses it to tell those
+ * apart. */
+bool cfs_extent_cache_is_empty(struct cfs_extent_cache *cache);
 int cfs_extent_cache_append(struct cfs_extent_cache *cache,
 			    struct cfs_packet_extent *extent, bool sync,
 			    struct cfs_packet_extent_array *discard_extents);

@@ -32,6 +32,14 @@ extern struct file_system_type cfs_fs_type;
 
 struct cfs_mount_info {
 	struct cfs_options *options;
+	/* Leaf name actually registered under /proc/fs/cubefs (usually the
+	 * volume name, "<vol>-<seq>" when a live mount already holds it) plus
+	 * this mount's link in the module-wide registry of taken names. The
+	 * registry is what lets init_proc pick a free name WITHOUT asking
+	 * procfs — proc_mkdir()'s duplicate path WARNs with a full stack trace
+	 * before it returns NULL, so "try and fall back" cannot be quiet. */
+	char *proc_leaf;
+	struct list_head proc_leaf_link;
 	struct proc_dir_entry *proc_dir;
 	struct proc_dir_entry *proc_log;
 	struct proc_dir_entry *proc_stats;

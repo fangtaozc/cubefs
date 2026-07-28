@@ -328,6 +328,16 @@ int cfs_extent_cache_refresh(struct cfs_extent_cache *cache, bool force)
 	return ret;
 }
 
+bool cfs_extent_cache_is_empty(struct cfs_extent_cache *cache)
+{
+	bool empty;
+
+	mutex_lock(&cache->lock);
+	empty = btree_count(cache->extents) == 0;
+	mutex_unlock(&cache->lock);
+	return empty;
+}
+
 /**
  * @param extent [in] append to local extent cache
  * @param sync [in]

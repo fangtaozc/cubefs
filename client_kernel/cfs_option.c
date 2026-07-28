@@ -300,3 +300,79 @@ void cfs_options_release(struct cfs_options *options)
 	cfs_options_clear(options);
 	kfree(options);
 }
+
+/* Mount options whose VALUE must never reach the kernel log. Keep in sync with
+ * the option names cfs_options_parse accepts — a new secret-bearing option
+ * added there without an entry here silently re-introduces the leak. */
+static const char *const cfs_secret_options[] = {
+	"ossacceladmintoken=",
+};
+
+#define CFS_REDACTED "<redacted>"
+
+/* Returns the length of the matched "name=" prefix if @p starts one of the
+ * secret-bearing options, 0 otherwise. @p is always at an option boundary
+ * (start of string or just past a ','), so a plain prefix match cannot be
+ * fooled by the same text appearing inside another option's value. */
+static size_t cfs_secret_prefix_len(const char *p)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(cfs_secret_options); i++) {
+		size_t n = strlen(cfs_secret_options[i]);
+
+		if (strncmp(p, cfs_secret_options[i], n) == 0)
+			return n;
+	}
+	return 0;
+}
+
+char *cfs_options_redact(const char *opt_str)
+{
+	const char *p;
+	char *out, *w;
+	size_t nsecret = 0;
+	size_t rlen = strlen(CFS_REDACTED);
+
+	if (!opt_str)
+		return NULL;
+
+	/* Count first so the buffer size is provably sufficient even for
+	 * pathological input (the same secret option repeated). Redacting can
+	 * only grow a segment, and only by at most rlen — its own value is
+	 * dropped, so the placeholder is the entire growth. */
+	for (p = opt_str; p;) {
+		if (cfs_secret_prefix_len(p))
+			nsecret++;
+		p = strchr(p, ',');
+		if (p)
+			p++;
+	}
+
+	out = kmalloc(strlen(opt_str) + nsecret * rlen + 1, GFP_NOFS);
+	if (!out)
+		return NULL;
+
+	w = out;
+	for (p = opt_str; *p;) {
+		size_t klen = cfs_secret_prefix_len(p);
+		const char *end = strchr(p, ',');
+		size_t seg = end ? (size_t)(end - p) : strlen(p);
+
+		if (klen) {
+			memcpy(w, p, klen);
+			w += klen;
+			memcpy(w, CFS_REDACTED, rlen);
+			w += rlen;
+		} else {
+			memcpy(w, p, seg);
+			w += seg;
+		}
+		if (!end)
+			break;
+		*w++ = ',';
+		p = end + 1;
+	}
+	*w = '\0';
+	return out;
+}

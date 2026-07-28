@@ -331,6 +331,62 @@ static int cfs_inode_refresh(struct cfs_inode *ci)
  * or the recall just succeeded), or a negative errno (-EAGAIN/-EIO) if the
  * caller must abort without reading.
  */
+/* Decides whether a cached "this inode is on the hot tier" classification is
+ * trustworthy enough to skip the gate.
+ *
+ * ci->storage_class comes from the inode attrs, which are cached for
+ * attr_cache_valid_ms (30s by default). An out-of-band tier flip — an
+ * lcnode commit-cold sweep, or a manual /ossAccelCommitCold — changes the
+ * class and releases every extent on the metanode WITHOUT touching mtime or
+ * size, so inside that window this client still believes the file is hot. It
+ * then skips the gate, reads an extent map that legitimately has no extents
+ * left, and cfs_extent_read_pages zero-fills the resulting holes: the read
+ * returns the right *length* of the wrong *bytes*, instantly and with no
+ * error. Measured: 18 zero bytes in 0.001s right after commit-cold; correct
+ * content in 249ms once the attr cache expired.
+ *
+ * Revalidating on open instead would be both more expensive (an RPC per open
+ * on the hot path) and incomplete — a file already open when the flip happens
+ * never re-opens, so its later reads would still get zeros. Checking here
+ * covers that case too.
+ *
+ * The signal used is "the extent map covers nothing while i_size > 0", which
+ * is exactly the state commit-cold leaves behind (it releases the whole file).
+ *
+ * Cost on the hot read path — this runs per readpage/readahead for every
+ * non-cold inode once oss-accel is configured — is a single uncontended mutex
+ * acquisition: a locally populated map short-circuits before any refresh. The
+ * refresh is only reached when the map is empty, and in that case it is the
+ * very same metanode RPC cfs_extent_read_pages is about to issue anyway. Only
+ * a regular file with i_size > 0 and *no* extents at all pays one extra inode
+ * RPC per read attempt to establish that its holes are real.
+ *
+ * NOT covered: a partial hole (some extents present, the read range unbacked).
+ * oss-accel only ever tiers whole files, so no oss-accel flip produces that
+ * shape; detecting it would mean plumbing the read range down into the gate
+ * for no case that exists today. Verified on-cluster: a seek-written sparse
+ * file keeps its tail extent, so this predicate correctly does not fire and
+ * its holes still read as zeros at full speed.
+ */
+static bool cfs_oss_accel_hot_is_suspect(struct cfs_inode *ci)
+{
+	struct inode *inode = &ci->vfs_inode;
+
+	if (!S_ISREG(inode->i_mode) || !ci->es)
+		return false;
+	if (i_size_read(inode) == 0)
+		return false;
+	/* Checked before refreshing, not after: cfs_extent_cache_refresh's own
+	 * fast path already returns without an RPC when the map is populated,
+	 * so asking first is equivalent and halves the locking on the common
+	 * case. */
+	if (!cfs_extent_cache_is_empty(&ci->es->cache))
+		return false;
+	if (cfs_extent_cache_refresh(&ci->es->cache, false) < 0)
+		return false; /* can't tell — behave exactly as before */
+	return cfs_extent_cache_is_empty(&ci->es->cache);
+}
+
 static int cfs_oss_accel_gate(struct cfs_inode *ci)
 {
 	struct inode *inode = &ci->vfs_inode;
@@ -343,12 +399,30 @@ static int cfs_oss_accel_gate(struct cfs_inode *ci)
 	u64 size;
 	int ret;
 
-	if (ci->storage_class != CFS_STORAGE_CLASS_BLOBSTORE)
-		return 0;
-
+	/* Checked before anything else so a mount without oss-accel configured
+	 * keeps its pre-existing behavior bit for bit, including paying none of
+	 * the stale-hot revalidation below. */
 	mover_addr = cmi->options->oss_accel_mover_addr;
 	if (!mover_addr || !*mover_addr)
 		return 0;
+
+	if (ci->storage_class != CFS_STORAGE_CLASS_BLOBSTORE) {
+		if (!cfs_oss_accel_hot_is_suspect(ci))
+			return 0;
+		/* One inode RPC settles it. cfs_inode_refresh also force-
+		 * refreshes the extent map and invalidates clean pages when it
+		 * sees the class flip, which is exactly what a recall needs
+		 * next. (invalidate_mapping_pages only trylocks, so it cannot
+		 * deadlock against the page this caller already holds locked.) */
+		if (cfs_inode_refresh(ci) < 0)
+			return 0;
+		if (ci->storage_class != CFS_STORAGE_CLASS_BLOBSTORE)
+			return 0; /* genuinely sparse — zero-filling is correct */
+		cfs_log_warn(
+			cmi->log,
+			"ino(%lu) cached storage class was stale: file is cold, refusing to serve it as sparse holes\n",
+			inode->i_ino);
+	}
 
 	/* Dedup concurrent gate calls for the SAME inode on THIS node into a
 	 * single helper invocation — a client-local efficiency optimization
@@ -887,8 +961,20 @@ static ssize_t cfs_direct_io(struct kiocb *iocb, struct iov_iter *iter)
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
 	loff_t offset = iocb->ki_pos;
 	bool is_read = (iov_iter_rw(iter) == READ);
-	loff_t isize = is_read ? i_size_read(inode) : 0;
+	loff_t isize;
 	ssize_t ret;
+
+	/* O_DIRECT reads need the cold-read gate just as much as buffered ones
+	 * — arguably more: this path never had it, so reading ANY cold file
+	 * with O_DIRECT returned zero-filled holes unconditionally, not just
+	 * inside the attr-cache window. Must run before i_size is sampled: a
+	 * recall refreshes the inode attrs. */
+	if (is_read) {
+		ret = cfs_oss_accel_gate(CFS_INODE(inode));
+		if (ret < 0)
+			return ret;
+	}
+	isize = is_read ? i_size_read(inode) : 0;
 
 	/* O_DIRECT 读按 i_size 处理 EOF(R4):越 EOF 返回 0(EOF)。不截断 iter——
 	 * 截断会经 UBUF 的 iov_len==count 把不足页的几何传入 extent_dio_pages_alloc,
@@ -913,8 +999,16 @@ static ssize_t cfs_direct_io(struct kiocb *iocb, struct iov_iter *iter,
 	struct inode *inode = file_inode(file);
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
 	bool is_read = (iov_iter_rw(iter) == READ);
-	loff_t isize = is_read ? i_size_read(inode) : 0;
+	loff_t isize;
 	ssize_t ret;
+
+	/* 冷读门(见另一变体注释:此路径原先完全没有,任何冷文件 O_DIRECT 读恒返全零)。 */
+	if (is_read) {
+		ret = cfs_oss_accel_gate(CFS_INODE(inode));
+		if (ret < 0)
+			return ret;
+	}
+	isize = is_read ? i_size_read(inode) : 0;
 
 	/* O_DIRECT 读 EOF 处理 + 返回长度钳制(R4,见另一变体注释;不截断 iter)。 */
 	if (is_read && offset >= isize)
@@ -940,6 +1034,12 @@ static ssize_t cfs_direct_io(int type, struct kiocb *iocb,
 	struct cfs_mount_info *cmi = inode->i_sb->s_fs_info;
 	ssize_t ret;
 
+	/* 冷读门(见上面变体注释)。 */
+	if (type == READ) {
+		ret = cfs_oss_accel_gate(CFS_INODE(inode));
+		if (ret < 0)
+			return ret;
+	}
 #ifdef KERNEL_HAS_IOV_ITER_WITH_TAG
 	iov_iter_init(&iter, type, iov, nr_segs, iov_length(iov, nr_segs));
 #else
@@ -2120,8 +2220,18 @@ static struct dentry *cfs_mount(struct file_system_type *fs_type, int flags,
 	struct cfs_options *options;
 	struct cfs_mount_info *cmi;
 	struct dentry *dentry;
+	char *safe_opts;
 
-	cfs_pr_info("dev=\"%s\", options=\"%s\"\n", dev_str, (char *)opt_str);
+	/* Never log opt_str directly: it carries ossacceladmintoken=<token> in
+	 * cleartext, and the kernel ring buffer is readable far more widely
+	 * than the token's intended audience. `mount` output never showed it
+	 * (show_options deliberately omits it), which made the dmesg copy easy
+	 * to miss. On allocation failure log without the options rather than
+	 * falling back to the raw string. */
+	safe_opts = cfs_options_redact(opt_str);
+	cfs_pr_info("dev=\"%s\", options=\"%s\"\n", dev_str,
+		    safe_opts ? safe_opts : "<unavailable>");
+	kfree(safe_opts);
 
 	options = cfs_options_new(dev_str, opt_str);
 	if (IS_ERR(options))
@@ -2418,45 +2528,117 @@ static const struct proc_ops proc_log_fops = {
 	.proc_release = proc_log_release,
 };
 
+/* Module-wide registry of the /proc/fs/cubefs leaf names currently in use.
+ *
+ * Previously init_proc discovered collisions by calling proc_mkdir() with the
+ * volume name and retrying with a "-<seq>" suffix when it returned NULL. That
+ * is functionally correct but NOT quiet: proc_register() emits
+ *
+ *   proc_dir_entry 'cubefs/<vol>' already registered
+ *   WARNING: ... at fs/proc/generic.c:375 proc_register+0x...
+ *
+ * with a full stack trace *before* returning NULL. So every legitimate second
+ * mount of the same volume (and every mount after an unclean umount left the
+ * entry behind) printed something that reads exactly like a crash.
+ *
+ * Deciding the name from our own registry instead means proc_mkdir() is only
+ * ever called with a name no live mount holds, so the duplicate path is not
+ * taken and nothing is logged. The registry can't miss a leftover entry: an
+ * unclean umount leaves the cmi alive (put_super never ran, so unint_proc
+ * never ran either), hence still registered here; and entries cannot survive a
+ * module reload because cfs_exit() removes the whole "fs/cubefs" parent.
+ */
+static LIST_HEAD(cfs_proc_leaves);
+static DEFINE_MUTEX(cfs_proc_leaves_lock);
+
+/* Caller must hold cfs_proc_leaves_lock. */
+static bool cfs_proc_leaf_taken(const char *leaf)
+{
+	struct cfs_mount_info *other;
+
+	list_for_each_entry(other, &cfs_proc_leaves, proc_leaf_link) {
+		if (strcmp(other->proc_leaf, leaf) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* Claims a free leaf name for @cmi, storing it in cmi->proc_leaf and linking
+ * cmi into the registry. The plain volume name is preferred so the documented
+ * /proc/fs/cubefs/<vol> path holds for the common single-mount case. */
+static int cfs_proc_leaf_claim(struct cfs_mount_info *cmi)
+{
+	const char *vol = cmi->options->volume;
+	unsigned long seq;
+	char *leaf;
+
+	/* +32 for the "-%lu" suffix. */
+	leaf = kzalloc(strlen(vol) + 32, GFP_KERNEL);
+	if (!leaf)
+		return -ENOMEM;
+
+	mutex_lock(&cfs_proc_leaves_lock);
+	for (seq = 0; seq < 64; seq++) {
+		if (seq == 0)
+			sprintf(leaf, "%s", vol);
+		else
+			sprintf(leaf, "%s-%lu", vol, seq);
+		if (!cfs_proc_leaf_taken(leaf)) {
+			cmi->proc_leaf = leaf;
+			list_add(&cmi->proc_leaf_link, &cfs_proc_leaves);
+			mutex_unlock(&cfs_proc_leaves_lock);
+			return 0;
+		}
+	}
+	mutex_unlock(&cfs_proc_leaves_lock);
+	kfree(leaf);
+	return -EBUSY;
+}
+
+static void cfs_proc_leaf_drop(struct cfs_mount_info *cmi)
+{
+	if (!cmi->proc_leaf)
+		return;
+	mutex_lock(&cfs_proc_leaves_lock);
+	list_del(&cmi->proc_leaf_link);
+	mutex_unlock(&cfs_proc_leaves_lock);
+	kfree(cmi->proc_leaf);
+	cmi->proc_leaf = NULL;
+}
+
 static int init_proc(struct cfs_mount_info *cmi)
 {
 	char *proc_name;
+	int ret;
 
-	/* +32 给冲突时的 "-%lu" 后缀留空间 */
-	proc_name =
-		kzalloc(strlen("fs/cubefs/") + strlen(cmi->options->volume) + 32,
-			GFP_KERNEL);
-	if (!proc_name)
-		return -ENOMEM;
+	ret = cfs_proc_leaf_claim(cmi);
+	if (ret < 0)
+		return ret;
 
-	/* proc 条目同名冲突重试：umount 不净（hostPath 持有 sb → put_super 未
-	 * 触发 → unint_proc 未执行）会残留 /proc/fs/cubefs/<vol>，下次 mount
-	 * proc_mkdir 同名返回 NULL（already registered）。首次用 vol 名以保持
-	 * /proc/fs/cubefs/<vol> 路径约定，仅在冲突时加唯一 seq 后缀绕开泄漏。*/
-	{
-		unsigned long proc_seq = 0;
-
-		do {
-			if (proc_seq == 0)
-				sprintf(proc_name, "fs/cubefs/%s",
-					cmi->options->volume);
-			else
-				sprintf(proc_name, "fs/cubefs/%s-%lu",
-					cmi->options->volume, proc_seq);
-			cmi->proc_dir = proc_mkdir(proc_name, NULL);
-			proc_seq++;
-		} while (!cmi->proc_dir && proc_seq < 64);
-	}
-	if (!cmi->proc_dir) {
-		kfree(proc_name);
+	proc_name = kzalloc(strlen("fs/cubefs/") + strlen(cmi->proc_leaf) + 1,
+			    GFP_KERNEL);
+	if (!proc_name) {
+		cfs_proc_leaf_drop(cmi);
 		return -ENOMEM;
 	}
+	sprintf(proc_name, "fs/cubefs/%s", cmi->proc_leaf);
+
+	/* The name is registry-checked, so a NULL here is a genuinely
+	 * unexpected state (out of memory, or an entry procfs knows about that
+	 * no live mount claims) — and in that case proc_mkdir's own WARNING is
+	 * information we want, not noise to suppress. */
+	cmi->proc_dir = proc_mkdir(proc_name, NULL);
 	kfree(proc_name);
+	if (!cmi->proc_dir) {
+		cfs_proc_leaf_drop(cmi);
+		return -ENOMEM;
+	}
 
 	cmi->proc_log = proc_create_data("log", S_IRUSR | S_IRGRP | S_IROTH,
 					 cmi->proc_dir, &proc_log_fops, cmi);
 	if (!cmi->proc_log) {
 		proc_remove(cmi->proc_dir);
+		cfs_proc_leaf_drop(cmi);
 		return -ENOMEM;
 	}
 
@@ -2467,6 +2649,7 @@ static int init_proc(struct cfs_mount_info *cmi)
 	if (!cmi->proc_stats) {
 		proc_remove(cmi->proc_log);
 		proc_remove(cmi->proc_dir);
+		cfs_proc_leaf_drop(cmi);
 		return -ENOMEM;
 	}
 	return 0;
@@ -2480,6 +2663,9 @@ static void unint_proc(struct cfs_mount_info *cmi)
 		proc_remove(cmi->proc_log);
 	if (cmi->proc_dir)
 		proc_remove(cmi->proc_dir);
+	/* Release the name only after the procfs entries are gone, so the next
+	 * mount can never pick a leaf whose directory still exists. */
+	cfs_proc_leaf_drop(cmi);
 }
 
 static void update_limit_work_cb(struct work_struct *work)

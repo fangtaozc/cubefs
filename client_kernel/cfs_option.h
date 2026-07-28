@@ -33,4 +33,14 @@ struct cfs_options {
 struct cfs_options *cfs_options_new(const char *dev_str, const char *opt_str);
 void cfs_options_release(struct cfs_options *options);
 
+/* Returns a newly allocated copy of @opt_str with the value of every
+ * credential-bearing option replaced by a fixed placeholder, for logging.
+ * cfs_mount() logs the raw mount options at entry, which put the lcnode admin
+ * token in cleartext into the kernel ring buffer — anyone with dmesg access
+ * then had the token (the `mount` output never showed it, so this was easy to
+ * miss). Caller owns the result and must kfree() it; NULL on allocation
+ * failure, in which case callers must log nothing rather than the raw string.
+ */
+char *cfs_options_redact(const char *opt_str);
+
 #endif
