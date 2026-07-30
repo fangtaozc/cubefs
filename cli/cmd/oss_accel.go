@@ -210,6 +210,16 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 				stdout("set oss-accel backend failed: --endpoint and --bucket are required\n")
 				return
 			}
+			// 凭证来源必须显式声明。同样的规则在 sdk/ossaccel.LoadBackendConfig
+			// 里也把关（那才是真正的闸门，xattr 可以被别的途径写入）；这里提前
+			// 拦一次，是为了在敲命令时就报错，而不是等到第一次 flush。
+			if profile == "" && (accessKeyEnv == "" || secretKeyEnv == "") {
+				stdout("set oss-accel backend failed: no credential source declared.\n" +
+					"  There is no implicit default credential — pick one:\n" +
+					"    --profile <name>                             a section in the mounted shared-credentials file (recommended)\n" +
+					"    --access-key-env <NAME> --secret-key-env <NAME>   both required together (discouraged: plaintext env vars)\n")
+				return
+			}
 			cfg := proto.OSSAccelBackendConfig{
 				Endpoint:                   endpoint,
 				Region:                     region,
@@ -242,9 +252,9 @@ func newOssAccelBackendSetCmd(client *master.MasterClient) *cobra.Command {
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint (required)")
 	cmd.Flags().StringVar(&region, "region", "", "S3 region (defaults to us-east-1 if empty)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "bucket name (required)")
-	cmd.Flags().StringVar(&accessKeyEnv, "access-key-env", "", "name of the lcnode env var holding the access key (defaults to the mover's global OSS_ACCEL_S3_AK if empty — credential VALUES are never stored here)")
-	cmd.Flags().StringVar(&secretKeyEnv, "secret-key-env", "", "name of the lcnode env var holding the secret key (defaults to the mover's global OSS_ACCEL_S3_SK if empty)")
-	cmd.Flags().StringVar(&profile, "profile", "", "named profile in the shared-credentials file to resolve this volume's ak/sk from (defaults to \"default\" if empty — lets multiple volumes share one mounted credentials file while each resolving to a different secret value)")
+	cmd.Flags().StringVar(&accessKeyEnv, "access-key-env", "", "name of the lcnode env var holding the access key. No longer defaults to OSS_ACCEL_S3_AK — must be given explicitly (together with --secret-key-env) when not using --profile. Credential VALUES are never stored here")
+	cmd.Flags().StringVar(&secretKeyEnv, "secret-key-env", "", "name of the lcnode env var holding the secret key. See --access-key-env; both must be given together")
+	cmd.Flags().StringVar(&profile, "profile", "", "named profile (a \"[name]\" section) in the mounted shared-credentials file to resolve this volume's ak/sk from. REQUIRED unless --access-key-env/--secret-key-env are given — there is no implicit default profile")
 	cmd.Flags().BoolVar(&pathStyle, "path-style", false, "use S3 path-style addressing (MinIO/Ceph RGW)")
 	cmd.Flags().BoolVar(&skipTLSVerify, "skip-tls-verify", false, "skip TLS certificate verification")
 	cmd.Flags().BoolVar(&allowBackendCredentialAuth, "allow-backend-credential-auth", false,

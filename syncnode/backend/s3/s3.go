@@ -151,11 +151,17 @@ func (c *Config) validate() error {
 	if c.Region == "" {
 		return fmt.Errorf("%w: missing Region", backend.ErrConfigInvalid)
 	}
-	if c.AccessKeyEnv == "" && c.AccessKey == "" {
-		return fmt.Errorf("%w: missing AccessKeyEnv (or inline AccessKey)", backend.ErrConfigInvalid)
-	}
-	if c.SecretKeyEnv == "" && c.SecretKey == "" {
-		return fmt.Errorf("%w: missing SecretKeyEnv (or inline SecretKey)", backend.ErrConfigInvalid)
+	// Profile 是第三种合法的凭证来源(SDK 按具名 profile 读共享凭证文件),
+	// 和内联 AccessKey/SecretKey、env 变量名并列。此前只认后两种,于是一个
+	// "只给 Profile"的合法配置会被以 "missing AccessKeyEnv" 这种指错方向的
+	// 理由拒掉——调用方看到这条会去补 env 变量,而真正该做的什么都没缺。
+	if c.Profile == "" {
+		if c.AccessKeyEnv == "" && c.AccessKey == "" {
+			return fmt.Errorf("%w: missing credential source: need Profile, or AccessKeyEnv, or inline AccessKey", backend.ErrConfigInvalid)
+		}
+		if c.SecretKeyEnv == "" && c.SecretKey == "" {
+			return fmt.Errorf("%w: missing credential source: need Profile, or SecretKeyEnv, or inline SecretKey", backend.ErrConfigInvalid)
+		}
 	}
 	if c.MultipartThresholdMiB <= 0 {
 		c.MultipartThresholdMiB = defaultMultipartThresholdMiB

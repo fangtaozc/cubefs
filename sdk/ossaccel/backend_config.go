@@ -27,14 +27,6 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 )
 
-// Default env var names used when a volume's oss-accel backend override
-// doesn't specify its own — matches the deployment-wide OSS_ACCEL_S3_AK/SK
-// convention.
-const (
-	DefaultAccessKeyEnv = "OSS_ACCEL_S3_AK"
-	DefaultSecretKeyEnv = "OSS_ACCEL_S3_SK"
-)
-
 // LoadBackendConfig returns this volume's oss-accel S3 backend config
 // (proto.XAttrKeyOSSAccelBackendConfig on proto.RootIno), or (nil, nil) when
 // the volume has none — which is NOT a fallback case: there is no
@@ -76,11 +68,21 @@ func LoadBackendConfig(mw *meta.MetaWrapper) (*proto.OSSAccelBackendConfig, erro
 	if cfg.Region == "" {
 		cfg.Region = "us-east-1"
 	}
-	if cfg.AccessKeyEnv == "" {
-		cfg.AccessKeyEnv = DefaultAccessKeyEnv
-	}
-	if cfg.SecretKeyEnv == "" {
-		cfg.SecretKeyEnv = DefaultSecretKeyEnv
+	// 凭证来源必须显式声明:要么 profileName,要么 accessKeyEnv+secretKeyEnv
+	// 成对。三者都不给曾经会静默落到 AWS SDK 默认凭证链去读共享凭证文件的
+	// [default] 段——那是和"部署级默认桶"同一类的隐式默认:"这个卷用的是哪套
+	// 凭证"从卷自身答不出来,漏配一个卷不会报错、只会悄悄用上别人的凭证。
+	//
+	// 以前这里把 accessKeyEnv/secretKeyEnv 默认成 OSS_ACCEL_S3_AK/_SK,正是
+	// 那条隐式路径的入口(env 不存在 -> 取到空 -> 落默认链 -> 读 [default])。
+	// 现在两个默认值一并删掉:profileName 非空时这两个字段保持为空,由
+	// s3.Config.Validate 承认 Profile 是合法凭证来源。
+	if cfg.ProfileName == "" && (cfg.AccessKeyEnv == "" || cfg.SecretKeyEnv == "") {
+		return nil, fmt.Errorf("oss-accel backend config for this volume declares no credential source: "+
+			"set exactly one of `--profile <name>` (a section in the mounted shared-credentials file) "+
+			"or `--access-key-env <NAME> --secret-key-env <NAME>` (both required together). "+
+			"There is no implicit default credential any more — got profileName=%q accessKeyEnv=%q secretKeyEnv=%q",
+			cfg.ProfileName, cfg.AccessKeyEnv, cfg.SecretKeyEnv)
 	}
 	return &cfg, nil
 }

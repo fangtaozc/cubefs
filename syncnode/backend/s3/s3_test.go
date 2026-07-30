@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1448,16 +1449,38 @@ func TestResolveCredentials_InlineTakesPrecedence(t *testing.T) {
 }
 
 func TestResolveCredentials_NoneConfiguredFallsToDefaultChain(t *testing.T) {
-	// Isolate from whatever AWS_* credential env vars might happen to be
-	// set on the machine running the test, so this deterministically hits
-	// an empty default chain and errors, rather than flaking based on the
-	// environment.
-	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE"} {
+	// Isolate from whatever credentials the host happens to provide, so this
+	// deterministically hits an empty default chain and errors.
+	//
+	// UNSETTING AWS_SHARED_CREDENTIALS_FILE IS NOT ENOUGH — that only removes
+	// the override; the SDK then falls back to its built-in default path
+	// ~/.aws/credentials, and on any machine that has one (our build host
+	// does) the chain resolves successfully and this test fails. Point the two
+	// file-based sources at paths inside t.TempDir() that do not exist, and
+	// disable IMDS so a cloud instance's metadata service can't supply
+	// credentials either.
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	for name, val := range map[string]string{
+		"AWS_ACCESS_KEY_ID":           "",
+		"AWS_SECRET_ACCESS_KEY":       "",
+		"AWS_SESSION_TOKEN":           "",
+		"AWS_PROFILE":                 "",
+		"AWS_SHARED_CREDENTIALS_FILE": missing,
+		"AWS_CONFIG_FILE":             missing,
+		"AWS_EC2_METADATA_DISABLED":   "true",
+	} {
 		old, had := os.LookupEnv(name)
-		_ = os.Unsetenv(name)
+		if val == "" {
+			_ = os.Unsetenv(name)
+		} else {
+			_ = os.Setenv(name, val)
+		}
+		name, old, had := name, old, had
 		t.Cleanup(func() {
 			if had {
 				_ = os.Setenv(name, old)
+			} else {
+				_ = os.Unsetenv(name)
 			}
 		})
 	}
