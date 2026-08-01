@@ -800,40 +800,81 @@ func waitForConcurrentRecallWinner(metaWrapper *meta.MetaWrapper, ino uint64, vs
 	}
 }
 
-// runOssAccelRecallWrite streams the S3 object into the inode's extents (S3 GET →
-// ExtentClient.Write, migration-write when isCold), verifying the whole-file sha256
-// against wantChecksum along the way. Returns the bytes written and the computed
-// checksum even on error (best-effort, for logging) — callers decide whether an
-// error here is real or just "lost a concurrent recall race" (see call site).
+// extentWriterAt adapts ExtentClient.Write to io.WriterAt so
+// manager.Downloader's parallel range-fetch workers can write directly into
+// a CubeFS extent. Concurrent WriteAt calls at different offsets are safe:
+// ExtentClient.Write's writeLock only guards enqueueing onto the target
+// Streamer's request channel — the actual write is serialized by that
+// Streamer's single server() goroutine, so multiple goroutines calling
+// WriteAt concurrently just queue, they don't race.
+type extentWriterAt struct {
+	ec                *stream.ExtentClient
+	ino               uint64
+	writeStorageClass uint32
+	isMigration       bool
+}
+
+func (w *extentWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	return w.ec.Write(w.ino, int(off), p, 0, nil, w.writeStorageClass, w.isMigration, false)
+}
+
+// recallReadbackChunkBytes is the buffer size used by runOssAccelRecallWrite's
+// post-download readback verification (below) — large enough to keep the
+// number of ExtentClient.Read calls proportional to file size / chunk, not
+// file size / a tiny buffer, for the multi-GB files this concurrent path
+// exists for.
+const recallReadbackChunkBytes = 4 * 1024 * 1024
+
+// runOssAccelRecallWrite downloads the S3 object into the inode's extents
+// (concurrent range-fetch via s3.Backend.GetConcurrent → ExtentClient.Write,
+// migration-write when isCold), then verifies the whole-file sha256 against
+// wantChecksum by reading the written extent back. Returns the bytes written
+// and the computed checksum even on error (best-effort, for logging) —
+// callers decide whether an error here is real or just "lost a concurrent
+// recall race" (see call site).
+//
+// Checksumming reads back from the extent rather than hashing the S3
+// download stream in-flight: with concurrent range-fetch workers, bytes
+// arrive at the WriterAt out of offset order, so there is no single ordered
+// stream left to feed a running sha256.Hash. Reading back after Flush is not
+// a downgrade — the old in-flight hash only proved "bytes handed to Write
+// matched wantChecksum", not "bytes actually landed correctly"; a readback
+// verifies the latter, which is the stronger guarantee.
 func runOssAccelRecallWrite(extentClient *stream.ExtentClient, s3Backend backend.Backend, ino uint64, s3key string, size uint64, writeStorageClass uint32, isMigration bool, wantChecksum string) (off int, checksum string, err error) {
+	s3ConcreteBackend, ok := s3Backend.(*s3.Backend)
+	if !ok {
+		return 0, "", fmt.Errorf("runOssAccelRecallWrite: expected *s3.Backend, got %T", s3Backend)
+	}
+
 	ctx := context.Background()
-	body, getErr := s3Backend.Get(ctx, s3key, 0, int64(size))
-	if getErr != nil {
+	w := &extentWriterAt{ec: extentClient, ino: ino, writeStorageClass: writeStorageClass, isMigration: isMigration}
+	if getErr := s3ConcreteBackend.GetConcurrent(ctx, s3key, w, ossAccelRecallConcurrency); getErr != nil {
 		return 0, "", fmt.Errorf("s3 get err: %v", getErr)
 	}
-	defer body.Close()
+	off = int(size)
+
+	if ferr := extentClient.Flush(ino); ferr != nil {
+		return off, "", fmt.Errorf("extent flush err: %v", ferr)
+	}
 
 	h := sha256.New()
-	buf := make([]byte, 4*1024*1024)
-	for {
-		n, rerr := body.Read(buf)
+	buf := make([]byte, recallReadbackChunkBytes)
+	for readOff := 0; readOff < off; {
+		readSize := len(buf)
+		if rest := off - readOff; rest < readSize {
+			readSize = rest
+		}
+		n, rerr := extentClient.Read(ino, buf[:readSize], readOff, readSize, writeStorageClass, isMigration)
 		if n > 0 {
-			wn, werr := extentClient.Write(ino, off, buf[:n], 0, nil, writeStorageClass, isMigration, false)
-			if werr != nil {
-				return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("extent write err at off(%v): %v", off, werr)
-			}
 			h.Write(buf[:n])
-			off += wn
+			readOff += n
 		}
-		if rerr == io.EOF {
-			break
+		if rerr != nil && rerr != io.EOF {
+			return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("readback verify err at off(%v): %v", readOff, rerr)
 		}
-		if rerr != nil {
-			return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("s3 read err: %v", rerr)
+		if n == 0 && rerr == nil {
+			return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("readback verify stalled at off(%v): Read returned 0 bytes with no error", readOff)
 		}
-	}
-	if ferr := extentClient.Flush(ino); ferr != nil {
-		return off, hex.EncodeToString(h.Sum(nil)), fmt.Errorf("extent flush err: %v", ferr)
 	}
 
 	checksum = hex.EncodeToString(h.Sum(nil))

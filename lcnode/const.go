@@ -22,12 +22,16 @@ import (
 )
 
 const (
-	configListen                       = proto.ListenPort
-	configMasterAddr                   = proto.MasterAddr
-	configSimpleQueueInitCapacityStr   = "simpleQueueInitCapacity"
-	configScanCheckIntervalStr         = "scanCheckInterval"
-	configLcScanRoutineNumPerTaskStr   = "lcScanRoutineNumPerTask"
-	configLcScanLimitPerSecondStr      = "lcScanLimitPerSecond"
+	configListen                     = proto.ListenPort
+	configMasterAddr                 = proto.MasterAddr
+	configSimpleQueueInitCapacityStr = "simpleQueueInitCapacity"
+	configScanCheckIntervalStr       = "scanCheckInterval"
+	configLcScanRoutineNumPerTaskStr = "lcScanRoutineNumPerTask"
+	configLcScanLimitPerSecondStr    = "lcScanLimitPerSecond"
+	// concurrent range-fetch worker count for oss-accel recall/prefetch
+	// downloads (lcnode/oss_accel.go, GetConcurrent). See const default below
+	// for why 16/64.
+	configOssAccelRecallConcurrencyStr = "ossAccelRecallConcurrency"
 	configSnapshotRoutineNumPerTaskStr = "snapshotRoutineNumPerTask"
 	configLcNodeTaskCountLimit         = "lcNodeTaskCountLimit"
 	configDelayDelMinute               = "delayDelMinute"
@@ -39,12 +43,20 @@ const (
 
 // Default of configuration value
 const (
-	defaultListen                    = "80"
-	ModuleName                       = "lcNode"
-	defaultReadDirLimit              = 1000
-	defaultScanCheckInterval         = 60
-	defaultLcScanRoutineNumPerTask   = 20
-	maxLcScanRoutineNumPerTask       = 500
+	defaultListen                  = "80"
+	ModuleName                     = "lcNode"
+	defaultReadDirLimit            = 1000
+	defaultScanCheckInterval       = 60
+	defaultLcScanRoutineNumPerTask = 20
+	maxLcScanRoutineNumPerTask     = 500
+	// defaultOssAccelRecallConcurrency: recall/prefetch of a large (multi-GB)
+	// object over a single S3 GET can't saturate a WAN link — this many
+	// parallel range-fetch workers instead. 16 is a starting point, not a
+	// measured optimum (no real-machine bandwidth data yet); maxOssAccel-
+	// RecallConcurrency caps misconfiguration from starving the node's own
+	// bandwidth/memory (each worker buffers ~PartSizeMiB).
+	defaultOssAccelRecallConcurrency = 16
+	maxOssAccelRecallConcurrency     = 64
 	defaultLcScanLimitPerSecond      = rate.Inf
 	defaultLcScanLimitBurst          = 1000
 	defaultUnboundedChanInitCapacity = 10000
@@ -68,6 +80,7 @@ var (
 	scanCheckInterval         int64
 	lcScanRoutineNumPerTask   int
 	lcScanLimitPerSecond      rate.Limit
+	ossAccelRecallConcurrency int
 	snapshotRoutineNumPerTask int
 	lcNodeTaskCountLimit      int
 	maxDirChanNum             = 1000000

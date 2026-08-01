@@ -174,6 +174,13 @@ func (l *LcNode) parseConfig(cfg *config.Config) (err error) {
 	}
 	log.LogWarnf("loadConfig: setup config: %v(%v)", configLcScanRoutineNumPerTaskStr, lcScanRoutineNumPerTask)
 
+	// parse ossAccelRecallConcurrency
+	ossAccelRecallConcurrency = cfg.GetInt(configOssAccelRecallConcurrencyStr)
+	if ossAccelRecallConcurrency <= 0 || ossAccelRecallConcurrency > maxOssAccelRecallConcurrency {
+		ossAccelRecallConcurrency = defaultOssAccelRecallConcurrency
+	}
+	log.LogWarnf("loadConfig: setup config: %v(%v)", configOssAccelRecallConcurrencyStr, ossAccelRecallConcurrency)
+
 	// parse simpleQueueInitCapacity
 	simpleQueueInitCapacity = cfg.GetInt(configSimpleQueueInitCapacityStr)
 	if simpleQueueInitCapacity <= lcScanRoutineNumPerTask*1000 {

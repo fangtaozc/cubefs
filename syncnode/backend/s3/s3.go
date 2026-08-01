@@ -421,6 +421,42 @@ func (b *Backend) Get(ctx context.Context, key string, off, size int64) (io.Read
 	return out.Body, nil
 }
 
+// GetConcurrent downloads key into w using manager.Downloader's parallel
+// range-fetch workers — the WriterAt-based counterpart Get's doc comment
+// says Downloader is "only useful when the caller can WriteAt to a file".
+// oss-accel recall is exactly that caller: it streams a cold object back
+// into a CubeFS extent, and extentWriterAt (lcnode/oss_accel.go) gives it a
+// WriteAt to hand the SDK. Single-stream Get can't saturate a WAN link for
+// large (multi-GB) objects; this exists specifically for that case.
+//
+// concurrency overrides the Downloader's per-call worker count (the
+// Backend-level default set in New is deliberately not mutated here —
+// Download's functional options only affect a local copy of the config for
+// this call, so concurrent GetConcurrent calls on the same Backend don't
+// step on each other). BufferProvider is set explicitly to PartSizeMiB: the
+// SDK's own default (nil on non-Windows) falls back to io.Copy's 32KB
+// buffer, which for a multi-GB object turns into tens of millions of
+// WriteAt calls — each one queuing through the extent Streamer's single
+// serializing goroutine. Sizing the buffer to match PartSizeMiB keeps the
+// WriteAt call count proportional to part count, not to object size /32KB.
+func (b *Backend) GetConcurrent(ctx context.Context, key string, w io.WriterAt, concurrency int) error {
+	bufProvider := manager.NewPooledBufferedWriterReadFromProvider(b.cfg.PartSizeMiB * mib)
+	_, err := b.downloader.Download(ctx, w, &awss3.GetObjectInput{
+		Bucket: aws.String(b.bucket),
+		Key:    aws.String(key),
+	}, func(d *manager.Downloader) {
+		d.Concurrency = concurrency
+		d.BufferProvider = bufProvider
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return backend.ErrKeyNotFound
+		}
+		return fmt.Errorf("s3 GetConcurrent %s/%s: %w", b.bucket, key, err)
+	}
+	return nil
+}
+
 // Head implements Backend. ETag is returned without surrounding quotes
 // (S3 wraps it in quotes; callers expect bare). When the
 // `x-amz-meta-syncnode-mtime` header is present its parsed RFC3339Nano value

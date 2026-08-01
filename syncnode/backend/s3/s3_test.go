@@ -92,6 +92,15 @@ type mockS3 struct {
 	objects map[string]*mockObject
 	uploads map[string]*mockUpload // uploadID -> upload
 	srv     *httptest.Server
+
+	// failRangeStart, when non-nil, is consulted on every ranged GET: if it
+	// returns true for the request's range start offset, the mock answers
+	// with a 500 instead of serving the range. Used to test that
+	// GetConcurrent's overall Download() call surfaces an error when one of
+	// several concurrent range-fetch workers fails, without needing a real
+	// broken S3 server. nil (the default) never fails anything — every
+	// existing test using mockS3 is unaffected.
+	failRangeStart func(start int64) bool
 }
 
 func newMockS3(bucket string) *mockS3 {
@@ -227,6 +236,10 @@ func (m *mockS3) handleGet(w http.ResponseWriter, r *http.Request, key string) {
 		}
 		if start > end {
 			start = end
+		}
+		if m.failRangeStart != nil && m.failRangeStart(start) {
+			writeS3Error(w, "InternalError", "injected failure for test", http.StatusInternalServerError)
+			return
 		}
 		writeUserMetadata(w, obj.metadata)
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, len(body)))
