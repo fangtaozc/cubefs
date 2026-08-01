@@ -1905,11 +1905,22 @@ func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer
 	// recall has actually happened and extents are back in the hot tier.
 	// Trigger that here, same protocol as the kernel/FUSE clients'
 	// ossAccelColdReadGate, before falling into the normal dispatch below.
-	if !proto.IsCold(v.volType) && proto.IsStorageClassBlobStore(storageClass) {
-		if rerr := v.ossAccelColdReadGate(inode); rerr != nil {
-			return rerr
+	// 差距分析续三(命中率可观测性): mirrors the same warm/cold split added to
+	// client/fs/file.go's Read. Only classified when !IsCold(v.volType) —
+	// a volType-Cold volume's reads go through the entirely separate
+	// readEbs() mechanism below (not oss-accel's gate at all), so they must
+	// NOT be counted as an oss-accel "warm hit"; that would blend two
+	// unrelated read paths into one misleading ratio.
+	if !proto.IsCold(v.volType) {
+		if proto.IsStorageClassBlobStore(storageClass) {
+			exporter.NewCounter("objectnode_getobject_cold").AddWithLabels(1, map[string]string{exporter.Vol: v.name})
+			if rerr := v.ossAccelColdReadGate(inode); rerr != nil {
+				return rerr
+			}
+			storageClass = proto.StorageClass_Replica_HDD // recall always restores a replica copy; exact flavor doesn't affect the dispatch below
+		} else {
+			exporter.NewCounter("objectnode_getobject_warm").AddWithLabels(1, map[string]string{exporter.Vol: v.name})
 		}
-		storageClass = proto.StorageClass_Replica_HDD // recall always restores a replica copy; exact flavor doesn't affect the dispatch below
 	}
 	isCache := false
 	if proto.IsCold(v.volType) || proto.IsStorageClassBlobStore(storageClass) {

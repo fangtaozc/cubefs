@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cubefs/cubefs/blobstore/util/limit"
+	"github.com/cubefs/cubefs/blobstore/util/limit/count"
 	"github.com/cubefs/cubefs/cmd/common"
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/data/stream"
@@ -71,6 +73,20 @@ type LcNode struct {
 	// back to the existing waitForConcurrentRecallWinner poll rather than
 	// blocking indefinitely.
 	ossAccelRecallLimit *concurrent.KeyConcurrentLimit
+
+	// ossAccelInflightRecallLimit: process-wide cap on how many DIFFERENT
+	// files' recalls run at once across all three callers of
+	// ossAccelRecallLimit above (manual recall endpoint, eager prefetch,
+	// batch prefetch) — 差距分析续三(聚合并发无上限). ossAccelRecallLimit
+	// only dedupes concurrent attempts on the SAME inode; it was never a
+	// total-count cap, so nothing bounded "how many different files this
+	// lcnode downloads at once" until this field. Acquired AFTER
+	// ossAccelRecallLimit succeeds (cheaper check first — no point spending
+	// a token on a request that ossAccelRecallLimit would reject anyway),
+	// released before it. See ossAccelAcquireRecallSlots/
+	// ossAccelReleaseRecallSlots (oss_accel_recall_inflight_limit.go) for
+	// the shared two-layer Acquire/Release helper all three callers use.
+	ossAccelInflightRecallLimit limit.Limiter
 
 	// ossAccelBatchTasks: in-memory registry of batch prefetch tasks
 	// (oss_accel_prefetch_batch.go) submitted to THIS lcnode process.
@@ -192,6 +208,14 @@ func (l *LcNode) parseConfig(cfg *config.Config) (err error) {
 		ossAccelRecallConcurrency = defaultOssAccelRecallConcurrency
 	}
 	log.LogWarnf("loadConfig: setup config: %v(%v)", configOssAccelRecallConcurrencyStr, ossAccelRecallConcurrency)
+
+	// parse ossAccelMaxInflightRecalls
+	ossAccelMaxInflightRecalls = cfg.GetInt(configOssAccelMaxInflightRecallsStr)
+	if ossAccelMaxInflightRecalls <= 0 || ossAccelMaxInflightRecalls > maxOssAccelMaxInflightRecalls {
+		ossAccelMaxInflightRecalls = defaultOssAccelMaxInflightRecalls
+	}
+	log.LogWarnf("loadConfig: setup config: %v(%v)", configOssAccelMaxInflightRecallsStr, ossAccelMaxInflightRecalls)
+	l.ossAccelInflightRecallLimit = count.New(ossAccelMaxInflightRecalls)
 
 	// parse simpleQueueInitCapacity
 	simpleQueueInitCapacity = cfg.GetInt(configSimpleQueueInitCapacityStr)

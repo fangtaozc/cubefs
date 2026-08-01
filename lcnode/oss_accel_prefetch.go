@@ -166,16 +166,27 @@ func (l *LcNode) runOssAccelPrefetchForVol(vol, path, prefix string, vsc uint32,
 	}
 
 	for _, c := range candidates {
-		recallKey := vol + "/" + strconv.FormatUint(c.ino, 10)
-		if aerr := l.ossAccelRecallLimit.Acquire(recallKey, 1); aerr != nil {
+		recallKey, dedupeWon, slotAcquired, slotErr := l.ossAccelAcquireRecallSlots(vol, c.ino)
+		if !dedupeWon {
 			// Someone else (a real client read, or an overlapping prefetch
 			// call) is already recalling this exact inode — not a failure
 			// for THIS call, the other caller's work covers it.
 			log.LogInfof("runOssAccelPrefetchForVol: vol(%v) ino(%v) already being recalled elsewhere — skipping, not an error", vol, c.ino)
 			continue
 		}
+		if !slotAcquired {
+			// 差距分析续三(聚合并发无上限): total in-flight budget exhausted
+			// — counted as errs (not silently skipped like the dedupe-lost
+			// case above) since, unlike a dedupe loss, nobody else is doing
+			// this work on this caller's behalf; a real client read hitting
+			// this same file would still recall it independently, but this
+			// eager-prefetch attempt itself did not complete.
+			log.LogInfof("runOssAccelPrefetchForVol: vol(%v) ino(%v) %v", vol, c.ino, slotErr)
+			errs++
+			continue
+		}
 		_, _, _, rerr := l.runOssAccelRecallForInode(metaWrapper, extentClient, s3Backend, vol, c.path, c.ino, c.size, vsc, c.checksum)
-		l.ossAccelRecallLimit.Release(recallKey)
+		l.ossAccelReleaseRecallSlots(recallKey)
 		if rerr != nil {
 			log.LogWarnf("runOssAccelPrefetchForVol: vol(%v) path(%v) ino(%v) prefetch err: %v", vol, c.path, c.ino, rerr)
 			errs++

@@ -1112,3 +1112,58 @@ func (api *AdminAPI) GetOSSAccelChangelogRule(vol string) (rule *proto.OSSAccelC
 	))
 	return
 }
+
+// 差距分析续三(自省覆盖不均): the changelog rule above was the only one of
+// oss-accel's 7 master-persisted rule types with a cfs-cli surface — the
+// other 6 had the identical REST GET endpoint already (master/api_service_
+// oss_accel_*.go, registered in master/http_server.go) but no SDK client
+// method, so cfs-cli had no way to reach them. These 6 close that gap the
+// same way GetOSSAccelChangelogRule did.
+
+func (api *AdminAPI) GetOSSAccelEvictionRule(vol string) (rule *proto.OSSAccelEvictionRule, err error) {
+	rule = &proto.OSSAccelEvictionRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelEvictionRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}
+
+func (api *AdminAPI) GetOSSAccelFlushPolicyRule(vol string) (rule *proto.OSSAccelFlushPolicyRule, err error) {
+	rule = &proto.OSSAccelFlushPolicyRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelFlushPolicyRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}
+
+func (api *AdminAPI) GetOSSAccelAuditRule(vol string) (rule *proto.OSSAccelAuditRule, err error) {
+	rule = &proto.OSSAccelAuditRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelAuditRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}
+
+func (api *AdminAPI) GetOSSAccelIntegrityRule(vol string) (rule *proto.OSSAccelIntegrityRule, err error) {
+	rule = &proto.OSSAccelIntegrityRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelIntegrityRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}
+
+func (api *AdminAPI) GetOSSAccelTrashPurgeRule(vol string) (rule *proto.OSSAccelTrashPurgeRule, err error) {
+	rule = &proto.OSSAccelTrashPurgeRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelTrashPurgeRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}
+
+func (api *AdminAPI) GetOSSAccelBucketScanRule(vol string) (rule *proto.OSSAccelBucketScanRule, err error) {
+	rule = &proto.OSSAccelBucketScanRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelBucketScanRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}

@@ -437,7 +437,19 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		metric.SetWithLabels(err, map[string]string{exporter.Vol: f.super.volname})
 	}()
 
-	if !f.shouldAccessReplicaStorageClass() {
+	// 差距分析续三(命中率可观测性): oss-accel's whole value proposition is
+	// "reads against already-hot data are fast" — without a warm/cold split
+	// here, that claim was unverifiable from the outside. fileread_warm/
+	// fileread_cold give Prometheus-side hit-rate = warm/(warm+cold) via
+	// PromQL; this file doesn't compute the ratio itself (see plan doc —
+	// raw counts, not a client-computed rate). shouldAccessReplicaStorageClass
+	// is the SAME check that decides whether this read even calls the gate,
+	// so it's also the correct hot/cold classification — no separate
+	// judgment needed.
+	if f.shouldAccessReplicaStorageClass() {
+		exporter.NewCounter("fileread_warm").AddWithLabels(1, map[string]string{exporter.Vol: f.super.volname})
+	} else {
+		exporter.NewCounter("fileread_cold").AddWithLabels(1, map[string]string{exporter.Vol: f.super.volname})
 		if gateErr, recalled := f.super.ossAccelColdReadGate(f.info.Inode); gateErr != nil {
 			msg := fmt.Sprintf("Read: oss-accel cold read gate ino(%v) err(%v)", f.info.Inode, gateErr)
 			f.super.handleError("Read", msg)

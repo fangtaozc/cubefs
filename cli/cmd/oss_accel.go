@@ -74,6 +74,36 @@ const (
 	cmdOssAccelChangelogShort       = "Inspect a volume's oss-accel changelog sync state (multi-cluster consistency self-inspection)"
 	cmdOssAccelChangelogStatusUse   = "status [volname]"
 	cmdOssAccelChangelogStatusShort = "show the volume's changelog sync health: consecutive failures, dead-letter skip threshold, last run result"
+
+	// 差距分析续三(自省覆盖不均): the remaining 6 oss-accel rule types get
+	// the same status-only cfs-cli surface changelog got above — each rule's
+	// master REST GET endpoint already existed, only the CLI command was
+	// missing. Use/Short strings grouped per rule, same use/short/status
+	// pattern as changelog.
+	cmdOssAccelEvictionUse            = "eviction [COMMAND]"
+	cmdOssAccelEvictionShort          = "Inspect a volume's oss-accel coldest-first eviction schedule"
+	cmdOssAccelEvictionStatusUse      = "status [volname]"
+	cmdOssAccelEvictionStatusShort    = "show the volume's eviction sweep health: in-flight state, last run result"
+	cmdOssAccelFlushPolicyUse         = "flush-policy [COMMAND]"
+	cmdOssAccelFlushPolicyShort       = "Inspect a volume's oss-accel age-triggered auto-flush schedule"
+	cmdOssAccelFlushPolicyStatusUse   = "status [volname]"
+	cmdOssAccelFlushPolicyStatusShort = "show the volume's flush-policy sweep health: in-flight state, last run result"
+	cmdOssAccelAuditUse               = "audit [COMMAND]"
+	cmdOssAccelAuditShort             = "Inspect a volume's oss-accel consistency audit schedule"
+	cmdOssAccelAuditStatusUse         = "status [volname]"
+	cmdOssAccelAuditStatusShort       = "show the volume's audit sweep health: last run result"
+	cmdOssAccelIntegrityUse           = "integrity [COMMAND]"
+	cmdOssAccelIntegrityShort         = "Inspect a volume's oss-accel cold-tier integrity-check schedule"
+	cmdOssAccelIntegrityStatusUse     = "status [volname]"
+	cmdOssAccelIntegrityStatusShort   = "show the volume's integrity-check sweep health: last run result"
+	cmdOssAccelTrashPurgeUse          = "trash-purge [COMMAND]"
+	cmdOssAccelTrashPurgeShort        = "Inspect a volume's oss-accel trash purge schedule"
+	cmdOssAccelTrashPurgeStatusUse    = "status [volname]"
+	cmdOssAccelTrashPurgeStatusShort  = "show the volume's trash-purge sweep health: last run result"
+	cmdOssAccelBucketScanUse          = "bucket-scan [COMMAND]"
+	cmdOssAccelBucketScanShort        = "Inspect a volume's oss-accel periodic bucket scan schedule"
+	cmdOssAccelBucketScanStatusUse    = "status [volname]"
+	cmdOssAccelBucketScanStatusShort  = "show the volume's bucket-scan sweep health: last run result"
 )
 
 func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
@@ -85,7 +115,9 @@ func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
 	}
 	proto.InitBufferPool(32768)
 	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client), newOssAccelRoleCmd(client),
-		newOssAccelWriteThroughCmd(client), newOssAccelChangelogCmd(client))
+		newOssAccelWriteThroughCmd(client), newOssAccelChangelogCmd(client),
+		newOssAccelEvictionCmd(client), newOssAccelFlushPolicyCmd(client), newOssAccelAuditCmd(client),
+		newOssAccelIntegrityCmd(client), newOssAccelTrashPurgeCmd(client), newOssAccelBucketScanCmd(client))
 	return cmd
 }
 
@@ -659,6 +691,224 @@ func newOssAccelChangelogStatusCmd(client *master.MasterClient) *cobra.Command {
 			if rule.SkipAfterFailures > 0 && rule.ConsecutiveFailures+1 >= rule.SkipAfterFailures {
 				stdout("  note: next failure on the current cursor line will be dead-letter-skipped (advances past it) rather than retried\n")
 			}
+		},
+	}
+	return cmd
+}
+
+// 差距分析续三(自省覆盖不均): the remaining 6 commands below all follow the
+// exact status-only shape newOssAccelChangelogCmd established — the only
+// per-rule variation is which extra field(s) get printed (Eviction/
+// FlushPolicy have an in-flight flag the other 4 don't; none of the 6 have
+// ConsecutiveFailures/SkipAfterFailures, those are changelog-only).
+
+func newOssAccelEvictionCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelEvictionUse,
+		Short: cmdOssAccelEvictionShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelEvictionStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelEvictionStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelEvictionStatusUse,
+		Short: cmdOssAccelEvictionStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelEvictionRule(volName)
+			if err != nil {
+				stdout("get oss-accel eviction rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel eviction status:\n", volName)
+			stdout("  enabled          : %v\n", rule.Enabled)
+			stdout("  evictionInFlight : %v\n", rule.EvictionInFlight)
+			stdout("  lastRunAt        : %v\n", lastRunAt)
+			stdout("  lastRunResult    : %v\n", rule.LastRunResult)
+		},
+	}
+	return cmd
+}
+
+func newOssAccelFlushPolicyCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelFlushPolicyUse,
+		Short: cmdOssAccelFlushPolicyShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelFlushPolicyStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelFlushPolicyStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelFlushPolicyStatusUse,
+		Short: cmdOssAccelFlushPolicyStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelFlushPolicyRule(volName)
+			if err != nil {
+				stdout("get oss-accel flush-policy rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel flush-policy status:\n", volName)
+			stdout("  enabled             : %v\n", rule.Enabled)
+			stdout("  flushPolicyInFlight : %v\n", rule.FlushPolicyInFlight)
+			stdout("  lastRunAt           : %v\n", lastRunAt)
+			stdout("  lastRunResult       : %v\n", rule.LastRunResult)
+		},
+	}
+	return cmd
+}
+
+func newOssAccelAuditCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelAuditUse,
+		Short: cmdOssAccelAuditShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelAuditStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelAuditStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelAuditStatusUse,
+		Short: cmdOssAccelAuditStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelAuditRule(volName)
+			if err != nil {
+				stdout("get oss-accel audit rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel audit status:\n", volName)
+			stdout("  enabled       : %v\n", rule.Enabled)
+			stdout("  lastRunAt     : %v\n", lastRunAt)
+			stdout("  lastRunResult : %v\n", rule.LastRunResult)
+		},
+	}
+	return cmd
+}
+
+func newOssAccelIntegrityCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelIntegrityUse,
+		Short: cmdOssAccelIntegrityShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelIntegrityStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelIntegrityStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelIntegrityStatusUse,
+		Short: cmdOssAccelIntegrityStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelIntegrityRule(volName)
+			if err != nil {
+				stdout("get oss-accel integrity rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel integrity status:\n", volName)
+			stdout("  enabled       : %v\n", rule.Enabled)
+			stdout("  lastRunAt     : %v\n", lastRunAt)
+			stdout("  lastRunResult : %v\n", rule.LastRunResult)
+		},
+	}
+	return cmd
+}
+
+func newOssAccelTrashPurgeCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelTrashPurgeUse,
+		Short: cmdOssAccelTrashPurgeShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelTrashPurgeStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelTrashPurgeStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelTrashPurgeStatusUse,
+		Short: cmdOssAccelTrashPurgeStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelTrashPurgeRule(volName)
+			if err != nil {
+				stdout("get oss-accel trash-purge rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel trash-purge status:\n", volName)
+			stdout("  enabled       : %v\n", rule.Enabled)
+			stdout("  lastRunAt     : %v\n", lastRunAt)
+			stdout("  lastRunResult : %v\n", rule.LastRunResult)
+		},
+	}
+	return cmd
+}
+
+func newOssAccelBucketScanCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelBucketScanUse,
+		Short: cmdOssAccelBucketScanShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelBucketScanStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelBucketScanStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelBucketScanStatusUse,
+		Short: cmdOssAccelBucketScanStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelBucketScanRule(volName)
+			if err != nil {
+				stdout("get oss-accel bucket-scan rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel bucket-scan status:\n", volName)
+			stdout("  enabled       : %v\n", rule.Enabled)
+			stdout("  lastRunAt     : %v\n", lastRunAt)
+			stdout("  lastRunResult : %v\n", rule.LastRunResult)
 		},
 	}
 	return cmd

@@ -24,6 +24,18 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+// boolToFloat: the 6 oss-accel rule types below (Eviction/Audit/TrashPurge/
+// FlushPolicy/Integrity/BucketScan) have no ConsecutiveFailures-style
+// counter — "last run ok/error" as a 1/0 gauge is the closest available
+// self-inspection signal without adding a new persisted field to any of
+// their proto structs just to back a metric.
+func boolToFloat(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTask) {
 	if task == nil {
 		log.LogInfof("lc action[handleLcNodeTaskResponse] receive addr[%v] task response, but task is nil", nodeAddr)
@@ -169,6 +181,10 @@ func (c *Cluster) handleLcNodeOssAccelEvictResp(nodeAddr string, resp *proto.OSS
 		return err
 	}
 	c.ossAccelEvictionRuleCache.Put(&updated)
+	// 差距分析续三(自省覆盖不均): see boolToFloat's doc comment. Same implicit
+	// leader-only scope as oss_accel_changelog_consecutive_failures (this
+	// handler only runs where lcnode's task response landed, always leader).
+	exporter.NewGauge("oss_accel_eviction_last_run_ok").SetWithLabels(boolToFloat(resp.StartErr == ""), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelEvictResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
@@ -200,6 +216,7 @@ func (c *Cluster) handleLcNodeOssAccelAuditResp(nodeAddr string, resp *proto.OSS
 		return err
 	}
 	c.ossAccelAuditRuleCache.Put(&updated)
+	exporter.NewGauge("oss_accel_audit_last_run_ok").SetWithLabels(boolToFloat(resp.StartErr == ""), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelAuditResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
@@ -227,6 +244,7 @@ func (c *Cluster) handleLcNodeOssAccelTrashPurgeResp(nodeAddr string, resp *prot
 		return err
 	}
 	c.ossAccelTrashPurgeRuleCache.Put(&updated)
+	exporter.NewGauge("oss_accel_trash_purge_last_run_ok").SetWithLabels(boolToFloat(resp.StartErr == ""), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelTrashPurgeResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
@@ -260,6 +278,7 @@ func (c *Cluster) handleLcNodeOssAccelFlushPolicyResp(nodeAddr string, resp *pro
 		return err
 	}
 	c.ossAccelFlushPolicyRuleCache.Put(&updated)
+	exporter.NewGauge("oss_accel_flush_policy_last_run_ok").SetWithLabels(boolToFloat(resp.StartErr == ""), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelFlushPolicyResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
@@ -288,6 +307,7 @@ func (c *Cluster) handleLcNodeOssAccelIntegrityResp(nodeAddr string, resp *proto
 		return err
 	}
 	c.ossAccelIntegrityRuleCache.Put(&updated)
+	exporter.NewGauge("oss_accel_integrity_last_run_ok").SetWithLabels(boolToFloat(resp.StartErr == ""), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelIntegrityResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }
@@ -316,6 +336,7 @@ func (c *Cluster) handleLcNodeOssAccelBucketScanResp(nodeAddr string, resp *prot
 		return err
 	}
 	c.ossAccelBucketScanRuleCache.Put(&updated)
+	exporter.NewGauge("oss_accel_bucket_scan_last_run_ok").SetWithLabels(boolToFloat(resp.StartErr == ""), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelBucketScanResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }

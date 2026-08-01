@@ -545,8 +545,8 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 	// eager prefetch sweep (lcnode/oss_accel_prefetch.go) acquires the SAME
 	// lock around its own call to the core function — the two callers race
 	// each other on the same inode just as two HTTP callers would.
-	recallKey := vol + "/" + strconv.FormatUint(ino, 10)
-	if aerr := l.ossAccelRecallLimit.Acquire(recallKey, 1); aerr != nil {
+	recallKey, dedupeWon, slotAcquired, slotErr := l.ossAccelAcquireRecallSlots(vol, ino)
+	if !dedupeWon {
 		log.LogInfof("httpServiceOssAccelRecall: vol(%v) ino(%v) another recall already in flight on this lcnode — waiting for it instead of racing a second migration-write", vol, ino)
 		if waitForConcurrentRecallWinner(metaWrapper, ino, vsc) {
 			fmt.Fprintf(w, "ok: vol=%v ino=%v wasCold=true (joined in-progress recall on this lcnode, no new write issued)\n", vol, ino)
@@ -555,7 +555,17 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		http.Error(w, fmt.Sprintf("ino(%v) recall already in progress on this lcnode and did not reach storageClass(%v) within %v; retry", ino, vsc, concurrentRecallWaitBound), http.StatusTooEarly)
 		return
 	}
-	defer l.ossAccelRecallLimit.Release(recallKey)
+	if !slotAcquired {
+		// 差距分析续三(聚合并发无上限): dedupe lock won, but this lcnode's
+		// total in-flight recall budget is exhausted — temporary
+		// backpressure, not "this file is unrecoverable". 429 (not 425/
+		// StatusTooEarly like the dedupe-lost branch above) because the
+		// caller isn't racing a specific winner to join, it just needs to
+		// back off and retry against whatever capacity frees up next.
+		http.Error(w, slotErr.Error(), http.StatusTooManyRequests)
+		return
+	}
+	defer l.ossAccelReleaseRecallSlots(recallKey)
 
 	// Per-vol backend override lives on this vol's own root inode, so the S3
 	// config can only be resolved once metaWrapper (above) exists.

@@ -333,8 +333,8 @@ func (l *LcNode) runOssAccelPrefetchBatch(task *ossAccelBatchPrefetchTask, paths
 			continue
 		}
 
-		recallKey := task.Vol + "/" + strconv.FormatUint(cand.ino, 10)
-		if aerr := l.ossAccelRecallLimit.Acquire(recallKey, 1); aerr != nil {
+		recallKey, dedupeWon, slotAcquired, slotErr := l.ossAccelAcquireRecallSlots(task.Vol, cand.ino)
+		if !dedupeWon {
 			// Someone else (a real client read, or an overlapping prefetch
 			// call) is already recalling this exact inode — not a failure
 			// for THIS batch, the other caller's work covers it. Counted as
@@ -346,8 +346,22 @@ func (l *LcNode) runOssAccelPrefetchBatch(task *ossAccelBatchPrefetchTask, paths
 			task.mu.Unlock()
 			continue
 		}
+		if !slotAcquired {
+			// 差距分析续三(聚合并发无上限): total in-flight budget exhausted
+			// — this is temporary backpressure, not a reason to abandon the
+			// whole batch (see plan doc). Counted as errs and the loop
+			// continues to the next candidate; the caller can re-submit
+			// this specific path in a follow-up batch once capacity frees
+			// up, same as any other per-candidate failure this batch
+			// already tolerates.
+			log.LogInfof("runOssAccelPrefetchBatch: taskId(%v) vol(%v) ino(%v) %v", task.ID, task.Vol, cand.ino, slotErr)
+			task.mu.Lock()
+			task.errs++
+			task.mu.Unlock()
+			continue
+		}
 		_, _, _, rcErr := l.runOssAccelRecallForInode(metaWrapper, extentClient, s3Backend, task.Vol, cand.path, cand.ino, cand.size, vsc, cand.checksum)
-		l.ossAccelRecallLimit.Release(recallKey)
+		l.ossAccelReleaseRecallSlots(recallKey)
 		task.mu.Lock()
 		if rcErr != nil {
 			log.LogWarnf("runOssAccelPrefetchBatch: taskId(%v) vol(%v) path(%v) ino(%v) prefetch err: %v", task.ID, task.Vol, cand.path, cand.ino, rcErr)
