@@ -256,20 +256,27 @@ func New(cfg interface{}) (backend.Backend, error) {
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(c.Region),
 		// aws-sdk-go-v2 defaults RequestChecksumCalculation to
-		// WhenSupported: PutObject/UploadPart bodies get an automatic
-		// trailing checksum sent via aws-chunked transfer encoding whenever
-		// the operation supports it, regardless of whether this backend's
-		// own sha256 (mergeMetadata, stamped as user-metadata) is in play.
-		// Many S3-compatible services besides AWS itself don't implement
-		// aws-chunked decoding and fail the request outright — observed
-		// against 百度 BOS as a 400 "ReadBodyError: Read http body error"
-		// on multipart UploadPart specifically (single-shot PutObject uses
-		// a seekable io.ReadSeeker body and takes a different, unaffected
-		// code path, which is why small objects worked while large ones
-		// didn't). WhenRequired means the checksum is only added when a
-		// caller explicitly asks for one — this backend never does, so this
-		// is a pure opt-out with no loss: correctness still comes from our
-		// own sha256 in user-metadata (Put/GetChecksum), not the SDK's.
+		// WhenSupported: request bodies get an automatic trailing checksum
+		// sent via aws-chunked transfer encoding whenever the operation
+		// supports it. Many S3-compatible services besides AWS itself
+		// don't implement aws-chunked decoding and fail the request
+		// outright — observed against 百度 BOS as a 400 "ReadBodyError:
+		// Read http body error". WhenRequired means the checksum is only
+		// added when a caller explicitly asks for one — this backend
+		// never does, so this is a pure opt-out with no loss: correctness
+		// still comes from our own sha256 in user-metadata (Put/
+		// GetChecksum), not the SDK's.
+		//
+		// This setting alone does NOT cover multipart uploads —
+		// manager.Uploader carries its own independent
+		// RequestChecksumCalculation field (hardcoded default
+		// WhenSupported in manager.NewUploader) that does not read this
+		// awsCfg value; see the matching option set on uploader below.
+		// This awsCfg setting only reaches direct client.PutObject/
+		// client.GetObject calls, which is why single-shot PutObject
+		// (small objects, this repo's threshold below MultipartThresholdMiB)
+		// was unaffected while multipart UploadPart (large objects) still
+		// 400'd even after this line alone.
 		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
 		// Same rationale, response side: WhenSupported (the SDK default)
 		// validates a response checksum whenever the server sends one,
@@ -316,6 +323,17 @@ func New(cfg interface{}) (backend.Backend, error) {
 
 	uploader := manager.NewUploader(client, func(u *manager.Uploader) {
 		u.PartSize = int64(c.PartSizeMiB) * mib
+		// manager.Uploader carries its OWN RequestChecksumCalculation field
+		// (default RequestChecksumCalculationWhenSupported, hardcoded in
+		// manager.NewUploader) — it does NOT read awsCfg's setting above.
+		// Multipart uploads (this Uploader) go through initChecksumAlgorithm
+		// picking a checksum algorithm and streaming the body as
+		// aws-chunked + trailer whenever this is anything but
+		// WhenRequired, regardless of what's configured on awsCfg. This is
+		// what was actually causing the BOS 400 ReadBodyError — the awsCfg
+		// setting above only reaches client.PutObject/GetObject calls made
+		// directly, not this Uploader's internal decision.
+		u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	})
 	downloader := manager.NewDownloader(client, func(d *manager.Downloader) {
 		d.PartSize = int64(c.PartSizeMiB) * mib
