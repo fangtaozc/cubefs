@@ -1098,3 +1098,17 @@ func (api *AdminAPI) GetRemoteCacheConfig() (config *proto.RemoteCacheConfig, er
 	err = api.mc.requestWith(config, newRequest(get, proto.AdminGetRemoteCacheConfig).Header(api.h))
 	return
 }
+
+// GetOSSAccelChangelogRule fetches vol's oss-accel changelog sync rule —
+// 差距分析续(对照 AFM/EFC 一致性自省能力): exposes ConsecutiveFailures/
+// SkipAfterFailures/LastRunResult, which were already persisted server-side
+// (master/api_service_oss_accel_changelog_rule.go getOSSAccelChangelogRule)
+// but had no cfs-cli surface, so an operator had no way to check a vol's
+// sync health short of hand-rolling a curl to the REST endpoint.
+func (api *AdminAPI) GetOSSAccelChangelogRule(vol string) (rule *proto.OSSAccelChangelogRule, err error) {
+	rule = &proto.OSSAccelChangelogRule{}
+	err = api.mc.requestWith(rule, newRequest(get, proto.OSSAccelChangelogRuleGet).Header(api.h).Param(
+		anyParam{"name", vol},
+	))
+	return
+}

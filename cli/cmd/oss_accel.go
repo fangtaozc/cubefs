@@ -69,6 +69,11 @@ const (
 	cmdOssAccelWTDelUse   = "delete [volname]"
 	cmdOssAccelWTDelShort = "remove the volume's write-through config (falls back to off)"
 	cmdOssAccelWTShort    = "Manage a volume's S3-gateway write-through mode: push newly PUT objects to the cold backend at write time (off/async/sync)"
+
+	cmdOssAccelChangelogUse         = "changelog [COMMAND]"
+	cmdOssAccelChangelogShort       = "Inspect a volume's oss-accel changelog sync state (multi-cluster consistency self-inspection)"
+	cmdOssAccelChangelogStatusUse   = "status [volname]"
+	cmdOssAccelChangelogStatusShort = "show the volume's changelog sync health: consecutive failures, dead-letter skip threshold, last run result"
 )
 
 func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
@@ -80,7 +85,7 @@ func newOssAccelCmd(client *master.MasterClient) *cobra.Command {
 	}
 	proto.InitBufferPool(32768)
 	cmd.AddCommand(newOssAccelBackendCmd(client), newOssAccelPinCmd(client), newOssAccelRoleCmd(client),
-		newOssAccelWriteThroughCmd(client))
+		newOssAccelWriteThroughCmd(client), newOssAccelChangelogCmd(client))
 	return cmd
 }
 
@@ -607,6 +612,53 @@ func newOssAccelWriteThroughDeleteCmd(client *master.MasterClient) *cobra.Comman
 				return
 			}
 			stdout("vol[%v] oss-accel write-through config removed — falls back to %q\n", volName, proto.OSSAccelWriteThroughOff)
+		},
+	}
+	return cmd
+}
+
+// 差距分析续(对照 AFM/EFC 一致性自省能力): ConsecutiveFailures/SkipAfter-
+// Failures/LastRunResult were already persisted master-side (master/
+// oss_accel_changelog_rule_manager.go) with a REST GET endpoint, but no
+// cfs-cli surface — an operator had to hand-roll a curl to check a vol's
+// sync health. This talks to MASTER (client.AdminAPI()), not a volume-root
+// xattr — unlike backend/role/write-through above, this data lives in the
+// rule object master persists via raft, not on the volume itself.
+func newOssAccelChangelogCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelChangelogUse,
+		Short: cmdOssAccelChangelogShort,
+		Args:  cobra.MinimumNArgs(0),
+	}
+	cmd.AddCommand(newOssAccelChangelogStatusCmd(client))
+	return cmd
+}
+
+func newOssAccelChangelogStatusCmd(client *master.MasterClient) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   cmdOssAccelChangelogStatusUse,
+		Short: cmdOssAccelChangelogStatusShort,
+		Args:  cobra.MinimumNArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			volName := args[0]
+			rule, err := client.AdminAPI().GetOSSAccelChangelogRule(volName)
+			if err != nil {
+				stdout("get oss-accel changelog rule failed: %v\n", err)
+				return
+			}
+			lastRunAt := "never"
+			if !rule.LastRunAt.IsZero() {
+				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
+			}
+			stdout("vol[%v] oss-accel changelog sync status:\n", volName)
+			stdout("  enabled              : %v\n", rule.Enabled)
+			stdout("  consecutiveFailures  : %v\n", rule.ConsecutiveFailures)
+			stdout("  skipAfterFailures    : %v\n", rule.SkipAfterFailures)
+			stdout("  lastRunAt            : %v\n", lastRunAt)
+			stdout("  lastRunResult        : %v\n", rule.LastRunResult)
+			if rule.SkipAfterFailures > 0 && rule.ConsecutiveFailures+1 >= rule.SkipAfterFailures {
+				stdout("  note: next failure on the current cursor line will be dead-letter-skipped (advances past it) rather than retried\n")
+			}
 		},
 	}
 	return cmd

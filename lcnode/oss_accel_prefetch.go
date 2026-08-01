@@ -50,6 +50,39 @@ type ossAccelPrefetchCandidate struct {
 	checksum string
 }
 
+// ossAccelResolvePrefetchCandidate looks up a single path and classifies it
+// for prefetch purposes — shared by runOssAccelPrefetchForVol's single-path
+// branch and the batch prefetch task (oss_accel_prefetch_batch.go), so the
+// two never drift on what counts as "already hot" vs "dangling" vs "a real
+// candidate". Returns exactly one of: (candidate, false, false, nil) — a
+// real BlobStore file to recall; (nil, true, false, nil) — already Replica,
+// nothing to do; (nil, false, true, nil) — a prior audit marked this s3key
+// unrecoverable, matches recall's own fast-fail contract; or a non-nil err
+// for a genuine lookup/metadata failure.
+func ossAccelResolvePrefetchCandidate(metaWrapper *meta.MetaWrapper, path string) (cand *ossAccelPrefetchCandidate, alreadyHot, dangling bool, err error) {
+	ino, lerr := metaWrapper.LookupPath(path)
+	if lerr != nil {
+		return nil, false, false, fmt.Errorf("LookupPath(%v) err: %v", path, lerr)
+	}
+	info, gerr := metaWrapper.InodeGet_ll(ino)
+	if gerr != nil || info == nil {
+		return nil, false, false, fmt.Errorf("InodeGet_ll(%v) err: %v", ino, gerr)
+	}
+	if info.StorageClass != proto.StorageClass_BlobStore {
+		return nil, true, false, nil
+	}
+	xattrs, xerr := metaWrapper.BatchGetXAttr([]uint64{ino}, []string{proto.XAttrKeyOSSAccelState, proto.XAttrKeyOSSAccelChecksum})
+	var state, checksum string
+	if xerr == nil && len(xattrs) > 0 {
+		state = xattrs[0].XAttrs[proto.XAttrKeyOSSAccelState]
+		checksum = strings.TrimPrefix(xattrs[0].XAttrs[proto.XAttrKeyOSSAccelChecksum], proto.ChecksumPrefixSHA256)
+	}
+	if state == proto.ColdStateError {
+		return nil, false, true, nil
+	}
+	return &ossAccelPrefetchCandidate{path: path, ino: ino, size: info.Size, checksum: checksum}, false, false, nil
+}
+
 // runOssAccelPrefetchForVol eagerly recalls already-materialized cold files —
 // path selects exactly one file, prefix walks the volume (reusing
 // walkOssAccelTree, the same traversal audit/integrity use) and selects every
@@ -88,27 +121,17 @@ func (l *LcNode) runOssAccelPrefetchForVol(vol, path, prefix string, vsc uint32,
 	var candidates []ossAccelPrefetchCandidate
 
 	if path != "" {
-		ino, lerr := metaWrapper.LookupPath(path)
-		if lerr != nil {
-			return 0, 0, 0, 0, fmt.Errorf("LookupPath(%v) err: %v", path, lerr)
+		cand, alreadyHotOne, danglingOne, rerr := ossAccelResolvePrefetchCandidate(metaWrapper, path)
+		if rerr != nil {
+			return 0, 0, 0, 0, rerr
 		}
-		info, gerr := metaWrapper.InodeGet_ll(ino)
-		if gerr != nil || info == nil {
-			return 0, 0, 0, 0, fmt.Errorf("InodeGet_ll(%v) err: %v", ino, gerr)
-		}
-		if info.StorageClass != proto.StorageClass_BlobStore {
+		if alreadyHotOne {
 			return 0, 1, 0, 0, nil // already hot — nothing to prefetch
 		}
-		xattrs, xerr := metaWrapper.BatchGetXAttr([]uint64{ino}, []string{proto.XAttrKeyOSSAccelState, proto.XAttrKeyOSSAccelChecksum})
-		var state, checksum string
-		if xerr == nil && len(xattrs) > 0 {
-			state = xattrs[0].XAttrs[proto.XAttrKeyOSSAccelState]
-			checksum = strings.TrimPrefix(xattrs[0].XAttrs[proto.XAttrKeyOSSAccelChecksum], proto.ChecksumPrefixSHA256)
-		}
-		if state == proto.ColdStateError {
+		if danglingOne {
 			return 0, 0, 1, 0, nil // confirmed-dangling reference — not retryable here, matches recall's own fast-fail
 		}
-		candidates = append(candidates, ossAccelPrefetchCandidate{path: path, ino: ino, size: info.Size, checksum: checksum})
+		candidates = append(candidates, *cand)
 	} else {
 		werr := walkOssAccelTree(metaWrapper, "prefetch", func(mw *meta.MetaWrapper, parentIno uint64, walkPath string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
 			s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]

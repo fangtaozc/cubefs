@@ -71,6 +71,17 @@ type LcNode struct {
 	// back to the existing waitForConcurrentRecallWinner poll rather than
 	// blocking indefinitely.
 	ossAccelRecallLimit *concurrent.KeyConcurrentLimit
+
+	// ossAccelBatchTasks: in-memory registry of batch prefetch tasks
+	// (oss_accel_prefetch_batch.go) submitted to THIS lcnode process.
+	// Deliberately process-local, not raft-backed — see plan doc: a batch
+	// prefetch task is an optimization (eagerly warming already-known cold
+	// files), not a correctness-critical operation, so losing in-flight
+	// progress on a process restart is an acceptable tradeoff for not
+	// introducing master-side scheduling/persistence for something that
+	// doesn't need cross-node coordination in the first place.
+	ossAccelBatchTasksMu sync.Mutex
+	ossAccelBatchTasks   map[string]*ossAccelBatchPrefetchTask
 }
 
 func NewServer() *LcNode {
@@ -78,6 +89,7 @@ func NewServer() *LcNode {
 		lcScanners:          make(map[string]*LcScanner),
 		snapshotScanners:    make(map[string]*SnapshotScanner),
 		ossAccelRecallLimit: concurrent.NewLimit(),
+		ossAccelBatchTasks:  make(map[string]*ossAccelBatchPrefetchTask),
 	}
 }
 
@@ -450,6 +462,12 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelPrefetch").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelPrefetch))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelPrefetchBatch").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelPrefetchBatch))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelPrefetchBatchStatus").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelPrefetchBatchStatus))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

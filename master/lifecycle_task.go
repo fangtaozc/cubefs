@@ -20,6 +20,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/auditlog"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -124,6 +125,18 @@ func (c *Cluster) handleLcNodeOssAccelChangelogSyncResp(nodeAddr string, resp *p
 		return err
 	}
 	c.ossAccelChangelogRuleCache.Put(&updated)
+	// 差距分析续(对照 AFM/EFC 一致性自省能力): ConsecutiveFailures already
+	// persisted above but was only ever read back by internal dead-letter
+	// logic (runOssAccelChangelogSync's skipAfterFailures check) — an
+	// operator had no external way to see "this vol's sync has failed N
+	// times in a row" short of GET /ossAccelChangelogRule/get and reading
+	// the JSON field by hand. No extra leader guard needed: lcnode always
+	// posts its task response to MasterClient's leaderAddr (sdk/master/
+	// client.go prepareRequest), so this handler only ever actually runs on
+	// whichever master is currently leader — same implicit scope as
+	// oss_accel_usage_ratio, just enforced by the caller instead of by a
+	// Start()/Stop() lifecycle on this side.
+	exporter.NewGauge("oss_accel_changelog_consecutive_failures").SetWithLabels(float64(updated.ConsecutiveFailures), map[string]string{exporter.Vol: resp.VolName})
 	log.LogInfof("handleLcNodeOssAccelChangelogSyncResp: vol(%v) lcnode(%v) result(%v)", resp.VolName, nodeAddr, updated.LastRunResult)
 	return nil
 }

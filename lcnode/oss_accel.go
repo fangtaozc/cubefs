@@ -1245,6 +1245,18 @@ func effectiveOssAccelChangelogKey(changelogKey string) string {
 // when Failed>0, reset to 0 on a clean run) and passing the current value
 // back in. 0/0 (the manual HTTP endpoint's fixed arguments) preserves the
 // original never-skip behavior exactly.
+// ossAccelChangelogLagBytes is how far this vol's consumed cursor trails the
+// changelog object's current size. changelogSize < cursor shouldn't happen
+// in the normal append-only case, but an externally truncated/replaced
+// changelog object isn't impossible — clamped to 0 rather than returning a
+// nonsensical negative lag.
+func ossAccelChangelogLagBytes(changelogSize, cursor uint64) uint64 {
+	if changelogSize <= cursor {
+		return 0
+	}
+	return changelogSize - cursor
+}
+
 func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string, skipAfterFailures, consecutiveFailures uint32) (processed, skipped, failed int, cursor, newCursor uint64, err error) {
 	defer ossAccelObserve("changelogSync", vol, &err)()
 	changelogKey = effectiveOssAccelChangelogKey(changelogKey)
@@ -1273,6 +1285,15 @@ func (l *LcNode) runOssAccelChangelogSync(vol, prefix, changelogKey string, skip
 	if headErr != nil {
 		return 0, 0, 0, cursor, cursor, fmt.Errorf("s3 head changelog(%v) err: %v", changelogKey, headErr)
 	}
+	// 差距分析续(对照 AFM/EFC 一致性自省能力): this was computed implicitly
+	// by the <= comparison below but never surfaced — an operator had no
+	// way to tell "this vol's secondary is 3 bytes behind" from "3 GB
+	// behind" without reading both the cursor xattr and doing a manual S3
+	// Head themselves. ossAccelChangelogLagBytes is a separate function
+	// purely so the clamp-to-0 edge case is unit-testable without a real S3
+	// backend.
+	lagBytes := ossAccelChangelogLagBytes(uint64(changelogSize), cursor)
+	exporter.NewGauge("oss_accel_changelog_lag_bytes").SetWithLabels(float64(lagBytes), map[string]string{exporter.Vol: vol})
 	if uint64(changelogSize) <= cursor {
 		return 0, 0, 0, cursor, cursor, nil // no new events
 	}
