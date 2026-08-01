@@ -255,6 +255,32 @@ func New(cfg interface{}) (backend.Backend, error) {
 
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(c.Region),
+		// aws-sdk-go-v2 defaults RequestChecksumCalculation to
+		// WhenSupported: PutObject/UploadPart bodies get an automatic
+		// trailing checksum sent via aws-chunked transfer encoding whenever
+		// the operation supports it, regardless of whether this backend's
+		// own sha256 (mergeMetadata, stamped as user-metadata) is in play.
+		// Many S3-compatible services besides AWS itself don't implement
+		// aws-chunked decoding and fail the request outright — observed
+		// against 百度 BOS as a 400 "ReadBodyError: Read http body error"
+		// on multipart UploadPart specifically (single-shot PutObject uses
+		// a seekable io.ReadSeeker body and takes a different, unaffected
+		// code path, which is why small objects worked while large ones
+		// didn't). WhenRequired means the checksum is only added when a
+		// caller explicitly asks for one — this backend never does, so this
+		// is a pure opt-out with no loss: correctness still comes from our
+		// own sha256 in user-metadata (Put/GetChecksum), not the SDK's.
+		awsconfig.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired),
+		// Same rationale, response side: WhenSupported (the SDK default)
+		// validates a response checksum whenever the server sends one,
+		// which for a non-AWS S3-compatible service can mean validating
+		// against a checksum algorithm/format the service computed
+		// differently than AWS does — a spurious validation failure on
+		// otherwise-correct data. WhenRequired only validates when this
+		// backend explicitly opts in (it doesn't; Get/GetConcurrent verify
+		// via our own sha256 metadata or the caller's readback, not SDK
+		// response-checksum validation).
+		awsconfig.WithResponseChecksumValidation(aws.ResponseChecksumValidationWhenRequired),
 	}
 	if ak != "" && sk != "" {
 		loadOpts = append(loadOpts,
