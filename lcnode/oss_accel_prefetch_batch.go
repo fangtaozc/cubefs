@@ -42,7 +42,29 @@ import (
 // internally. Not tuned against any measured limit, just a sane stop against
 // an accidental multi-million-entry submission; raise it if a real workload
 // needs more (see plan doc — YAGNI on auto-sharding).
+//
+// This is also the source of a real per-path RPC cost worth calling out
+// explicitly: runOssAccelPrefetchBatch re-checks usage via
+// ossAccelVolUsageRatio (a Statfs RPC to metanode) before EVERY path, not
+// once up front — so a 1000-path batch is up to 1000 extra Statfs calls
+// against metanode, on top of the LookupPath/InodeGet_ll/BatchGetXAttr calls
+// ossAccelResolvePrefetchCandidate already makes per path. This is a
+// deliberate correctness tradeoff (a long-running batch can't safely reuse a
+// stale usage snapshot — see runOssAccelPrefetchBatch's doc comment), not an
+// oversight, but it has not been load-tested against metanode at the max
+// batch size; if metanode RPC load becomes a real concern, the fix is a
+// bounded-staleness cache of usageRatio (re-check at most every N seconds),
+// not silently reverting to a single up-front check.
 const ossAccelBatchPrefetchMaxPaths = 1000
+
+// ossAccelBatchTaskRetention is how long a finished (done/failed) task stays
+// queryable after FinishedAt before it's dropped from LcNode.ossAccelBatch-
+// Tasks. Without this the registry only ever grows — every submission adds
+// an entry and nothing ever removes one, which for a long-lived lcnode
+// process under continuous batch-prefetch use is a real (if slow) memory
+// leak. 30 minutes is enough for a caller to poll status after completion
+// without racing the cleanup; not tied to any measured workload.
+const ossAccelBatchTaskRetention = 30 * time.Minute
 
 const (
 	ossAccelBatchStatusRunning = "running"
@@ -169,7 +191,7 @@ func (l *LcNode) httpServiceOssAccelPrefetchBatch(w http.ResponseWriter, r *http
 	l.ossAccelBatchTasks[task.ID] = task
 	l.ossAccelBatchTasksMu.Unlock()
 
-	go l.runOssAccelPrefetchBatch(task, paths, vsc, asc, maxUsageRatio)
+	go l.runOssAccelPrefetchBatchGuarded(task, paths, vsc, asc, maxUsageRatio)
 
 	fmt.Fprintf(w, "ok: taskId=%v vol=%v total=%v\n", task.ID, vol, len(paths))
 }
@@ -199,13 +221,53 @@ func (l *LcNode) httpServiceOssAccelPrefetchBatchStatus(w http.ResponseWriter, r
 	}
 }
 
-// runOssAccelPrefetchBatch is the background worker for one submitted batch.
-// Unlike runOssAccelPrefetchForVol's single up-front capacity check (safe
-// there because that call is short-lived and usage is monotonically
-// non-decreasing across it), a batch can run for a long time — usage is
-// re-checked before EACH path so a batch that starts under the watermark but
-// crosses it partway through stops cleanly instead of overshooting on stale
-// information.
+// runOssAccelPrefetchBatchGuarded wraps runOssAccelPrefetchBatch with a
+// panic recover and the task's post-completion self-cleanup — split out so
+// the actual batch logic doesn't have to interleave with either concern.
+// The recover matters here specifically because this runs unsupervised on
+// its own goroutine (go l.runOssAccelPrefetchBatchGuarded(...) in the submit
+// handler): every other long-lived lcnode goroutine (lc_op.go's
+// respondToMaster, server.go's stopServer, snapshot_scanner.go) recovers a
+// panic into a log line, not a crashed process — an unrecovered panic here
+// would take down the WHOLE lcnode process (every other in-flight
+// recall/flush/audit on it, not just this one batch) over what might be a
+// single malformed candidate.
+func (l *LcNode) runOssAccelPrefetchBatchGuarded(task *ossAccelBatchPrefetchTask, paths []string, vsc uint32, asc []uint32, maxUsageRatio float64) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.LogErrorf("runOssAccelPrefetchBatchGuarded: taskId(%v) vol(%v) recovered panic: %v", task.ID, task.Vol, r)
+			task.mu.Lock()
+			task.status = ossAccelBatchStatusFailed
+			task.finishedAt = time.Now()
+			task.mu.Unlock()
+		}
+		// Self-cleanup: without this, ossAccelBatchTasks only ever grows —
+		// every submission adds an entry, nothing removes one, which is a
+		// slow but real memory leak for a long-lived lcnode process under
+		// continuous batch-prefetch use (see ossAccelBatchTaskRetention's
+		// doc comment). Scheduled AFTER the task is actually marked
+		// done/failed above (or by runOssAccelPrefetchBatch's own defer, in
+		// the non-panic case) so a status query landing in between still
+		// sees the terminal state, not a task that vanished mid-transition.
+		time.AfterFunc(ossAccelBatchTaskRetention, func() {
+			l.ossAccelBatchTasksMu.Lock()
+			delete(l.ossAccelBatchTasks, task.ID)
+			l.ossAccelBatchTasksMu.Unlock()
+		})
+	}()
+	l.runOssAccelPrefetchBatch(task, paths, vsc, asc, maxUsageRatio)
+}
+
+// runOssAccelPrefetchBatch is the actual batch worker, called only from
+// runOssAccelPrefetchBatchGuarded above (recover + self-cleanup live there,
+// not here, so this function's control flow stays focused on the batch
+// logic itself). Unlike runOssAccelPrefetchForVol's single up-front capacity
+// check (safe there because that call is short-lived and usage is
+// monotonically non-decreasing across it), a batch can run for a long time
+// — usage is re-checked before EACH path so a batch that starts under the
+// watermark but crosses it partway through stops cleanly instead of
+// overshooting on stale information. See ossAccelBatchPrefetchMaxPaths's doc
+// comment for the RPC-cost tradeoff this implies at the max batch size.
 func (l *LcNode) runOssAccelPrefetchBatch(task *ossAccelBatchPrefetchTask, paths []string, vsc uint32, asc []uint32, maxUsageRatio float64) {
 	var err error
 	defer ossAccelObserve("prefetchBatch", task.Vol, &err)()
