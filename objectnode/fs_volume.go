@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -150,6 +151,17 @@ type Volume struct {
 	closeCh   chan struct{}
 
 	onAsyncTaskError AsyncTaskErrorFunc
+
+	// 对齐AFM(队列深度可见性续三): write-through async has no queue structure
+	// at all — each write spawns its own goroutine directly (see
+	// ossAccelWriteThroughAsyncAfterPublish below), so unlike flush-policy's
+	// candidate slice or lcnode's inflight-recall limiter there was nothing
+	// to snapshot. This is the one genuinely real-time depth signal of the
+	// three: it changes the instant a goroutine starts/ends, not on a
+	// periodic sweep. Per-volume (not a package-level counter) so the
+	// exported gauge's exporter.Vol label always matches the count it's
+	// reporting.
+	ossAccelWriteThroughAsyncInflight atomic.Int64
 }
 
 func (v *Volume) GetOwner() string {
@@ -1889,12 +1901,22 @@ func (v *Volume) ossAccelWriteThroughAsyncAfterPublish(inode, size uint64, path 
 	if v.ossAccelWriteThroughMode() != proto.OSSAccelWriteThroughAsync {
 		return
 	}
+	v.ossAccelReportWriteThroughAsyncInflight(v.ossAccelWriteThroughAsyncInflight.Add(1))
 	go func() {
+		defer v.ossAccelReportWriteThroughAsyncInflight(v.ossAccelWriteThroughAsyncInflight.Add(-1))
 		if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
 			log.LogWarnf("ossAccelWriteThroughAsyncAfterPublish: volume(%v) inode(%v) path(%v) async write-through failed (write already acked; the object still reaches the cold tier via the flush policy): %v",
 				v.name, inode, path, err)
 		}
 	}()
+}
+
+// ossAccelReportWriteThroughAsyncInflight exports the post-update count —
+// called from both the increment (before the goroutine starts) and the
+// decrement (deferred inside it), so the gauge changes at exactly the two
+// moments the real in-flight count changes, with no separate ticker.
+func (v *Volume) ossAccelReportWriteThroughAsyncInflight(count int64) {
+	exporter.NewGauge("oss_accel_write_through_async_inflight").SetWithLabels(float64(count), map[string]string{exporter.Vol: v.name})
 }
 
 func (v *Volume) readFile(inode, inodeSize uint64, path string, writer io.Writer, offset, size uint64, storageClass uint32) (err error) {

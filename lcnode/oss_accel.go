@@ -566,6 +566,16 @@ func (l *LcNode) httpServiceOssAccelRecall(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer l.ossAccelReleaseRecallSlots(recallKey)
+	// 差距分析续四(对照 AFM Queue Length): ossAccelInflightRecallLimit.
+	// Running() has been tracking this number in memory since the
+	// aggregate-concurrency cap shipped, but nothing ever exported it — no
+	// periodic ticker needed, a slot-acquisition event is already exactly
+	// when the count is guaranteed to have just changed, so piggyback the
+	// export here rather than adding a new goroutine. Process-wide, not
+	// per-vol (unlike every other oss-accel gauge) — there's deliberately no
+	// exporter.Vol label, since the underlying limiter isn't scoped per-vol
+	// either.
+	exporter.NewGauge("oss_accel_inflight_recalls").Set(float64(l.ossAccelInflightRecallLimit.Running()))
 
 	// Per-vol backend override lives on this vol's own root inode, so the S3
 	// config can only be resolved once metaWrapper (above) exists.

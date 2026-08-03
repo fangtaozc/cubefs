@@ -22,6 +22,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -159,6 +160,15 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 	if werr != nil {
 		return scanned, 0, skipped, 0, fmt.Errorf("walkOssAccelTree err: %v", werr)
 	}
+	// 对齐AFM(队列深度可见性续): snapshot of what THIS sweep found, exported
+	// right after the walk finishes and before any flushing starts — so it
+	// reflects "how much backlog exists" even on a run where every candidate
+	// later fails to flush. Not a live/persisted queue: flush-policy has no
+	// queue at all, only a periodic full-tree walk (see this function's doc
+	// comment), so this number is frozen between sweeps and jumps discretely
+	// on the next one — a coarser signal than AFM's real queue length, but
+	// the cheapest one available without turning this sweep into an index.
+	exporter.NewGauge("oss_accel_flush_policy_candidates").SetWithLabels(float64(len(candidates)), map[string]string{exporter.Vol: vol})
 	if len(candidates) == 0 {
 		return scanned, 0, skipped, 0, nil
 	}

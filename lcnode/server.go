@@ -492,6 +492,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelPrefetchBatchStatus").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelPrefetchBatchStatus))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelDelete").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelDelete))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{
