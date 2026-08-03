@@ -166,30 +166,47 @@ type Volume struct {
 	// 对齐AFM(写合并第二轮): AFM's AsyncDelay coalesces same-file writes
 	// within its delay window into a single upload; write-through-async had
 	// no equivalent — each completed write spawned its own goroutine
-	// directly, so N rapid overwrites of the same key raced N concurrent
+	// directly, so N rapid overwrites of the same S3 key raced N concurrent
 	// uploads with no ordering guarantee tied to which write was actually
-	// newest. ossAccelWriteThroughCoalesce (key: inode uint64, value:
+	// newest. ossAccelWriteThroughCoalesce (key: the S3 path string, value:
 	// *ossAccelWriteThroughCoalesceState) makes at most one upload run at a
-	// time per inode — see ossAccelWriteThroughAsyncAfterPublish below.
+	// time per key — see ossAccelWriteThroughAsyncAfterPublish below.
+	//
+	// KEYED BY PATH, NOT INODE — this is load-bearing, not a style choice.
+	// Every successful PutObject/CompleteMultipart allocates a BRAND NEW
+	// temp inode and republishes the dentry onto it (see
+	// invisibleTempDataInode/completeInodeInfo at the call sites below);
+	// two separate PUTs to the SAME key therefore carry two DIFFERENT inode
+	// numbers. Keying by inode was tried first and verified WRONG on real
+	// hardware: back-to-back PUTs to one key each get their own coalescing
+	// entry and race independently, exactly the bug this feature exists to
+	// close. The S3 key is the one identifier that stays constant across
+	// repeated writes to "the same object," matching AFM's own notion of
+	// "same file" (AFM's cached inode is stable across in-place POSIX
+	// writes; ObjectNode's is not, but the key is).
 	//
 	// Entries are never deleted: doing so races a new write's LoadOrStore
 	// against the in-flight goroutine's own decision to delete once it goes
 	// idle (the new write could grab the about-to-be-deleted entry, set
 	// inflight=true, and then have it erased out from under it — the next
 	// write would then create a SECOND independent state object for the
-	// same inode, reintroducing the exact "more than one concurrent upload"
+	// same key, reintroducing the exact "more than one concurrent upload"
 	// problem this exists to prevent). The accepted cost is a sync.Map that
-	// grows with the number of distinct inodes this objectnode process has
+	// grows with the number of distinct keys this objectnode process has
 	// ever async-write-through'd — bounded by the volume's real file count,
 	// and each entry is only a mutex + bool + pointer.
 	ossAccelWriteThroughCoalesce sync.Map
 }
 
 // ossAccelWriteThroughQueuedWrite is the most recent write recorded while an
-// async push for its inode was already in flight.
+// async push for its S3 key was already in flight. inode is carried
+// separately from the map key (which is path) because each PUT to the same
+// key uses its own fresh temp inode — the queued write's inode is the one
+// that must actually be uploaded once it's this write's turn.
 type ossAccelWriteThroughQueuedWrite struct {
-	size uint64
-	path string
+	inode uint64
+	size  uint64
+	path  string
 }
 
 // ossAccelWriteThroughCoalesceState tracks, per inode, whether an async
@@ -1938,17 +1955,19 @@ func (v *Volume) ossAccelWriteThroughAsyncAfterPublish(inode, size uint64, path 
 	if v.ossAccelWriteThroughMode() != proto.OSSAccelWriteThroughAsync {
 		return
 	}
-	stateAny, _ := v.ossAccelWriteThroughCoalesce.LoadOrStore(inode, &ossAccelWriteThroughCoalesceState{})
+	stateAny, _ := v.ossAccelWriteThroughCoalesce.LoadOrStore(path, &ossAccelWriteThroughCoalesceState{})
 	state := stateAny.(*ossAccelWriteThroughCoalesceState)
 
 	state.mu.Lock()
 	if state.inflight {
-		// 对齐AFM(写合并第二轮): a push for this inode is already running —
-		// record this write as the one to re-push once it finishes, instead
-		// of starting a second concurrent upload racing the first (two
-		// goroutines uploading the same key with no ordering guarantee tied
-		// to which write was actually newer).
-		state.queued = &ossAccelWriteThroughQueuedWrite{size: size, path: path}
+		// 对齐AFM(写合并第二轮): a push for this KEY is already running —
+		// record this write (and its own fresh inode — see
+		// ossAccelWriteThroughCoalesce's doc comment for why the map is
+		// keyed by path, not inode) as the one to re-push once it finishes,
+		// instead of starting a second concurrent upload racing the first
+		// (two goroutines uploading the same key with no ordering guarantee
+		// tied to which write was actually newer).
+		state.queued = &ossAccelWriteThroughQueuedWrite{inode: inode, size: size, path: path}
 		state.mu.Unlock()
 		return
 	}
@@ -1961,9 +1980,9 @@ func (v *Volume) ossAccelWriteThroughAsyncAfterPublish(inode, size uint64, path 
 
 // ossAccelRunWriteThroughAsyncCoalesced runs the async write-through push,
 // then checks whether another write arrived while it was uploading. If so,
-// it loops and pushes again immediately with the LATEST queued size/path
-// instead of returning — collapsing however many overwrites landed during
-// the upload into at most one extra trip, mirroring AFM's AsyncDelay
+// it loops and pushes again immediately with the LATEST queued inode/size/
+// path instead of returning — collapsing however many overwrites landed
+// during the upload into at most one extra trip, mirroring AFM's AsyncDelay
 // (which coalesces same-file writes within its delay window into a single
 // flush) without imposing a fixed delay on the common single-write case.
 func (v *Volume) ossAccelRunWriteThroughAsyncCoalesced(state *ossAccelWriteThroughCoalesceState, inode, size uint64, path string) {
@@ -1982,7 +2001,7 @@ func (v *Volume) ossAccelRunWriteThroughAsyncCoalesced(state *ossAccelWriteThrou
 			return
 		}
 		state.mu.Unlock()
-		size, path = queued.size, queued.path
+		inode, size, path = queued.inode, queued.size, queued.path
 	}
 }
 
