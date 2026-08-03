@@ -72,6 +72,51 @@ type ossAccelFlushPolicyCandidate struct {
 	sc   uint32
 }
 
+// ossAccelFlushCandidateVerdict distinguishes "not applicable at all" from
+// "applicable but doesn't qualify yet" — runOssAccelFlushPolicyForVol needs
+// this distinction to keep its scanned/skipped counters exactly as they were
+// before this predicate was extracted (skipped only counts near-misses on
+// size/idle, never pin/already-tiered/wrong-storage-class).
+type ossAccelFlushCandidateVerdict int
+
+const (
+	// ossAccelFlushCandidateNotEligible: pinned, already tiered out (has an
+	// s3key), or not a plain replica-class file — not flush-policy's
+	// business at all, not counted as a near-miss.
+	ossAccelFlushCandidateNotEligible ossAccelFlushCandidateVerdict = iota
+	// ossAccelFlushCandidateTooYoungOrSmall: a genuine never-tiered
+	// candidate that just hasn't earned its flush yet (too small, or not
+	// idle long enough).
+	ossAccelFlushCandidateTooYoungOrSmall
+	// ossAccelFlushCandidateMatch: qualifies for flush right now.
+	ossAccelFlushCandidateMatch
+)
+
+// ossAccelIsFlushCandidate is the pure predicate both
+// runOssAccelFlushPolicyForVol (the scheduled sweep) and
+// httpServiceOssAccelListFlushCandidates (the read-only checkDirty-style
+// inventory query, lcnode/oss_accel_inventory.go) filter on — extracted so
+// the two call sites can never silently drift apart on what "a flush
+// candidate" means.
+func ossAccelIsFlushCandidate(xattrs map[string]string, info *proto.InodeInfo, now time.Time, minSizeBytes uint64, idleThreshold time.Duration) ossAccelFlushCandidateVerdict {
+	if xattrs[proto.XAttrKeyOSSAccelPin] == "true" {
+		return ossAccelFlushCandidateNotEligible
+	}
+	if xattrs[proto.XAttrKeyOSSAccelS3Key] != "" {
+		return ossAccelFlushCandidateNotEligible // already tiered out at some point — runOssAccelEvictionSweep's job, not this one's
+	}
+	if !proto.IsStorageClassReplica(info.StorageClass) {
+		return ossAccelFlushCandidateNotEligible // defensive — a never-tiered file should always be a replica class
+	}
+	if info.Size < minSizeBytes {
+		return ossAccelFlushCandidateTooYoungOrSmall
+	}
+	if now.Sub(info.ModifyTime) < idleThreshold {
+		return ossAccelFlushCandidateTooYoungOrSmall
+	}
+	return ossAccelFlushCandidateMatch
+}
+
 // runOssAccelFlushPolicyForVol walks vol once, flushing+committing-cold
 // every never-tiered file that's been idle at least minIdleHours and is at
 // least minSizeBytes. Returns how many candidates were considered
@@ -137,20 +182,10 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 			return nil
 		}
 		scanned++
-		if xattrs[proto.XAttrKeyOSSAccelPin] == "true" {
+		switch ossAccelIsFlushCandidate(xattrs, info, now, minSizeBytes, idleThreshold) {
+		case ossAccelFlushCandidateNotEligible:
 			return nil
-		}
-		if xattrs[proto.XAttrKeyOSSAccelS3Key] != "" {
-			return nil // already tiered out at some point — runOssAccelEvictionSweep's job, not this one's
-		}
-		if !proto.IsStorageClassReplica(info.StorageClass) {
-			return nil // defensive — a never-tiered file should always be a replica class
-		}
-		if info.Size < minSizeBytes {
-			skipped++
-			return nil
-		}
-		if now.Sub(info.ModifyTime) < idleThreshold {
+		case ossAccelFlushCandidateTooYoungOrSmall:
 			skipped++
 			return nil
 		}
@@ -169,6 +204,9 @@ func (l *LcNode) runOssAccelFlushPolicyForVol(vol, prefix string, minIdleHours u
 	// on the next one — a coarser signal than AFM's real queue length, but
 	// the cheapest one available without turning this sweep into an index.
 	exporter.NewGauge("oss_accel_flush_policy_candidates").SetWithLabels(float64(len(candidates)), map[string]string{exporter.Vol: vol})
+	l.ossAccelUpdateOutstandingWork(vol, func(s *ossAccelOutstandingWorkSnapshot) {
+		s.flushPolicyCandidates = len(candidates)
+	})
 	if len(candidates) == 0 {
 		return scanned, 0, skipped, 0, nil
 	}

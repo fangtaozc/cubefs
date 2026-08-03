@@ -22,6 +22,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -102,6 +103,12 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 		return 0, 0, usageRatioAfter, fmt.Errorf("walkOssAccelTree err: %v", werr)
 	}
 	considered = len(candidates)
+	// 对齐AFM(队列观察第二轮): snapshot of this sweep's candidate count,
+	// exported right after the walk finishes and before eviction starts —
+	// same placement convention as oss_accel_flush_policy_candidates. Frozen
+	// between sweeps, not a live queue (eviction has no persisted backlog,
+	// only a periodic full-tree walk — see this function's own doc comment).
+	exporter.NewGauge("oss_accel_eviction_candidates").SetWithLabels(float64(considered), map[string]string{exporter.Vol: vol})
 	if considered == 0 {
 		return 0, 0, usageRatioAfter, nil
 	}

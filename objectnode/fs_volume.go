@@ -162,6 +162,43 @@ type Volume struct {
 	// exported gauge's exporter.Vol label always matches the count it's
 	// reporting.
 	ossAccelWriteThroughAsyncInflight atomic.Int64
+
+	// 对齐AFM(写合并第二轮): AFM's AsyncDelay coalesces same-file writes
+	// within its delay window into a single upload; write-through-async had
+	// no equivalent — each completed write spawned its own goroutine
+	// directly, so N rapid overwrites of the same key raced N concurrent
+	// uploads with no ordering guarantee tied to which write was actually
+	// newest. ossAccelWriteThroughCoalesce (key: inode uint64, value:
+	// *ossAccelWriteThroughCoalesceState) makes at most one upload run at a
+	// time per inode — see ossAccelWriteThroughAsyncAfterPublish below.
+	//
+	// Entries are never deleted: doing so races a new write's LoadOrStore
+	// against the in-flight goroutine's own decision to delete once it goes
+	// idle (the new write could grab the about-to-be-deleted entry, set
+	// inflight=true, and then have it erased out from under it — the next
+	// write would then create a SECOND independent state object for the
+	// same inode, reintroducing the exact "more than one concurrent upload"
+	// problem this exists to prevent). The accepted cost is a sync.Map that
+	// grows with the number of distinct inodes this objectnode process has
+	// ever async-write-through'd — bounded by the volume's real file count,
+	// and each entry is only a mutex + bool + pointer.
+	ossAccelWriteThroughCoalesce sync.Map
+}
+
+// ossAccelWriteThroughQueuedWrite is the most recent write recorded while an
+// async push for its inode was already in flight.
+type ossAccelWriteThroughQueuedWrite struct {
+	size uint64
+	path string
+}
+
+// ossAccelWriteThroughCoalesceState tracks, per inode, whether an async
+// write-through push is currently running and — if a newer write arrived
+// while it was — what to push next once it finishes.
+type ossAccelWriteThroughCoalesceState struct {
+	mu       sync.Mutex
+	inflight bool
+	queued   *ossAccelWriteThroughQueuedWrite
 }
 
 func (v *Volume) GetOwner() string {
@@ -1901,14 +1938,52 @@ func (v *Volume) ossAccelWriteThroughAsyncAfterPublish(inode, size uint64, path 
 	if v.ossAccelWriteThroughMode() != proto.OSSAccelWriteThroughAsync {
 		return
 	}
+	stateAny, _ := v.ossAccelWriteThroughCoalesce.LoadOrStore(inode, &ossAccelWriteThroughCoalesceState{})
+	state := stateAny.(*ossAccelWriteThroughCoalesceState)
+
+	state.mu.Lock()
+	if state.inflight {
+		// 对齐AFM(写合并第二轮): a push for this inode is already running —
+		// record this write as the one to re-push once it finishes, instead
+		// of starting a second concurrent upload racing the first (two
+		// goroutines uploading the same key with no ordering guarantee tied
+		// to which write was actually newer).
+		state.queued = &ossAccelWriteThroughQueuedWrite{size: size, path: path}
+		state.mu.Unlock()
+		return
+	}
+	state.inflight = true
+	state.mu.Unlock()
+
 	v.ossAccelReportWriteThroughAsyncInflight(v.ossAccelWriteThroughAsyncInflight.Add(1))
-	go func() {
-		defer v.ossAccelReportWriteThroughAsyncInflight(v.ossAccelWriteThroughAsyncInflight.Add(-1))
+	go v.ossAccelRunWriteThroughAsyncCoalesced(state, inode, size, path)
+}
+
+// ossAccelRunWriteThroughAsyncCoalesced runs the async write-through push,
+// then checks whether another write arrived while it was uploading. If so,
+// it loops and pushes again immediately with the LATEST queued size/path
+// instead of returning — collapsing however many overwrites landed during
+// the upload into at most one extra trip, mirroring AFM's AsyncDelay
+// (which coalesces same-file writes within its delay window into a single
+// flush) without imposing a fixed delay on the common single-write case.
+func (v *Volume) ossAccelRunWriteThroughAsyncCoalesced(state *ossAccelWriteThroughCoalesceState, inode, size uint64, path string) {
+	for {
 		if err := v.ossAccelWriteThroughHook(inode, size, path); err != nil {
 			log.LogWarnf("ossAccelWriteThroughAsyncAfterPublish: volume(%v) inode(%v) path(%v) async write-through failed (write already acked; the object still reaches the cold tier via the flush policy): %v",
 				v.name, inode, path, err)
 		}
-	}()
+		state.mu.Lock()
+		queued := state.queued
+		state.queued = nil
+		if queued == nil {
+			state.inflight = false
+			state.mu.Unlock()
+			v.ossAccelReportWriteThroughAsyncInflight(v.ossAccelWriteThroughAsyncInflight.Add(-1))
+			return
+		}
+		state.mu.Unlock()
+		size, path = queued.size, queued.path
+	}
 }
 
 // ossAccelReportWriteThroughAsyncInflight exports the post-update count —

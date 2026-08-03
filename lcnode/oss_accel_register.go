@@ -38,6 +38,7 @@ import (
 
 	"github.com/cubefs/cubefs/syncnode/backend"
 	"github.com/cubefs/cubefs/syncnode/backend/s3"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -122,6 +123,14 @@ func (l *LcNode) runOssAccelRegisterForVol(vol string, keys []string, prefix str
 		for _, k := range keys {
 			register(k)
 		}
+		// 对齐AFM(队列观察第二轮): "how many previously-unknown-to-CubeFS S3
+		// objects did the last scan just adopt" — the direct parallel to
+		// AFM's "how long until externally-written data is discovered".
+		// Snapshot of the last register/bucket-scan pass, not exported on
+		// the early error returns above (a run that failed before doing any
+		// work has no real materialized count to report, matching
+		// flush-policy's convention of not exporting on a failed sweep).
+		exporter.NewGauge("oss_accel_bucket_scan_materialized").SetWithLabels(float64(materialized), map[string]string{exporter.Vol: vol})
 		return materialized, skipped, errors, nil
 	}
 
@@ -143,6 +152,7 @@ func (l *LcNode) runOssAccelRegisterForVol(vol string, keys []string, prefix str
 		}
 		register(entry.Key)
 	}
+	exporter.NewGauge("oss_accel_bucket_scan_materialized").SetWithLabels(float64(materialized), map[string]string{exporter.Vol: vol})
 	return materialized, skipped, errors, nil
 }
 

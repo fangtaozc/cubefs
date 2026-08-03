@@ -98,14 +98,23 @@ type LcNode struct {
 	// doesn't need cross-node coordination in the first place.
 	ossAccelBatchTasksMu sync.Mutex
 	ossAccelBatchTasks   map[string]*ossAccelBatchPrefetchTask
+
+	// ossAccelOutstandingWork: per-vol cache of the last known value from
+	// each of the three same-process sweeps (flushPolicy/audit/trashPurge)
+	// that feed the oss_accel_outstanding_work_estimate_lcnode gauge — see
+	// oss_accel_outstanding_work.go for why this is process-local, per-vol,
+	// and deliberately excludes recall/write-through-async.
+	ossAccelOutstandingWorkMu sync.Mutex
+	ossAccelOutstandingWork   map[string]*ossAccelOutstandingWorkSnapshot
 }
 
 func NewServer() *LcNode {
 	return &LcNode{
 		lcScanners:          make(map[string]*LcScanner),
 		snapshotScanners:    make(map[string]*SnapshotScanner),
-		ossAccelRecallLimit: concurrent.NewLimit(),
-		ossAccelBatchTasks:  make(map[string]*ossAccelBatchPrefetchTask),
+		ossAccelRecallLimit:     concurrent.NewLimit(),
+		ossAccelBatchTasks:      make(map[string]*ossAccelBatchPrefetchTask),
+		ossAccelOutstandingWork: make(map[string]*ossAccelOutstandingWorkSnapshot),
 	}
 }
 
@@ -495,6 +504,12 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelDelete").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelDelete))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelListCold").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelListCold))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelListFlushCandidates").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelListFlushCandidates))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

@@ -31,6 +31,7 @@ import (
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/syncnode/backend"
 	"github.com/cubefs/cubefs/syncnode/backend/s3"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -60,34 +61,34 @@ func (l *LcNode) httpServiceOssAccelTrashPurge(w http.ResponseWriter, r *http.Re
 	prefix := r.FormValue("prefix")
 	retentionHours := parseUintForm(r, "retentionHours", ossAccelDefaultTrashRetentionHours)
 
-	purged, refused, perr := l.runOssAccelTrashPurgeForVol(vol, prefix, retentionHours)
+	purged, refused, total, perr := l.runOssAccelTrashPurgeForVol(vol, prefix, retentionHours)
 	if perr != nil {
 		httpErrorOssAccel(w, perr)
 		return
 	}
-	fmt.Fprintf(w, "ok: vol=%v prefix=%v retentionHours=%v purged=%v refused=%v\npurgedKeys=%v\nrefusedKeys=%v\n",
-		vol, prefix, retentionHours, len(purged), len(refused), purged, refused)
+	fmt.Fprintf(w, "ok: vol=%v prefix=%v retentionHours=%v purged=%v refused=%v pending=%v\npurgedKeys=%v\nrefusedKeys=%v\n",
+		vol, prefix, retentionHours, len(purged), len(refused), total, purged, refused)
 }
 
 // runOssAccelTrashPurgeForVol builds this volume's meta/S3 clients and runs
 // one purge pass — the shared setup both httpServiceOssAccelTrashPurge
 // (manual trigger) and opOssAccelTrashPurge (系统层面收尾: master-scheduled
 // AdminTask, lcnode/lc_op.go) call.
-func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours uint64) (purged, refused []string, err error) {
+func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours uint64) (purged, refused []string, total int, err error) {
 	defer ossAccelObserve("trashPurge", vol, &err)()
 	metaWrapper, err := l.buildVolMetaWrapper(vol)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer metaWrapper.Close()
 
 	s3Cfg, err := loadOssAccelS3Config(metaWrapper, vol)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	s3Backend, err := s3.New(s3Cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("s3 backend init err: %v", err)
+		return nil, nil, 0, fmt.Errorf("s3 backend init err: %v", err)
 	}
 	defer s3Backend.Close()
 
@@ -97,10 +98,23 @@ func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours 
 	// evaluated per key inside the loop.
 	roleCfg, rcerr := loadOssAccelRoleConfig(metaWrapper)
 	if rcerr != nil {
-		return nil, nil, rcerr
+		return nil, nil, 0, rcerr
 	}
 
-	return runOssAccelTrashPurge(s3Backend, roleCfg, prefix, time.Duration(retentionHours)*time.Hour)
+	purged, refused, total, err = runOssAccelTrashPurge(s3Backend, roleCfg, prefix, time.Duration(retentionHours)*time.Hour)
+	if err != nil {
+		return purged, refused, total, err
+	}
+	// 对齐AFM(队列观察第二轮): total counts EVERY object currently sitting
+	// under .trash/<prefix>, not just the ones old enough to purge this run
+	// (purged/refused only cover those) — the closer analog to "how much is
+	// quarantined right now, waiting out its retention or refused", vs.
+	// purged/refused which only describe what happened in this one pass.
+	exporter.NewGauge("oss_accel_trash_pending").SetWithLabels(float64(total), map[string]string{exporter.Vol: vol})
+	l.ossAccelUpdateOutstandingWork(vol, func(s *ossAccelOutstandingWorkSnapshot) {
+		s.trashPending = total
+	})
+	return purged, refused, total, nil
 }
 
 // runOssAccelTrashPurge deletes every object under .trash/<prefix> whose S3
@@ -115,26 +129,27 @@ func (l *LcNode) runOssAccelTrashPurgeForVol(vol, prefix string, retentionHours 
 // callers see the ORIGINAL key that leaked — matching AUDIT-2's
 // QuarantinedKeys reporting convention) plus any partial progress if an
 // error interrupts the listing.
-func runOssAccelTrashPurge(s3Backend backend.Backend, roleCfg *proto.OSSAccelRoleConfig, prefix string, retention time.Duration) (purged, refused []string, err error) {
+func runOssAccelTrashPurge(s3Backend backend.Backend, roleCfg *proto.OSSAccelRoleConfig, prefix string, retention time.Duration) (purged, refused []string, total int, err error) {
 	ctx := context.Background()
 	// 形态收敛: bucket-level pre-flight. A role that may not write the bucket at
 	// all can never purge anything, so refuse before even listing — no point
 	// paying for a List whose every result we'd decline.
 	if !ossAccelBucketWriteAllowed(roleCfg) {
-		return nil, nil, ossAccelWriteForbiddenErrf(roleCfg, "", "trashPurge", ossAccelTrashPrefix+prefix)
+		return nil, nil, 0, ossAccelWriteForbiddenErrf(roleCfg, "", "trashPurge", ossAccelTrashPrefix+prefix)
 	}
 	ch, lerr := s3Backend.List(ctx, ossAccelTrashPrefix+prefix, true)
 	if lerr != nil {
-		return nil, nil, fmt.Errorf("s3 list err: %v", lerr)
+		return nil, nil, 0, fmt.Errorf("s3 list err: %v", lerr)
 	}
 	now := time.Now()
 	for entry := range ch {
 		if entry.Err != nil {
-			return purged, refused, fmt.Errorf("s3 list entry err: %v", entry.Err)
+			return purged, refused, total, fmt.Errorf("s3 list entry err: %v", entry.Err)
 		}
 		if entry.IsDir {
 			continue
 		}
+		total++
 		if now.Sub(entry.Mtime) < retention {
 			continue // not old enough yet — give a false positive time to be renamed back
 		}
@@ -156,5 +171,5 @@ func runOssAccelTrashPurge(s3Backend backend.Backend, roleCfg *proto.OSSAccelRol
 		purged = append(purged, originalKey)
 		log.LogWarnf("runOssAccelTrashPurge: purged key(%v) (quarantined %v ago, >= retention %v)", originalKey, now.Sub(entry.Mtime), retention)
 	}
-	return purged, refused, nil
+	return purged, refused, total, nil
 }

@@ -402,7 +402,7 @@ func (l *LcNode) opOssAccelTrashPurge(conn net.Conn, p *proto.Packet) (err error
 		resp.LcNode = l.localServerAddr
 		resp.StartTime = &start
 
-		purged, refused, runErr := l.runOssAccelTrashPurgeForVol(request.VolName, request.Prefix, uint64(request.RetentionHours))
+		purged, refused, _, runErr := l.runOssAccelTrashPurgeForVol(request.VolName, request.Prefix, uint64(request.RetentionHours))
 		end := time.Now()
 		resp.EndTime = &end
 		resp.Done = true

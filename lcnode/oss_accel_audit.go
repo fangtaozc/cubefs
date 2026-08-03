@@ -47,6 +47,7 @@ import (
 	"github.com/cubefs/cubefs/sdk/meta"
 	"github.com/cubefs/cubefs/syncnode/backend"
 	"github.com/cubefs/cubefs/syncnode/backend/s3"
+	"github.com/cubefs/cubefs/util/exporter"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -193,7 +194,24 @@ func (l *LcNode) runOssAccelAuditForVol(vol, prefix string, graceHours uint64) (
 		return ossAccelAuditResult{}, rcerr
 	}
 
-	return runOssAccelAudit(metaWrapper, s3Backend, roleCfg, prefix, time.Duration(graceHours)*time.Hour)
+	result, aerr := runOssAccelAudit(metaWrapper, s3Backend, roleCfg, prefix, time.Duration(graceHours)*time.Hour)
+	if aerr != nil {
+		return result, aerr
+	}
+	// 对齐AFM(队列观察第二轮): only the three top-level directions, not every
+	// *Refused/*Unmarked sub-slice — those are ⊆ their parent set and adding
+	// them as separate gauges would triple the metric count for no
+	// incremental "how much is outstanding" signal. Snapshot of the last
+	// audit pass, not a live count — audit has no persisted backlog, only a
+	// periodic full-tree-walk + full-bucket-list pass (see package doc
+	// comment above).
+	exporter.NewGauge("oss_accel_audit_dangling").SetWithLabels(float64(len(result.DanglingKeys)), map[string]string{exporter.Vol: vol})
+	exporter.NewGauge("oss_accel_audit_orphans_quarantined").SetWithLabels(float64(len(result.QuarantinedKeys)), map[string]string{exporter.Vol: vol})
+	exporter.NewGauge("oss_accel_audit_drift_detected").SetWithLabels(float64(len(result.DriftDetectedKeys)), map[string]string{exporter.Vol: vol})
+	l.ossAccelUpdateOutstandingWork(vol, func(s *ossAccelOutstandingWorkSnapshot) {
+		s.auditDangling = len(result.DanglingKeys)
+	})
+	return result, nil
 }
 
 // ossAccelAuditResult carries not just counts but the actual affected keys —
