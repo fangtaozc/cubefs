@@ -187,6 +187,7 @@ func (m *OSSAccelEvictionRuleManager) fireRule(r *proto.OSSAccelEvictionRule, us
 		LcNodeAddr:        lcNode.Addr,
 		VolName:           r.VolName,
 		LowWatermarkRatio: r.LowWatermarkRatio,
+		Order:             r.Order,
 	}
 	task := proto.NewAdminTaskEx(proto.OpLcNodeOssAccelEvict, lcNode.Addr, req, r.VolName)
 	m.cluster.addLcNodeTasks([]*proto.AdminTask{task})

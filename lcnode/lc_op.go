@@ -293,7 +293,7 @@ func (l *LcNode) opOssAccelEvict(conn net.Conn, p *proto.Packet) (err error) {
 		resp.LcNode = l.localServerAddr
 		resp.StartTime = &start
 
-		considered, evicted, usageRatioAfter, runErr := l.runOssAccelEvictionSweep(request.VolName, request.LowWatermarkRatio)
+		considered, evicted, usageRatioAfter, runErr := l.runOssAccelEvictionSweep(request.VolName, request.LowWatermarkRatio, request.Order)
 		end := time.Now()
 		resp.EndTime = &end
 		resp.Done = true

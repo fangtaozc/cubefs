@@ -728,8 +728,13 @@ func newOssAccelEvictionStatusCmd(client *master.MasterClient) *cobra.Command {
 			if !rule.LastRunAt.IsZero() {
 				lastRunAt = rule.LastRunAt.Format("2006-01-02 15:04:05")
 			}
+			order := rule.Order
+			if order == "" {
+				order = proto.OSSAccelEvictionOrderLastRecall + " (default)"
+			}
 			stdout("vol[%v] oss-accel eviction status:\n", volName)
 			stdout("  enabled          : %v\n", rule.Enabled)
+			stdout("  order            : %v\n", order)
 			stdout("  evictionInFlight : %v\n", rule.EvictionInFlight)
 			stdout("  lastRunAt        : %v\n", lastRunAt)
 			stdout("  lastRunResult    : %v\n", rule.LastRunResult)

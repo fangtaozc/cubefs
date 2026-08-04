@@ -140,5 +140,14 @@ func validateOSSAccelEvictionRule(rule *proto.OSSAccelEvictionRule) error {
 	if rule.LowWatermarkRatio <= 0 || rule.LowWatermarkRatio >= rule.HighWatermarkRatio {
 		return fmt.Errorf("lowWatermarkRatio must be in (0, highWatermarkRatio)")
 	}
+	// 对齐AFM(eviction排序策略): empty is valid (defaults to lastRecall,
+	// the pre-existing behavior) — only reject an unrecognized non-empty
+	// value, so a typo doesn't silently fall back to the default instead of
+	// erroring loudly.
+	switch rule.Order {
+	case "", proto.OSSAccelEvictionOrderLastRecall, proto.OSSAccelEvictionOrderSize:
+	default:
+		return fmt.Errorf("order must be %q or %q (or omitted)", proto.OSSAccelEvictionOrderLastRecall, proto.OSSAccelEvictionOrderSize)
+	}
 	return nil
 }

@@ -60,16 +60,20 @@ type ossAccelEvictCandidate struct {
 	path       string
 	name       string
 	ino        uint64
+	size       uint64
 	lastRecall time.Time // zero value sorts first, see doc comment above
 }
 
 // runOssAccelEvictionSweep walks vol once, evicting (commit-cold) the
 // coldest oss-accel-managed resident files until usage drops to
-// lowWatermarkRatio or candidates run out. Returns how many candidates were
+// lowWatermarkRatio or candidates run out. order picks the ranking —
+// proto.OSSAccelEvictionOrderSize (largest first, 对齐AFM `--order SIZE`)
+// or empty/proto.OSSAccelEvictionOrderLastRecall (the original and default:
+// oldest-least-recently-recalled first). Returns how many candidates were
 // considered, how many were actually evicted, and the resulting usage
 // ratio (all needed by master to decide whether another round is needed —
 // see proto.OSSAccelEvictionTaskResponse).
-func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64) (considered, evicted int, usageRatioAfter float64, err error) {
+func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64, order string) (considered, evicted int, usageRatioAfter float64, err error) {
 	defer ossAccelObserve("evict", vol, &err)()
 	mw, berr := l.buildVolMetaWrapper(vol)
 	if berr != nil {
@@ -96,7 +100,7 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 				lastRecall = parsed
 			}
 		}
-		candidates = append(candidates, ossAccelEvictCandidate{parentIno: parentIno, path: path, name: name, ino: info.Inode, lastRecall: lastRecall})
+		candidates = append(candidates, ossAccelEvictCandidate{parentIno: parentIno, path: path, name: name, ino: info.Inode, size: info.Size, lastRecall: lastRecall})
 		return nil
 	})
 	if werr != nil {
@@ -114,7 +118,10 @@ func (l *LcNode) runOssAccelEvictionSweep(vol string, lowWatermarkRatio float64)
 	}
 
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].lastRecall.Before(candidates[j].lastRecall)
+		if order == proto.OSSAccelEvictionOrderSize {
+			return candidates[i].size > candidates[j].size // largest first — reclaim more space sooner
+		}
+		return candidates[i].lastRecall.Before(candidates[j].lastRecall) // default: oldest-least-recently-recalled first
 	})
 
 	// Batches of up to ossAccelEvictionBatchConcurrency run concurrently

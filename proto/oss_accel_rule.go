@@ -103,7 +103,23 @@ type OSSAccelEvictionRule struct {
 	// over the high watermark" would otherwise look identical to "haven't
 	// dispatched yet" on every tick). Not caller-settable via /set.
 	EvictionInFlight bool `json:"evictionInFlight,omitempty"`
+	// Order picks which candidates get evicted first — OSSAccelEvictionOrderLastRecall
+	// (default, empty string means this) or OSSAccelEvictionOrderSize. 对齐AFM
+	// `mmafmctl evict --order LRU|SIZE`. Empty preserves the pre-existing
+	// coldest-first-by-lastRecallTime behavior, so old rules and old callers
+	// need no change.
+	Order string `json:"order,omitempty"`
 }
+
+// OSSAccelEvictionOrderLastRecall (the default/empty value) ranks eviction
+// candidates oldest-least-recently-recalled first — the original,
+// only-ever-existing behavior before Order was added. OSSAccelEvictionOrderSize
+// ranks largest-first, reclaiming more space per eviction sooner — 对齐AFM's
+// `--order SIZE`.
+const (
+	OSSAccelEvictionOrderLastRecall = "lastRecall"
+	OSSAccelEvictionOrderSize       = "size"
+)
 
 // OSSAccelEvictionTaskRequest is the AdminTask payload for a dispatched
 // eviction sweep (OpLcNodeOssAccelEvict).
@@ -112,6 +128,7 @@ type OSSAccelEvictionTaskRequest struct {
 	LcNodeAddr        string
 	VolName           string
 	LowWatermarkRatio float64
+	Order             string
 }
 
 // OSSAccelEvictionTaskResponse is what lcnode reports back after running an
