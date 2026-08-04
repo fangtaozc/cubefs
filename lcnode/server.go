@@ -510,6 +510,9 @@ func (l *LcNode) httpServiceStart() {
 	router.NewRoute().Methods(http.MethodGet).
 		Path("/ossAccelListFlushCandidates").
 		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelListFlushCandidates))
+	router.NewRoute().Methods(http.MethodGet).
+		Path("/ossAccelListDrifted").
+		HandlerFunc(requireLcnodeAdminToken(l.httpServiceOssAccelListDrifted))
 
 	addr := fmt.Sprintf(":%v", l.httpListen)
 	server := &http.Server{

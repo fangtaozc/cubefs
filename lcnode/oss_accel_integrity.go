@@ -354,6 +354,21 @@ const (
 	ossAccelMismatchSuspectCorruption
 )
 
+// String renders the verdict for text responses — the read-only
+// /ossAccelListDrifted endpoint (oss_accel_inventory.go) uses this to report
+// what it found without duplicating the mark/refresh decision this sweep
+// makes on the same verdict.
+func (v ossAccelMismatchVerdict) String() string {
+	switch v {
+	case ossAccelMismatchExternalUpdate:
+		return "externalUpdate"
+	case ossAccelMismatchSuspectCorruption:
+		return "suspectCorruption"
+	default:
+		return "uninterpretable"
+	}
+}
+
 // classifyOssAccelMismatch applies the flushedAt-vs-Mtime discriminator. Split
 // out as a pure function so the truth table is unit-testable without S3 or a
 // metanode (see oss_accel_integrity_test.go).

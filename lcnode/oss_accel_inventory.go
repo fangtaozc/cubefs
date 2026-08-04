@@ -22,6 +22,7 @@
 package lcnode
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/sdk/meta"
+	"github.com/cubefs/cubefs/syncnode/backend/s3"
 )
 
 // errOssAccelListLimitReached is returned by a listing endpoint's walk
@@ -219,5 +221,128 @@ func (l *LcNode) httpServiceOssAccelListFlushCandidates(w http.ResponseWriter, r
 		vol, prefix, minIdleHours, minSizeBytes, limit, len(entries), truncated)
 	for _, e := range entries {
 		fmt.Fprintf(w, "path=%v size=%v\n", e.path, e.size)
+	}
+}
+
+// ossAccelDriftedListEntry is one row of /ossAccelListDrifted's result.
+type ossAccelDriftedListEntry struct {
+	path       string
+	s3key      string
+	verdict    ossAccelMismatchVerdict
+	remoteMtime time.Time
+	flushedAt  string
+	checksum   string
+}
+
+// httpServiceOssAccelListDrifted handles
+// GET /ossAccelListDrifted?vol=&prefix=&limit=
+// checkDirty's other half: /ossAccelListFlushCandidates covers "never
+// tiered out at all"; this covers "already flushed/committed cold, but the
+// S3 side no longer matches what we recorded" — either legitimately
+// rewritten by an external owner, or (if nothing rewrote it since our own
+// flush) potentially corrupted. Reuses the exact cheap (zero-download HEAD)
+// check runOssAccelIntegrityForVol's own cheap tier performs
+// (ossAccelObserveS3Object + classifyOssAccelMismatch,
+// oss_accel_integrity.go) — but ONLY reports what it finds. Unlike the
+// scheduled integrity sweep, this endpoint never refreshes the cold
+// reference and never marks ColdStateError: it is a pure inspection, the
+// same stance ListCold/ListFlushCandidates take.
+//
+// Costs real S3 requests, unlike the other two list endpoints (which are
+// pure metadata reads): one HEAD per candidate with a recorded checksum.
+// limit bounds this the same way it bounds result size — a caller scoping
+// this at a prefix with many cold files should expect real network time,
+// not an instant in-memory answer.
+func (l *LcNode) httpServiceOssAccelListDrifted(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, fmt.Sprintf("ParseForm err: %v", err), http.StatusBadRequest)
+		return
+	}
+	vol := r.FormValue("vol")
+	if vol == "" {
+		http.Error(w, "missing required form value: vol", http.StatusBadRequest)
+		return
+	}
+	prefix := r.FormValue("prefix")
+	limit := ossAccelListLimit(r)
+
+	mw, err := l.buildVolMetaWrapper(vol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer mw.Close()
+
+	s3Cfg, err := loadOssAccelS3Config(mw, vol)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s3Backend, err := s3.New(s3Cfg)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("s3 backend init err: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer s3Backend.Close()
+
+	ctx := context.Background()
+	checked := 0
+	var entries []ossAccelDriftedListEntry
+	truncated := false
+	// Same current-path-safe reasoning as ListCold — StorageClass is
+	// evaluated at the file's CURRENT path, so prefix-scoping the walk
+	// never misses a match the way an s3key-based filter (audit/integrity's
+	// own prefix handling) could.
+	walk := func(visit ossAccelWalkVisitor) error {
+		if prefix == "" {
+			return walkOssAccelTree(mw, "listDrifted", visit)
+		}
+		return walkOssAccelTreeUnderPathPrefix(mw, "listDrifted", prefix, visit)
+	}
+	werr := walk(func(mw *meta.MetaWrapper, parentIno uint64, path string, name string, info *proto.InodeInfo, xattrs map[string]string) error {
+		if prefix != "" && !strings.HasPrefix(normalizeOssAccelKey(path), prefix) {
+			return nil
+		}
+		if info.StorageClass != proto.StorageClass_BlobStore {
+			return nil
+		}
+		s3key := xattrs[proto.XAttrKeyOSSAccelS3Key]
+		checksum := strings.TrimPrefix(xattrs[proto.XAttrKeyOSSAccelChecksum], proto.ChecksumPrefixSHA256)
+		if s3key == "" || checksum == "" {
+			return nil // nothing recorded to compare the remote side against
+		}
+		checked++
+		obs, oerr := ossAccelObserveS3Object(ctx, s3Backend, s3key)
+		if oerr != nil {
+			return nil // HEAD failure is inconclusive, not evidence of drift — same stance integrity takes
+		}
+		if !obs.Conclusive || obs.Matches(checksum) {
+			return nil // matches (or nothing to conclude from) — not drifted
+		}
+		flushedAt := xattrs[proto.XAttrKeyOSSAccelFlushedAt]
+		entries = append(entries, ossAccelDriftedListEntry{
+			path: path, s3key: s3key,
+			verdict:    classifyOssAccelMismatch(flushedAt, obs.Mtime),
+			remoteMtime: obs.Mtime, flushedAt: flushedAt, checksum: checksum,
+		})
+		if uint64(len(entries)) >= limit {
+			return errOssAccelListLimitReached
+		}
+		return nil
+	})
+	if werr != nil {
+		if errors.Is(werr, errOssAccelListLimitReached) {
+			truncated = true
+		} else {
+			http.Error(w, fmt.Sprintf("walkOssAccelTree err: %v", werr), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	fmt.Fprintf(w, "ok: vol=%v prefix=%v limit=%v checked=%v drifted=%v truncated=%v\n",
+		vol, prefix, limit, checked, len(entries), truncated)
+	for _, e := range entries {
+		fmt.Fprintf(w, "path=%v s3key=%v verdict=%v remoteMtime=%v flushedAt=%v checksum=%v\n",
+			e.path, e.s3key, e.verdict, e.remoteMtime.Format(time.RFC3339), e.flushedAt, e.checksum)
 	}
 }
