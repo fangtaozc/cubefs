@@ -132,13 +132,38 @@ int cfs_extent_update_partition(struct cfs_extent_client *ec)
 	struct cfs_data_partition_view *dp_view;
 	struct cfs_data_partition *dp;
 	struct hlist_node *tmp;
-	u32 i;
+	u32 i, nr_rw_in_view = 0;
 	int ret;
 
 	ret = cfs_master_get_data_partitions(ec->master, &dp_views);
 	if (ret < 0)
 		return ret;
+
+	for (i = 0; i < dp_views.num; i++) {
+		if (dp_views.base[i].status == CFS_DP_STATUS_READWRITE)
+			nr_rw_in_view++;
+	}
+
 	write_lock(&ec->lock);
+	/* 防坏视图覆盖好缓存:master 刚重启、还没收到 datanode 心跳时可能
+	 * 返回一份"RPC 成功但零可写分区"的瞬时坏视图——无条件清空重建会把
+	 * 健康的旧缓存换成空的,期间该 client 全部写失败,直到下一次(5分钟
+	 * 后,EXTENT_UPDATE_DP_INTERVAL_MS)定时刷新拿到好视图才可能自愈。
+	 * 真机复现:master 滚动重启期间命中过这个窗口,close(2) 报 EPERM,
+	 * 重新挂载(即重新拿一次好视图)立即恢复。只在"旧缓存原本非空、新
+	 * 视图却一个可写分区都没有"时触发保护;新视图非空(即便数量比旧的
+	 * 少)按原逻辑正常应用。旧缓存里的分区若真的不可写,后续 write RPC
+	 * 本身会报错,不存在用陈旧数据掩盖真实故障的风险。 */
+	if (nr_rw_in_view == 0 && ec->nr_rw_partitions > 0) {
+		write_unlock(&ec->lock);
+		cfs_log_warn(
+			ec->log,
+			"get_data_partitions returned 0 rw partitions (view has %u total) while cache still has %u — keeping stale cache instead of discarding it\n",
+			dp_views.num, ec->nr_rw_partitions);
+		cfs_data_partition_view_array_clear(&dp_views);
+		return 0;
+	}
+
 	while (!list_empty(&ec->rw_partitions)) {
 		dp = list_first_entry(&ec->rw_partitions,
 				      struct cfs_data_partition, list);
