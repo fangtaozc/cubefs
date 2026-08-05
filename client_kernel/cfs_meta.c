@@ -1184,7 +1184,12 @@ static int cfs_meta_get_xattr_internal(struct cfs_meta_client *mc,
 			cfs_packet_release(packet);
 			return ret;
 		}
-		n = decoded_len + 1;
+		/* n 是解码后真实字节数,不额外 +1——xattr 值不是 NUL 结尾字符串,
+		 * getxattr(2) 契约要求返回值=拷贝的真实字节数。历史上这里曾经
+		 * 多报 1 字节(下面旧路径同理),这个 off-by-one 在 security.
+		 * capability 这类要求精确匹配结构体长度(4/20/24 字节)的场景下
+		 * 会被内核 cap_inode_getsecurity 转换逻辑拒绝(EINVAL)——修掉。 */
+		n = decoded_len;
 		if (value) {
 			if (n > size) {
 				ret = -ERANGE;
@@ -1194,8 +1199,9 @@ static int cfs_meta_get_xattr_internal(struct cfs_meta_client *mc,
 		}
 		kfree(decoded);
 	} else {
-		/* 服务端不认识 wantB64(旧 metanode)——跟这个修复引入前完全一样。 */
-		n = strlen(reply_data->value) + 1;
+		/* 服务端不认识 wantB64(旧 metanode)。同上,n 是真实字节数
+		 * (strlen 本身就是不含终止符的真实长度),不再额外 +1。 */
+		n = strlen(reply_data->value);
 		if (value) {
 			if (n > size) {
 				ret = -ERANGE;
