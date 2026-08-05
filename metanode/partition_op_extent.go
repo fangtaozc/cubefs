@@ -793,12 +793,13 @@ func (mp *metaPartition) persistInodeAccessTime(inode uint64, p *Packet) {
 		return
 	}
 
-	// always update local AccessTime
-	ino.AccessTime = ctime
-	log.LogDebugf("persistInodeAccessTime ino(%v) persist at to %v", ino.Inode, atime)
-
 	leaderAddr, ok := mp.IsLeader()
 	if ok {
+		// This node IS the leader: mutating here is safe — this value is
+		// about to become the raft-committed truth via the enqueue below,
+		// not a guess about what some other node will independently decide.
+		ino.AccessTime = ctime
+		log.LogDebugf("persistInodeAccessTime ino(%v) persist at to %v", ino.Inode, atime)
 		retry := 0
 		// sync AccessTime to followers, retry 3 times
 		for retry <= 3 {
@@ -815,6 +816,18 @@ func (mp *metaPartition) persistInodeAccessTime(inode uint64, p *Packet) {
 		return
 	}
 
+	// This node is a FOLLOWER: do NOT mutate ino.AccessTime here — that
+	// would be a direct write to this replica's state outside raft
+	// consensus. The previous implementation mutated it unconditionally
+	// before this point; if the forward-to-leader below then failed (a
+	// network hiccup, handled below only with a log.LogWarnf), that
+	// optimistic mutation was never rolled back and had no corresponding
+	// raft entry to correct it — this follower's AccessTime silently and
+	// permanently diverged from the raft-committed value. Just forward the
+	// request; the leader independently re-evaluates and, if it bumps,
+	// that update reaches this follower through the normal raft apply path
+	// (opFSMSyncInodeAccessTime/opFSMBatchSyncInodeAccessTime), which is
+	// the only path that should ever change a follower's persisted state.
 	if leaderAddr == "" {
 		log.LogWarnf("persistInodeAccessTime ino(%v) sync InodeAccessTime failed for no leader", ino.Inode)
 		return
