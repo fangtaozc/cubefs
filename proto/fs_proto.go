@@ -829,6 +829,11 @@ type SetXAttrRequest struct {
 	Inode       uint64 `json:"ino"`
 	Key         string `json:"key"`
 	Value       string `json:"val"`
+	// ValueBase64修复T3(内核客户端二进制xattr): 为true时Value是base64编码后的
+	// 文本,服务端需要先解码还原原始字节再存储。默认false(缺省/旧客户端)时
+	// Value就是原始值本身,行为跟这个字段引入前完全一致。纯加法字段,omitempty
+	// 保证旧客户端发出的请求在wire上跟以前字节级相同。
+	ValueBase64 bool `json:"valB64,omitempty"`
 }
 
 type BatchSetXAttrRequest struct {
@@ -858,6 +863,12 @@ type GetXAttrRequest struct {
 	Inode       uint64 `json:"ino"`
 	Key         string `json:"key"`
 	VerSeq      uint64 `json:"seq"`
+	// WantBase64修复T3(内核客户端二进制xattr): 为true时要求服务端把Value
+	// base64编码后再返回(见GetXAttrResponse.ValueBase64)。一个不认识这个
+	// 字段的旧服务端会直接忽略它,按老逻辑返回明文Value——这是这个方向天生
+	// 能对服务端版本自适应的原因:新客户端看响应里有没有回显ValueBase64来
+	// 决定要不要解码,不依赖请求方跟响应方版本一致。
+	WantBase64 bool `json:"wantB64,omitempty"`
 }
 
 type GetXAttrResponse struct {
@@ -866,6 +877,10 @@ type GetXAttrResponse struct {
 	Inode       uint64 `json:"ino"`
 	Key         string `json:"key"`
 	Value       string `json:"val"`
+	// ValueBase64修复T3: 请求方WantBase64=true且本服务端认识这个字段时才会
+	// 置true,同时Value换成base64编码后的文本。缺省false时Value跟这个字段
+	// 引入前完全一样(可能对非UTF-8字节有损,这是旧行为,不是新引入的回归)。
+	ValueBase64 bool `json:"valB64,omitempty"`
 }
 
 type RemoveXAttrRequest struct {
