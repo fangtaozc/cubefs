@@ -168,7 +168,9 @@ static int cfs_packet_inode_from_json(cfs_json_t *json,
 
 	ret = cfs_json_get_string_ptr(json, "tgt", &val, &len);
 	if (ret == 0) {
-		ret = cfs_base64_decode(val, len, &info->target);
+		/* symlink target 天然是不含内嵌 NUL 的路径字符串,按 NUL 结尾处理,
+		 * 不需要真实解码长度,传 NULL 沿用旧行为。 */
+		ret = cfs_base64_decode(val, len, &info->target, NULL);
 		CHECK_GOTO(ret, "failed to parse tgt");
 	}
 
@@ -718,6 +720,13 @@ cfs_packet_sxattr_request_to_json(struct cfs_packet_sxattr_request *req,
 	 * 原写成 "value" 导致 metanode 忽略、value 丢失(key 存了但取回为空)。 */
 	CHECK(cfs_buffer_write(buffer, "\"val\":\"%.*s\"", req->value_len,
 			       req->value));
+	/* 修复T3(内核客户端二进制xattr): value_base64 为真时 value/value_len 在
+	 * 调用方(cfs_meta_set_xattr_internal)那一层已经换成 base64 编码后的
+	 * 缓冲——这里只需要多告知服务端一句"这是编码过的",不需要再做任何编码
+	 * 动作。旧行为(value_base64==false)下面这行不会被拼进去,wire 上跟这个
+	 * 字段引入前完全一样。 */
+	if (req->value_base64)
+		CHECK(cfs_buffer_write(buffer, ",\"valB64\":true"));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
 }
@@ -730,7 +739,11 @@ cfs_packet_gxattr_request_to_json(struct cfs_packet_gxattr_request *req,
 	CHECK(cfs_buffer_write(buffer, "\"vol\":\"%s\",", req->vol_name));
 	CHECK(cfs_buffer_write(buffer, "\"pid\":%llu,", req->pid));
 	CHECK(cfs_buffer_write(buffer, "\"ino\":%llu,", req->ino));
-	CHECK(cfs_buffer_write(buffer, "\"key\":\"%s\"", req->key));
+	CHECK(cfs_buffer_write(buffer, "\"key\":\"%s\",", req->key));
+	/* 修复T3(内核客户端二进制xattr): 无条件请求 base64——服务端认不认识这个
+	 * 字段完全不影响正确性,新客户端靠回包里有没有回显"valB64"来判断要不要
+	 * 解码(见 cfs_packet_gxattr_reply_from_json),不需要提前知道服务端版本。 */
+	CHECK(cfs_buffer_write(buffer, "\"wantB64\":true"));
 	CHECK(cfs_buffer_write(buffer, "}"));
 	return 0;
 }
@@ -752,6 +765,11 @@ cfs_packet_gxattr_reply_from_json(cfs_json_t *json,
 	CHECK_GOTO(ret, "not found key");
 	ret = cfs_json_get_string(json, "val", &res->value);
 	CHECK_GOTO(ret, "not found val");
+	/* 修复T3(内核客户端二进制xattr): 不用 CHECK_GOTO——一个不认识 wantB64
+	 * 请求字段的旧服务端永远不会回显这个字段,找不到是完全预期的正常情况,
+	 * 不是失败;res 已经被上面的 memset 清零,找不到时 value_is_base64 保持
+	 * false,退回旧行为(不解码,直接用 res->value 原样)。 */
+	cfs_json_get_bool(json, "valB64", &res->value_is_base64);
 	return 0;
 failed:
 	cfs_packet_gxattr_reply_clear(res);

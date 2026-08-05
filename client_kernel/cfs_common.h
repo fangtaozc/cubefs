@@ -242,6 +242,13 @@ const char *cfs_pr_time(struct timespec64 *time);
 int cfs_parse_time(const char *str, size_t len, struct timespec64 *time);
 
 int cfs_base64_encode(const char *str, size_t len, char **base64);
-int cfs_base64_decode(const char *base64, size_t base64_len, char **str);
+/* out_len 可传 NULL(不关心真实解码长度,沿用旧调用方式——如 symlink target,
+ * 本身按 NUL 结尾字符串处理,不受影响)。非 NULL 时按输入末尾 '=' 补位个数
+ * 算出真实解码字节数写回——base64_decode 的输出缓冲固定按 (base64_len/4)*3
+ * 分配,但当原始内容不是 3 的整数倍时,末尾 1-2 个字节是补位字符解出来的
+ * 0x00,不是真实内容;调用方如果把结果当成任意二进制(而不是天然不含内嵌
+ * NUL 的路径字符串)使用,必须知道真实长度在哪里截止,不能不做修改直接假设
+ * 整块缓冲都是有效数据。修复T3(内核客户端二进制xattr)引入。 */
+int cfs_base64_decode(const char *base64, size_t base64_len, char **str, size_t *out_len);
 
 #endif

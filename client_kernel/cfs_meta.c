@@ -1040,6 +1040,27 @@ out:
 	return ret;
 }
 
+/*
+ * 修复T3(内核客户端二进制xattr): 判断 value 是否能作为 JSON 字符串原样安全
+ * 嵌入——不含 NUL/引号/反斜杠/控制字符,且限定纯 ASCII 可打印字节(不做严格
+ * UTF-8 校验,换取这里的判断逻辑容易审查正确)。为真才走跟这个修复引入前
+ * 完全一样的老路径;为假走新的 base64 路径。保守规则只会让更多值走 base64
+ * (从不出错的一侧),不会有相反方向的误判。
+ */
+static bool cfs_xattr_value_needs_base64(const char *value, size_t len)
+{
+	size_t i;
+	unsigned char c;
+
+	for (i = 0; i < len; i++) {
+		c = (unsigned char)value[i];
+		if (c < 0x20 || c == 0x22 /* '"' */ || c == 0x5c /* '\\' */ ||
+		    c >= 0x80)
+			return true;
+	}
+	return false;
+}
+
 static int cfs_meta_set_xattr_internal(struct cfs_meta_client *mc,
 				       struct cfs_meta_partition *mp, u64 ino,
 				       const char *name, const char *value,
@@ -1050,33 +1071,54 @@ static int cfs_meta_set_xattr_internal(struct cfs_meta_client *mc,
 	u8 op = (flags & XATTR_REPLACE) ? CFS_OP_XATTR_UPDATE : CFS_OP_XATTR_SET;
 	struct cfs_packet *packet;
 	struct cfs_packet_sxattr_request *request_data;
+	char *encoded = NULL;
+	bool need_base64;
 	int ret;
 
 	packet = cfs_packet_new(op, mp->id, NULL, NULL);
 	if (!packet)
 		return -ENOMEM;
 
+	need_base64 = cfs_xattr_value_needs_base64(value, len);
+	if (need_base64) {
+		ret = cfs_base64_encode(value, len, &encoded);
+		if (ret < 0) {
+			cfs_packet_release(packet);
+			return ret;
+		}
+	}
+
 	request_data = &packet->request.data.sxattr;
 	request_data->vol_name = mc->volume;
 	request_data->pid = mp->id;
 	request_data->ino = ino;
 	request_data->key = name;
-	request_data->value = value;
-	request_data->value_len = len;
+	if (need_base64) {
+		request_data->value = encoded;
+		request_data->value_len = strlen(encoded);
+	} else {
+		request_data->value = value;
+		request_data->value_len = len;
+	}
+	request_data->value_base64 = need_base64;
 
 	ret = do_meta_request(mc, mp, packet);
 	if (ret < 0) {
 		cfs_log_error(mc->log, "do_meta_request() error %d\n", ret);
-		cfs_packet_release(packet);
-		return ret;
+		goto out;
 	}
 	ret = cfs_parse_status(packet->reply.hdr.result_code);
 	if (ret > 0) {
 		cfs_log_error(mc->log, "server return error 0x%x\n",
 			      packet->reply.hdr.result_code);
-		cfs_packet_release(packet);
-		return ret;
+		goto out;
 	}
+out:
+	/* need_base64 两条路径(成功/失败)都要走到这里释放,不能漏——encoded 是
+	 * 上面 cfs_base64_encode 单独分配的临时缓冲,packet 自己的释放逻辑不知道
+	 * 也不会碰它。 */
+	if (encoded)
+		kfree(encoded);
 	cfs_packet_release(packet);
 	return ret;
 }
@@ -1121,12 +1163,45 @@ static int cfs_meta_get_xattr_internal(struct cfs_meta_client *mc,
 		return ret;
 	}
 	reply_data = &packet->reply.data.gxattr;
-	n = strlen(reply_data->value) + 1;
-	if (value) {
-		if (n > size) {
-			ret = -ERANGE;
-		} else {
-			memcpy(value, reply_data->value, n);
+	if (reply_data->value_is_base64) {
+		/* 修复T3(内核客户端二进制xattr): 服务端认识 wantB64 并回显了
+		 * valB64,value 是 base64 编码后的文本,先解码拿到真实字节+真实
+		 * 长度(不能再用 strlen——原始内容可能含内嵌 NUL)。decoded_len+1
+		 * 是为了跟下面旧路径的"含 1 个尾随 NUL"约定保持一致,不引入两条
+		 * 路径之间的报告长度差异;cfs_base64_decode 的输出缓冲本身按
+		 * (base64_len/4)*3+1 分配、kzalloc 清零,decoded[decoded_len]
+		 * 保证是 0,+1 字节可以安全一起 memcpy。 */
+		char *decoded = NULL;
+		size_t decoded_len = 0;
+
+		ret = cfs_base64_decode(reply_data->value,
+					strlen(reply_data->value), &decoded,
+					&decoded_len);
+		if (ret < 0) {
+			cfs_log_error(mc->log,
+				      "failed to decode base64 xattr value %d\n",
+				      ret);
+			cfs_packet_release(packet);
+			return ret;
+		}
+		n = decoded_len + 1;
+		if (value) {
+			if (n > size) {
+				ret = -ERANGE;
+			} else {
+				memcpy(value, decoded, n);
+			}
+		}
+		kfree(decoded);
+	} else {
+		/* 服务端不认识 wantB64(旧 metanode)——跟这个修复引入前完全一样。 */
+		n = strlen(reply_data->value) + 1;
+		if (value) {
+			if (n > size) {
+				ret = -ERANGE;
+			} else {
+				memcpy(value, reply_data->value, n);
+			}
 		}
 	}
 	if (out_len)

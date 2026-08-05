@@ -265,9 +265,10 @@ int cfs_base64_encode(const char *str, size_t str_len, char **base64)
 	return 0;
 }
 
-int cfs_base64_decode(const char *base64, size_t base64_len, char **str)
+int cfs_base64_decode(const char *base64, size_t base64_len, char **str, size_t *out_len)
 {
 	size_t i;
+	size_t pad;
 	int a, b, c, d;
 	char *buf, *dst;
 
@@ -294,5 +295,17 @@ int cfs_base64_decode(const char *base64, size_t base64_len, char **str)
 		*dst++ = (c << 6) | d;
 	}
 	*str = buf;
+	if (out_len) {
+		/* 修复T3: 末尾 '=' 补位字符解出来的是垫零字节,不是真实内容——按标准
+		 * base64 规则,输入结尾 0/1/2 个 '=' 对应真实内容比 (base64_len/4)*3
+		 * 少 0/1/2 字节。只看最后一个 4 字符分组即可(标准 base64 补位只出现
+		 * 在末尾)。 */
+		pad = 0;
+		if (base64_len >= 1 && base64[base64_len - 1] == '=')
+			pad++;
+		if (base64_len >= 2 && base64[base64_len - 2] == '=')
+			pad++;
+		*out_len = (base64_len / 4) * 3 - pad;
+	}
 	return 0;
 }

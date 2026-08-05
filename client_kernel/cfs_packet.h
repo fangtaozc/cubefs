@@ -690,6 +690,10 @@ struct cfs_packet_sxattr_request {
 	const char *key; /* json: key */
 	const char *value; /* json: value */
 	size_t value_len;
+	/* 修复T3(内核客户端二进制xattr): 为true时value/value_len已经是调用方
+	 * base64编码后的内容,序列化时额外多写一个"valB64":true告知服务端需要
+	 * 解码。为false(默认)时行为跟这个字段引入前完全一样。 */
+	bool value_base64;
 };
 
 static inline void
@@ -721,6 +725,10 @@ struct cfs_packet_gxattr_reply {
 	u64 ino; /* json: ino */
 	char *key; /* json: key */
 	char *value; /* json: value */
+	/* 修复T3(内核客户端二进制xattr): 从回包"valB64"字段解析,缺省false——
+	 * 一个不认识这个请求字段的旧服务端永远不会回显它,新客户端据此判断
+	 * value是不是base64编码过的,不需要预先知道服务端版本。 */
+	bool value_is_base64;
 };
 
 static inline void
