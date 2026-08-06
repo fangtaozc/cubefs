@@ -204,13 +204,15 @@ func (o *ObjectNode) policyCheck(f http.HandlerFunc) http.HandlerFunc {
 			// downstream authorization step with its own independent
 			// accessKey→user lookup, which fails for a bridged request
 			// (its ak is never a registered CubeFS user) unless checked
-			// here too. Full owner-equivalent access, matching the
-			// "读写对等" decision — no narrower policy to apply since
-			// there's no CubeFS user/policy record for this identity.
-			if vol != nil {
+			// here too. Grants object read/write parity ("读写对等") ONLY for
+			// the api allow-list in ossAccelBridgeAllowedApi — there is no
+			// CubeFS user/policy record for this identity to scope against,
+			// so bucket-configuration apis (policy/acl/cors/lifecycle/
+			// delete-bucket/...) stay denied rather than defaulting open.
+			if vol != nil && ossAccelBridgeAllowedApi(param.apiName) {
 				if backendAk, _, bridgeAllowed := vol.OSSAccelBackendCredential(); bridgeAllowed && backendAk == param.AccessKey() {
-					log.LogDebugf("user policy check: oss-accel backend-credential bridge: requestID(%v) volume(%v)",
-						GetRequestID(r), vol.Name())
+					log.LogDebugf("user policy check: oss-accel backend-credential bridge: requestID(%v) volume(%v) api(%v)",
+						GetRequestID(r), vol.Name(), param.apiName)
 					allowed = true
 					err = nil
 					return

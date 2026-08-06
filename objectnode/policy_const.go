@@ -126,6 +126,29 @@ func IsAccountLevelApi(apiName string) bool {
 	return apiName == PUT_BUCKET || apiName == List_BUCKETS
 }
 
+// ossAccelBridgeAllowedApis is the object read/write/list/multipart surface
+// the oss-accel backend-credential bridge is documented to grant ("读写对等":
+// full object-level parity within the one opted-in volume). It deliberately
+// excludes every bucket-CONFIGURATION api (policy/acl/cors/encryption/
+// lifecycle/logging/metrics/notification/replication/tagging/versioning/
+// website/public-access-block/object-lock-config, create/delete bucket,
+// list-buckets, federation token) — the bridge identity has no CubeFS
+// user/policy record to scope those against, so granting them would let any
+// holder of the backend ak/sk reconfigure or delete the whole bucket instead
+// of just reading/writing objects.
+var ossAccelBridgeAllowedApis = SliceString{
+	GET_OBJECT, HEAD_OBJECT, GET_OBJECT_ACL, GET_OBJECT_TAGGING,
+	PUT_OBJECT, POST_OBJECT, COPY_OBJECT, PUT_OBJECT_ACL, PUT_OBJECT_TAGGING,
+	DELETE_OBJECT, BATCH_DELETE, DELETE_OBJECT_TAGGING,
+	OPTIONS_OBJECT,
+	INITIALE_MULTIPART_UPLOAD, UPLOAD_PART, UPLOAD_PART_COPY, LIST_PARTS, COMPLETE_MULTIPART_UPLOAD, ABORT_MULTIPART_UPLOAD,
+	LIST_OBJECTS, LIST_OBJECTS_V2, LIST_MULTIPART_UPLOADS, HEAD_BUCKET, GET_BUCKET_LOCATION,
+}
+
+func ossAccelBridgeAllowedApi(apiName string) bool {
+	return ossAccelBridgeAllowedApis.Contain(apiName)
+}
+
 func isAnonymous(accessKey string) bool {
 	return accessKey == ""
 }
