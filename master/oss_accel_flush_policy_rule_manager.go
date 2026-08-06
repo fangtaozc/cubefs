@@ -121,6 +121,8 @@ func (m *OSSAccelFlushPolicyRuleManager) tick() {
 			// Mirrors OSSAccelEvictionRuleManager.tick's watchdog exactly.
 			log.LogWarnf("OSSAccelFlushPolicyRuleManager.tick: vol(%v) FlushPolicyInFlight stuck true for over %v (dispatched at %v) with no lcnode response — treating as lost/crashed, auto-clearing",
 				r.VolName, ossAccelFlushPolicyDispatchStaleTimeout, r.LastRunAt)
+			// 跟HTTP setOSSAccelFlushPolicyRule handler共用同一把updateMu。
+			m.cluster.ossAccelFlushPolicyRuleCache.LockUpdate()
 			stale := *r
 			stale.FlushPolicyInFlight = false
 			stale.LastRunResult = fmt.Sprintf("stale: no lcnode response within %v of dispatch — auto-cleared by watchdog", ossAccelFlushPolicyDispatchStaleTimeout)
@@ -128,6 +130,7 @@ func (m *OSSAccelFlushPolicyRuleManager) tick() {
 			if perr := m.cluster.syncUpdateOSSAccelFlushPolicyRule(&stale); perr != nil {
 				log.LogWarnf("OSSAccelFlushPolicyRuleManager.tick: vol(%v) persist stale-clear err: %v", r.VolName, perr)
 			}
+			m.cluster.ossAccelFlushPolicyRuleCache.UnlockUpdate()
 			r = &stale
 		}
 		if !r.LastRunAt.IsZero() && now.Sub(r.LastRunAt) < time.Duration(r.IntervalSeconds)*time.Second {
@@ -156,6 +159,8 @@ func (m *OSSAccelFlushPolicyRuleManager) fireRule(r *proto.OSSAccelFlushPolicyRu
 		return
 	}
 
+	// 跟HTTP setOSSAccelFlushPolicyRule handler共用同一把updateMu。
+	m.cluster.ossAccelFlushPolicyRuleCache.LockUpdate()
 	updated := *r
 	updated.FlushPolicyInFlight = true
 	updated.LastRunAt = time.Now()
@@ -163,6 +168,7 @@ func (m *OSSAccelFlushPolicyRuleManager) fireRule(r *proto.OSSAccelFlushPolicyRu
 	if perr := m.cluster.syncUpdateOSSAccelFlushPolicyRule(&updated); perr != nil {
 		log.LogWarnf("OSSAccelFlushPolicyRuleManager.fireRule: vol(%v) persist FlushPolicyInFlight err: %v", r.VolName, perr)
 	}
+	m.cluster.ossAccelFlushPolicyRuleCache.UnlockUpdate()
 
 	req := &proto.OSSAccelFlushPolicyTaskRequest{
 		MasterAddr:   m.cluster.masterAddr(),

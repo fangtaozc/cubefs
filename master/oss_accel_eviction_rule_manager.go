@@ -121,6 +121,9 @@ func (m *OSSAccelEvictionRuleManager) tick() {
 			// not next — no need to wait another ossAccelEvictionRuleTickInterval.
 			log.LogWarnf("OSSAccelEvictionRuleManager.tick: vol(%v) EvictionInFlight stuck true for over %v (dispatched at %v) with no lcnode response — treating as lost/crashed, auto-clearing",
 				r.VolName, ossAccelEvictionDispatchStaleTimeout, r.LastRunAt)
+			// 跟HTTP setOSSAccelEvictionRule handler共用同一把updateMu,避免
+			// 这段Get(通过上面的List)+Put跟handler自己的Get+Put交错踩踏。
+			m.cluster.ossAccelEvictionRuleCache.LockUpdate()
 			stale := *r
 			stale.EvictionInFlight = false
 			stale.LastRunResult = fmt.Sprintf("stale: no lcnode response within %v of dispatch — auto-cleared by watchdog", ossAccelEvictionDispatchStaleTimeout)
@@ -128,6 +131,7 @@ func (m *OSSAccelEvictionRuleManager) tick() {
 			if perr := m.cluster.syncUpdateOSSAccelEvictionRule(&stale); perr != nil {
 				log.LogWarnf("OSSAccelEvictionRuleManager.tick: vol(%v) persist stale-clear err: %v", r.VolName, perr)
 			}
+			m.cluster.ossAccelEvictionRuleCache.UnlockUpdate()
 			r = &stale
 		}
 		vol, err := m.cluster.getVol(r.VolName)
@@ -174,6 +178,9 @@ func (m *OSSAccelEvictionRuleManager) fireRule(r *proto.OSSAccelEvictionRule, us
 		return
 	}
 
+	// 跟HTTP setOSSAccelEvictionRule handler共用同一把updateMu,理由见
+	// OSSAccelEvictionRuleCache.updateMu的doc comment。
+	m.cluster.ossAccelEvictionRuleCache.LockUpdate()
 	updated := *r
 	updated.EvictionInFlight = true
 	updated.LastRunAt = time.Now()
@@ -181,6 +188,7 @@ func (m *OSSAccelEvictionRuleManager) fireRule(r *proto.OSSAccelEvictionRule, us
 	if perr := m.cluster.syncUpdateOSSAccelEvictionRule(&updated); perr != nil {
 		log.LogWarnf("OSSAccelEvictionRuleManager.fireRule: vol(%v) persist EvictionInFlight err: %v", r.VolName, perr)
 	}
+	m.cluster.ossAccelEvictionRuleCache.UnlockUpdate()
 
 	req := &proto.OSSAccelEvictionTaskRequest{
 		MasterAddr:        m.cluster.masterAddr(),

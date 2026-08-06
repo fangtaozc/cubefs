@@ -62,6 +62,12 @@ func (m *Server) setOSSAccelEvictionRule(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Get-then-Put race: 跟后台tick()/fireRule各自的Get-then-Put序列共用同一
+	// 把updateMu,避免两边交错时后写的覆盖丢失前一个刚落的更新(比如把tick()
+	// 刚置true的EvictionInFlight又拍回旧值)。
+	m.cluster.ossAccelEvictionRuleCache.LockUpdate()
+	defer m.cluster.ossAccelEvictionRuleCache.UnlockUpdate()
+
 	existing := m.cluster.GetOSSAccelEvictionRule(rule.VolName)
 	now := time.Now()
 	rule.UpdatedAt = now

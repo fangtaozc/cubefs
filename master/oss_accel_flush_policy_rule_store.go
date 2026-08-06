@@ -38,7 +38,16 @@ const (
 type OSSAccelFlushPolicyRuleCache struct {
 	mu    sync.RWMutex
 	rules map[string]*proto.OSSAccelFlushPolicyRule // volName -> rule
+
+	// updateMu 序列化"读现有规则→合并派发态字段→写回"这类复合操作,理由跟
+	// OSSAccelEvictionRuleCache.updateMu完全一样(见那份doc comment)——HTTP
+	// setOSSAccelFlushPolicyRule handler跟后台tick()/fireRule各自的
+	// Get-then-Put序列需要共用这把锁才不会互相踩踏。
+	updateMu sync.Mutex
 }
+
+func (c *OSSAccelFlushPolicyRuleCache) LockUpdate()   { c.updateMu.Lock() }
+func (c *OSSAccelFlushPolicyRuleCache) UnlockUpdate() { c.updateMu.Unlock() }
 
 func NewOSSAccelFlushPolicyRuleCache() *OSSAccelFlushPolicyRuleCache {
 	return &OSSAccelFlushPolicyRuleCache{rules: make(map[string]*proto.OSSAccelFlushPolicyRule)}

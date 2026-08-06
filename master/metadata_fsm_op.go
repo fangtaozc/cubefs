@@ -575,7 +575,12 @@ type metaNodeValue struct {
 	ReplicaPort   string
 	ZoneName      string
 	RdOnly        bool
-	maxMpCntLimit uint64
+	// MaxMpCntLimit修复(TOCTOU/持久化审计): 之前是未导出字段
+	// maxMpCntLimit,json.Marshal会静默跳过未导出字段——buildPutMetaNodeCmd
+	// 里的json.Marshal(mnv)从未真正把这个值写进raft持久化的字节,重启/leader
+	// 切换重放raft日志后MpCntLimit总是被重置成0,不管运维之前配置过什么。
+	// 导出后修复持久化,不改变字段语义。
+	MaxMpCntLimit uint64
 }
 
 func newMetaNodeValue(metaNode *MetaNode) *metaNodeValue {
@@ -587,7 +592,7 @@ func newMetaNodeValue(metaNode *MetaNode) *metaNodeValue {
 		ReplicaPort:   metaNode.ReplicaPort,
 		ZoneName:      metaNode.ZoneName,
 		RdOnly:        metaNode.RdOnly,
-		maxMpCntLimit: metaNode.MpCntLimit,
+		MaxMpCntLimit: metaNode.MpCntLimit,
 	}
 }
 
@@ -1724,7 +1729,7 @@ func (c *Cluster) loadMetaNodes() (err error) {
 		}
 
 		metaNode := newMetaNode(mnv.Addr, mnv.HeartbeatPort, mnv.ReplicaPort, mnv.ZoneName, c.Name)
-		metaNode.MpCntLimit = mnv.maxMpCntLimit
+		metaNode.MpCntLimit = mnv.MaxMpCntLimit
 		metaNode.ID = mnv.ID
 		metaNode.NodeSetID = mnv.NodeSetID
 		metaNode.RdOnly = mnv.RdOnly

@@ -68,6 +68,11 @@ func (m *Server) setOSSAccelFlushPolicyRule(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Get-then-Put race:跟后台tick()/fireRule共用同一把updateMu,理由见
+	// OSSAccelEvictionRuleCache.updateMu的doc comment(同一套问题、同一套修复)。
+	m.cluster.ossAccelFlushPolicyRuleCache.LockUpdate()
+	defer m.cluster.ossAccelFlushPolicyRuleCache.UnlockUpdate()
+
 	existing := m.cluster.GetOSSAccelFlushPolicyRule(rule.VolName)
 	now := time.Now()
 	rule.UpdatedAt = now

@@ -38,7 +38,22 @@ const (
 type OSSAccelEvictionRuleCache struct {
 	mu    sync.RWMutex
 	rules map[string]*proto.OSSAccelEvictionRule // volName -> rule
+
+	// updateMu 序列化"读现有规则→合并派发态字段(CreatedAt/LastRunAt/
+	// LastRunResult/EvictionInFlight)→写回"这类复合操作。mu本身只保护map的
+	// 单次Get/Put/Delete,不能覆盖跨越Get+Put两步的read-modify-write——HTTP
+	// setOSSAccelEvictionRule handler跟后台tick()/fireRule各自都是这种复合
+	// 操作,中间没有共享锁时会互相踩踏(TOCTOU:后写的覆盖丢失前一个的更新,
+	// 例如把刚被tick()置true的EvictionInFlight又拍回旧值)。调用方需要在
+	// Get和Put之间持有这把锁,见LockUpdate/UnlockUpdate。
+	updateMu sync.Mutex
 }
+
+// LockUpdate/UnlockUpdate serialize the Get-then-modify-then-Put sequences
+// used by the HTTP Set handler and the manager's tick()/fireRule — see
+// updateMu's doc comment for why mu alone isn't enough.
+func (c *OSSAccelEvictionRuleCache) LockUpdate()   { c.updateMu.Lock() }
+func (c *OSSAccelEvictionRuleCache) UnlockUpdate() { c.updateMu.Unlock() }
 
 func NewOSSAccelEvictionRuleCache() *OSSAccelEvictionRuleCache {
 	return &OSSAccelEvictionRuleCache{rules: make(map[string]*proto.OSSAccelEvictionRule)}
