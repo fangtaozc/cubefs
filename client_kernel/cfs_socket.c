@@ -3,17 +3,17 @@
  */
 #include <linux/tcp.h>
 #include <net/sock.h>
-#include <linux/version.h>
 #include <linux/bvec.h>
 #include "cfs_socket.h"
 
-/* 6.4 起 iov_iter 的 iov 成员改名 __iov，提供 iter_iov() 访问器。 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-#define iter_iov(iter) ((iter)->iov)
-#endif
+/* iter_iov 兼容宏在 cfs_common.h 统一定义（cfs_extent_stream.c 也用），这里
+ * 不再重复。判断改用 configure 现场探测的 KERNEL_HAS_* 宏，不再猜版本号。 */
 
-/* kernel_sendpage 于 6.5 移除，改用 MSG_SPLICE_PAGES + sock_sendmsg。 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
+/* kernel_sendpage 被移除后改用 MSG_SPLICE_PAGES + sock_sendmsg。 */
+#ifdef KERNEL_HAS_SENDPAGE
+#define cfs_kernel_sendpage(sock, page, offset, size, flags) \
+	kernel_sendpage((sock), (page), (offset), (size), (flags))
+#else
 static inline int cfs_kernel_sendpage(struct socket *sock, struct page *page,
 				      int offset, size_t size, int flags)
 {
@@ -24,9 +24,6 @@ static inline int cfs_kernel_sendpage(struct socket *sock, struct page *page,
 	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, &bvec, 1, size);
 	return sock_sendmsg(sock, &msg);
 }
-#else
-#define cfs_kernel_sendpage(sock, page, offset, size, flags) \
-	kernel_sendpage((sock), (page), (offset), (size), (flags))
 #endif
 
 #define SOCK_POOL_BUCKET_COUNT 128

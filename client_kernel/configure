@@ -254,5 +254,239 @@ int test (void)
 EOF
 check_flags "KERNEL_HAS_SOCK_CREATE_KERN_WITH_NET"
 
+# 以下 10 个探测替代原先按 LINUX_VERSION_CODE 猜版本号的判断——发行版反向移植
+# (如 RHEL9 把 folio aops 移植进报数字 5.14 的内核) 会让版本号判断失真，这里
+# 全部换成跟上面一致的"现场编译试探"，只认真实 API，不认版本号。
+
+cat > $TEST_C <<EOF
+#include <linux/fs.h>
+#if defined(__has_include) && __has_include(<linux/mnt_idmap.h>)
+#include <linux/mnt_idmap.h>
+#else
+#include <linux/mnt_idmapping.h>
+#endif
+#include "test.h"
+
+int test (void)
+{
+    struct mnt_idmap *idmap = &nop_mnt_idmap;
+    (void)idmap;
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_MNT_IDMAP"
+
+cat > $TEST_C <<EOF
+#include <linux/fs.h>
+#if defined(__has_include) && __has_include(<linux/mnt_idmap.h>)
+#include <linux/mnt_idmap.h>
+#define TEST_IDMAP_INIT (&nop_mnt_idmap)
+#elif defined(__has_include) && __has_include(<linux/mnt_idmapping.h>)
+#include <linux/mnt_idmapping.h>
+#define TEST_IDMAP_INIT (&nop_mnt_idmap)
+#else
+#define TEST_IDMAP_INIT (&init_user_ns)
+#endif
+#include "test.h"
+
+int test (void)
+{
+    struct inode inode;
+    struct kstat stat;
+    generic_fillattr(TEST_IDMAP_INIT, 0, &inode, &stat);
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_FILLATTR_REQUEST_MASK"
+
+cat > $TEST_C <<EOF
+#include <linux/fs.h>
+#include "test.h"
+
+int read_folio (struct file *file, struct folio *folio)
+{
+    return 0;
+}
+
+int test (void)
+{
+    struct address_space_operations op;
+
+    op.read_folio = read_folio;
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_FOLIO_AOPS"
+
+# read_folio/readahead(读侧)和 write_cache_pages 的回调类型(写侧)是两次独立
+# 的 folio 化迁移——真机(RHEL9 5.14.0-362 反向移植内核)证实过读侧已经 folio
+# 化但写侧的 write_cache_pages 仍然要 page 版回调,不能共用同一个判断。
+cat > $TEST_C <<EOF
+#include <linux/pagemap.h>
+#include "test.h"
+
+static int cb (struct folio *folio, struct writeback_control *wbc, void *data)
+{
+    return 0;
+}
+
+int test (void)
+{
+    struct address_space *mapping = NULL;
+    struct writeback_control wbc = { 0 };
+
+    write_cache_pages(mapping, &wbc, cb, NULL);
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_WRITEPAGES_FOLIO_CB"
+
+cat > $TEST_C <<EOF
+#include <linux/pagemap.h>
+#include "test.h"
+
+int test (void)
+{
+    struct address_space *mapping = NULL;
+    struct page *page;
+
+    page = grab_cache_page_write_begin(mapping, 0);
+    (void)page;
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_WRITE_BEGIN_NO_FLAGS"
+
+cat > $TEST_C <<EOF
+#include <linux/pagemap.h>
+#include "test.h"
+
+int test (void)
+{
+    struct page *page = NULL;
+
+    page_endio(page, false, 0);
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_PAGE_ENDIO"
+
+cat > $TEST_C <<EOF
+#include <linux/fs.h>
+#include "test.h"
+
+int test (void)
+{
+    struct inode inode;
+    struct timespec64 ts;
+
+    ts = inode_get_ctime(&inode);
+    inode_set_ctime_to_ts(&inode, ts);
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_CTIME_ACCESSOR"
+
+cat > $TEST_C <<EOF
+#include <linux/fs.h>
+#include "test.h"
+
+int test (void)
+{
+    struct inode inode;
+    struct timespec64 ts;
+
+    ts = inode_get_atime(&inode);
+    ts = inode_get_mtime(&inode);
+    inode_set_atime_to_ts(&inode, ts);
+    inode_set_mtime_to_ts(&inode, ts);
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_ATIME_MTIME_ACCESSOR"
+
+cat > $TEST_C <<EOF
+#include <linux/proc_fs.h>
+#include "test.h"
+
+int test (void)
+{
+    void *p;
+
+    p = PDE_DATA(NULL);
+    (void)p;
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_PDE_DATA_OLDNAME"
+
+cat > $TEST_C <<EOF
+#include <linux/uio.h>
+#include "test.h"
+
+int test (void)
+{
+    /* 必须零初始化——直接声明未初始化就读成员,GCC 的
+     * -Werror=uninitialized 会把这当成一个用户代码错误报出来,跟"这个成员
+     * 是否存在"完全是两件事,会把探测结果搞成假阴性(RHEL9 反向移植内核上
+     * 真机踩到过:.iov 其实存在于一个匿名 union 里,不初始化直接读触发这个
+     * 警告,被 -Werror 提升成编译失败,误判成"不存在")。 */
+    struct iov_iter iter = { 0 };
+    const struct iovec *iov;
+
+    iov = iter.iov;
+    (void)iov;
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_ITER_IOV_MEMBER"
+
+# 真机(RHEL9 5.14.0-362 反向移植内核)证实这两个探测不是简单互补:该内核把
+# 成员改名成了 __iov(KERNEL_HAS_ITER_IOV_MEMBER=no),但没有同步移植 iter_iov()
+# 这个访问器函数——member 改名和 accessor 移植是两件独立的事,必须分开探测,
+# 不能假设"旧成员名不在=新访问器函数一定在"。
+cat > $TEST_C <<EOF
+#include <linux/uio.h>
+#include "test.h"
+
+int test (void)
+{
+    struct iov_iter iter;
+    const struct iovec *iov;
+
+    iov = iter_iov(&iter);
+    (void)iov;
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_ITER_IOV_FUNC"
+
+cat > $TEST_C <<EOF
+#include <linux/net.h>
+#include "test.h"
+
+int test (void)
+{
+    struct socket *sock = NULL;
+    struct page *page = NULL;
+
+    kernel_sendpage(sock, page, 0, 0, 0);
+    return 0;
+}
+
+EOF
+check_flags "KERNEL_HAS_SENDPAGE"
+
 echo "#endif" >> $CONFIG_H
 rm -rf $TMPDIR

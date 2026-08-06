@@ -5,12 +5,8 @@
 
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/version.h>
 
-/* 5.17 起 PDE_DATA 改名 pde_data。 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
-#define pde_data(inode) PDE_DATA(inode)
-#endif
+/* pde_data 兼容宏在 cfs_common.h 统一定义（cfs_fs.c 也用），这里不再重复。 */
 
 const u64 cfs_lat_bound_us[CFS_LAT_NBUCKET] = {
 	1000, 5000, 10000, 50000, 100000, 500000, 1000000, 0 /* +Inf */

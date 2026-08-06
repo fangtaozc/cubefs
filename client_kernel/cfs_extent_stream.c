@@ -2,12 +2,8 @@
  * Copyright 2023 The CubeFS Authors.
  */
 #include "cfs_extent.h"
-#include <linux/version.h>
 
-/* 6.4 起 struct iov_iter 的 iov 成员改名 __iov，并提供 iter_iov() 访问器。 */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-#define iter_iov(iter) ((iter)->iov)
-#endif
+/* iter_iov 兼容宏在 cfs_common.h 统一定义（cfs_socket.c 也用），这里不再重复。 */
 
 /* EXTENT_RECV_TIMEOUT_MS 已移至 cfs_extent.h(reader/writer 也需要,R3)。 */
 

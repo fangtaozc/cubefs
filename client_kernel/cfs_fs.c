@@ -4,7 +4,6 @@
 #include <linux/completion.h>
 #include <linux/exportfs.h>
 #include <linux/proc_fs.h>
-#include <linux/version.h>
 #include "cfs_fs.h"
 #include "cfs_oss_accel.h"
 
@@ -15,7 +14,7 @@
  *   - 6.6+   ：generic_fillattr 增加 request_mask 参数。
  * 本客户端不做 idmap 映射，统一透传空 idmap，保持 <=5.15 与 6.8 均可编译。
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+#ifdef KERNEL_HAS_MNT_IDMAP
 #if defined(__has_include) && __has_include(<linux/mnt_idmap.h>)
 #include <linux/mnt_idmap.h>
 #else
@@ -27,7 +26,7 @@
 #define CFS_IDMAP struct user_namespace
 #define CFS_INIT_IDMAP (&init_user_ns)
 #endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#ifdef KERNEL_HAS_FILLATTR_REQUEST_MASK
 #define cfs_generic_fillattr(idmap, mask, inode, stat) \
 	generic_fillattr((idmap), (mask), (inode), (stat))
 #else
@@ -43,13 +42,16 @@
  *   - 6.6：page_endio 移除；inode i_ctime 改访问器。
  *   - 6.7：inode i_atime/i_mtime 改访问器。
  *   - 5.17：PDE_DATA 改名 pde_data。
- * 目标内核只有 ≤5.15 与 6.8，统一以 6.0 为界切换新旧 aops。
+ * 判断全部走 configure 现场探测的 KERNEL_HAS_* 宏（config.h），不再按版本号
+ * 猜——发行版反向移植（如 RHEL9 把 folio aops 移植进报数字 5.14 的内核）会让
+ * 版本号判断失真，现场探测真实 API 才可靠。pde_data 兼容宏挪到 cfs_common.h
+ * 统一定义（cfs_stats.c 也需要，避免两处重复）。
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#ifdef KERNEL_HAS_FOLIO_AOPS
 #define CFS_HAS_FOLIO_AOPS 1
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 19, 0)
+#ifdef KERNEL_HAS_WRITE_BEGIN_NO_FLAGS
 #define cfs_grab_cache_page_write_begin(m, i, f) \
 	grab_cache_page_write_begin((m), (i))
 #else
@@ -57,7 +59,10 @@
 	grab_cache_page_write_begin((m), (i), (f))
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#ifdef KERNEL_HAS_PAGE_ENDIO
+#define cfs_page_endio(page, is_write, err) \
+	page_endio((page), (is_write), (err))
+#else
 static inline void cfs_page_endio(struct page *page, bool is_write, int err)
 {
 	if (!is_write) {
@@ -70,23 +75,17 @@ static inline void cfs_page_endio(struct page *page, bool is_write, int err)
 		end_page_writeback(page);
 	}
 }
-#else
-#define cfs_page_endio(page, is_write, err) \
-	page_endio((page), (is_write), (err))
 #endif
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#ifndef KERNEL_HAS_CTIME_ACCESSOR
 #define inode_get_ctime(inode) ((inode)->i_ctime)
 #define inode_set_ctime_to_ts(inode, ts) ((inode)->i_ctime = (ts))
 #endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 7, 0)
+#ifndef KERNEL_HAS_ATIME_MTIME_ACCESSOR
 #define inode_get_atime(inode) ((inode)->i_atime)
 #define inode_get_mtime(inode) ((inode)->i_mtime)
 #define inode_set_atime_to_ts(inode, ts) ((inode)->i_atime = (ts))
 #define inode_set_mtime_to_ts(inode, ts) ((inode)->i_mtime = (ts))
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
-#define pde_data(inode) PDE_DATA(inode)
 #endif
 
 #define CFS_FS_MAGIC 0x20230705
@@ -769,7 +768,10 @@ static int cfs_writepage(struct page *page, struct writeback_control *wbc)
 	return ret;
 }
 
-#ifdef CFS_HAS_FOLIO_AOPS
+/* 独立于 CFS_HAS_FOLIO_AOPS(那个只管 read_folio/readahead 读侧)——
+ * write_cache_pages 的回调类型是写侧单独的一次 folio 化迁移,真机(RHEL9
+ * 反向移植内核)证实过读侧已经 folio 化但写侧仍要 page 版回调,两者不同步。 */
+#ifdef KERNEL_HAS_WRITEPAGES_FOLIO_CB
 static int cfs_writepages_cb(struct folio *folio, struct writeback_control *wbc,
 			     void *data)
 {

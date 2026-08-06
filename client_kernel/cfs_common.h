@@ -38,6 +38,24 @@
 
 #include "config.h"
 
+/* 跨内核版本兼容宏，cfs_fs.c/cfs_stats.c(pde_data)、cfs_socket.c/
+ * cfs_extent_stream.c(iter_iov) 共用——原先各文件独立按 LINUX_VERSION_CODE
+ * 猜版本号、且重复定义了一遍，现在改成 configure 现场探测(KERNEL_HAS_*，见
+ * config.h)+ 集中定义一次。 */
+#ifdef KERNEL_HAS_PDE_DATA_OLDNAME
+#define pde_data(inode) PDE_DATA(inode)
+#endif
+/* member 改名(.iov -> __iov)和 iter_iov() 访问器函数是否移植,是两件独立的
+ * 事——真机(RHEL9 反向移植内核)证实过成员已改名但访问器还没移植,不能假设
+ * 两者总是同步。访问器不存在时,才需要按member实际叫什么名字自己定义。 */
+#ifndef KERNEL_HAS_ITER_IOV_FUNC
+#ifdef KERNEL_HAS_ITER_IOV_MEMBER
+#define iter_iov(iter) ((iter)->iov)
+#else
+#define iter_iov(iter) ((iter)->__iov)
+#endif
+#endif
+
 #undef pr_fmt
 #define pr_fmt(fmt) "cfs: %s() " fmt
 
