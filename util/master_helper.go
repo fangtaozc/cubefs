@@ -72,11 +72,18 @@ func (helper *masterHelper) setLeader(addr string) {
 
 // Request sends out the request through the helper.
 func (helper *masterHelper) Request(method, path string, param, header map[string]string, reqData []byte) (respData []byte, err error) {
-	respData, err = helper.request(method, path, param, header, reqData)
+	respData, err = helper.request(method, path, param, header, reqData, 0)
 	return
 }
 
-func (helper *masterHelper) request(method, path string, param, header map[string]string, reqData []byte) (repsData []byte, err error) {
+// maxForbiddenRedirectRetry bounds the 403-redirect chain — same fix as
+// sdk/master/client.go's serveRequestWithRedirectDepth for the identical bug:
+// two masters that both believe the other is leader (stale/flapping leader
+// state) would otherwise send this into unbounded recursion with no SetLeader
+// call to make progress, until the goroutine stack overflows.
+const maxForbiddenRedirectRetry = 5
+
+func (helper *masterHelper) request(method, path string, param, header map[string]string, reqData []byte, redirectDepth int) (repsData []byte, err error) {
 	leaderAddr, nodes := helper.prepareRequest()
 	host := leaderAddr
 	for i := -1; i < len(nodes); i++ {
@@ -111,7 +118,14 @@ func (helper *masterHelper) request(method, path string, param, header map[strin
 				err = ErrNoValidMaster
 				return
 			}
-			repsData, err = helper.request(method, path, param, header, reqData)
+			helper.setLeader(curMasterAddr)
+			if redirectDepth >= maxForbiddenRedirectRetry {
+				err = fmt.Errorf("[masterHelper] exceeded max forbidden-redirect retries (%d), last redirect target(%s)",
+					maxForbiddenRedirectRetry, curMasterAddr)
+				log.LogErrorf("%v", err)
+				return
+			}
+			repsData, err = helper.request(method, path, param, header, reqData, redirectDepth+1)
 			return
 		case http.StatusOK:
 			if leaderAddr != host {
