@@ -15,11 +15,13 @@
 package meta
 
 import (
+	"encoding/base64"
 	"fmt"
 	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/cubefs/cubefs/proto"
 	"github.com/cubefs/cubefs/util/errors"
@@ -2058,12 +2060,24 @@ func (mw *MetaWrapper) setXAttr(mp *MetaPartition, inode uint64, name []byte, va
 		stat.EndStat("setXAttr", err, bgTime, 1)
 	}()
 
+	// T3(二进制xattr): metanode.SetXAttr 的 Value 字段是 Go string,请求经
+	// json.Marshal 序列化——非合法 UTF-8 的字节(如 setcap/setfacl 写的二进制
+	// 属性值)会被 json.Marshal 静默替换成 U+FFFD 损坏数据(跟内核客户端
+	// client_kernel/cfs_meta.c 修复的是同一个根因)。这里镜像内核客户端已验证
+	// 过的做法:仅当值非法 UTF-8 时才 base64 编码并置 ValueBase64,纯文本值
+	// 走原有路径分毫不动,旧 metanode(不认识这个字段)按老逻辑处理时也只是
+	// 退回到修复前的已知行为,不是新引入的回归。
 	req := &proto.SetXAttrRequest{
 		VolName:     mw.volname,
 		PartitionId: mp.PartitionID,
 		Inode:       inode,
 		Key:         string(name),
-		Value:       string(value),
+	}
+	if utf8.Valid(value) {
+		req.Value = string(value)
+	} else {
+		req.Value = base64.StdEncoding.EncodeToString(value)
+		req.ValueBase64 = true
 	}
 
 	packet := proto.NewPacketReqID()
@@ -2156,12 +2170,17 @@ func (mw *MetaWrapper) getXAttr(mp *MetaPartition, inode uint64, name string) (v
 		stat.EndStat("getXAttr", err, bgTime, 1)
 	}()
 
+	// T3(二进制xattr): 无条件请求 base64——旧metanode不认识WantBase64会直接
+	// 忽略,新metanode认识才会在响应里回显ValueBase64,解码逻辑只在看到回显
+	// 时才触发,天生对服务端版本自适应(镜像内核客户端
+	// client_kernel/cfs_packet.c的cfs_packet_gxattr_request_to_json)。
 	req := &proto.GetXAttrRequest{
 		VolName:     mw.volname,
 		PartitionId: mp.PartitionID,
 		Inode:       inode,
 		Key:         name,
 		VerSeq:      mw.VerReadSeq,
+		WantBase64:  true,
 	}
 
 	packet := proto.NewPacketReqID()
@@ -2197,7 +2216,17 @@ func (mw *MetaWrapper) getXAttr(mp *MetaPartition, inode uint64, name string) (v
 		log.LogErrorf("get xattr: packet(%v) mp(%v) req(%v) err(%v) PacketData(%v)", packet, mp, *req, err, string(packet.Data))
 		return
 	}
-	value = resp.Value
+	if resp.ValueBase64 {
+		var decoded []byte
+		if decoded, err = base64.StdEncoding.DecodeString(resp.Value); err != nil {
+			log.LogErrorf("get xattr: base64 decode fail: packet(%v) mp(%v) req(%v) err(%v)", packet, mp, *req, err)
+			status = statusError
+			return
+		}
+		value = string(decoded)
+	} else {
+		value = resp.Value
+	}
 
 	log.LogDebugf("get xattr: packet(%v) mp(%v) req(%v) result(%v)", packet, mp, *req, packet.GetResultMsg())
 	return
