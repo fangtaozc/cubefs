@@ -146,7 +146,19 @@ func (c *MasterClient) SetClientIDKey(clientIDKey string) {
 	c.Unlock()
 }
 
+// maxForbiddenRedirectRetry bounds the 403-redirect chain in
+// serveRequestWithRedirectDepth. Without this, two masters that both believe
+// the other is leader (stale/flapping leader state) send serveRequest into
+// unbounded recursion — each 403 response redirects straight back into
+// another full serveRequest call with no progress check — until the
+// goroutine stack overflows and the process crashes.
+const maxForbiddenRedirectRetry = 5
+
 func (c *MasterClient) serveRequest(r *request) (repsData []byte, err error) {
+	return c.serveRequestWithRedirectDepth(r, 0)
+}
+
+func (c *MasterClient) serveRequestWithRedirectDepth(r *request, redirectDepth int) (repsData []byte, err error) {
 	leaderAddr, nodes := c.prepareRequest()
 	host := leaderAddr
 	for i := -1; i < len(nodes); i++ {
@@ -186,7 +198,14 @@ func (c *MasterClient) serveRequest(r *request) (repsData []byte, err error) {
 				err = ErrNoValidMaster
 				return
 			}
-			repsData, err = c.serveRequest(r)
+			c.SetLeader(curMasterAddr)
+			if redirectDepth >= maxForbiddenRedirectRetry {
+				err = fmt.Errorf("serveRequest: exceeded max forbidden-redirect retries (%d), last redirect target(%s)",
+					maxForbiddenRedirectRetry, curMasterAddr)
+				log.LogErrorf("%v", err)
+				return
+			}
+			repsData, err = c.serveRequestWithRedirectDepth(r, redirectDepth+1)
 			return
 		case http.StatusOK:
 			if leaderAddr != host {
