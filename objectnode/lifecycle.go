@@ -17,7 +17,6 @@ package objectnode
 import (
 	"encoding/xml"
 	"io"
-	"io/ioutil"
 	"net/http"
 
 	"github.com/cubefs/cubefs/proto"
@@ -101,7 +100,7 @@ func (o *ObjectNode) putBucketLifecycleConfigurationHandler(w http.ResponseWrite
 		return
 	}
 	var requestBody []byte
-	if requestBody, err = ioutil.ReadAll(r.Body); err != nil && err != io.EOF {
+	if requestBody, err = readBodyLimited(r, BodyLimit); err != nil && err != io.EOF {
 		log.LogErrorf("putBucketLifecycle failed: read request body data err: requestID(%v) err(%v)", GetRequestID(r), err)
 		return
 	}

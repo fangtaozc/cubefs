@@ -93,7 +93,7 @@ func (o *ObjectNode) createBucketHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if length > 0 {
-		requestBytes, err := io.ReadAll(r.Body)
+		requestBytes, err := readBodyLimited(r, BodyLimit)
 		if err != nil && err != io.EOF {
 			log.LogErrorf("createBucketHandler: read request body fail: requestID(%v) err(%v)", GetRequestID(r), err)
 			return
@@ -408,7 +408,7 @@ func (o *ObjectNode) putBucketTaggingHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var body []byte
-	if body, err = io.ReadAll(r.Body); err != nil {
+	if body, err = readBodyLimited(r, BodyLimit); err != nil {
 		log.LogErrorf("putBucketTaggingHandler: read request body data fail: requestID(%v) err(%v)",
 			GetRequestID(r), err)
 		errorCode = InvalidArgument

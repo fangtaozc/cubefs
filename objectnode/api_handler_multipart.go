@@ -692,7 +692,7 @@ func (o *ObjectNode) completeMultipartUploadHandler(w http.ResponseWriter, r *ht
 	if errorCode != nil {
 		return
 	}
-	requestBytes, err := io.ReadAll(r.Body)
+	requestBytes, err := readBodyLimited(r, BodyLimit)
 	if err != nil && err != io.EOF {
 		log.LogErrorf("completeMultipartUploadHandler: read request body fail: requestID(%v) err(%v)",
 			GetRequestID(r), err)

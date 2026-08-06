@@ -571,7 +571,7 @@ func (o *ObjectNode) deleteObjectsHandler(w http.ResponseWriter, r *http.Request
 	if errorCode != nil {
 		return
 	}
-	bytes, err := io.ReadAll(r.Body)
+	bytes, err := readBodyLimited(r, BodyLimit)
 	if err != nil {
 		log.LogErrorf("deleteObjectsHandler: read request body fail: requestID(%v) volume(%v) err(%v)",
 			GetRequestID(r), param.Bucket(), err)
@@ -1835,7 +1835,7 @@ func (o *ObjectNode) putObjectTaggingHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	var requestBody []byte
-	if requestBody, err = io.ReadAll(r.Body); err != nil {
+	if requestBody, err = readBodyLimited(r, BodyLimit); err != nil {
 		log.LogErrorf("putObjectTaggingHandler: read request body data fail: requestID(%v) err(%v)",
 			GetRequestID(r), err)
 		errorCode = InvalidArgument
@@ -1959,7 +1959,7 @@ func (o *ObjectNode) putObjectXAttrHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var requestBody []byte
-	if requestBody, err = io.ReadAll(r.Body); err != nil {
+	if requestBody, err = readBodyLimited(r, BodyLimit); err != nil {
 		errorCode = &ErrorCode{
 			ErrorCode:    "BadRequest",
 			ErrorMessage: err.Error(),
@@ -2297,4 +2297,24 @@ func VerifyContentLength(r *http.Request, bodyLimit int64) (int64, *ErrorCode) {
 		return 0, MissingContentLength
 	}
 	return length, nil
+}
+
+// readBodyLimited reads at most limit bytes from r.Body. VerifyContentLength's
+// returned length can come from the client-controlled X-Amz-Decoded-Content-
+// Length header (legitimately smaller than the real on-wire body for
+// chunked-signed streaming uploads) — a caller that passed that check and
+// then did an unguarded io.ReadAll(r.Body) would buffer however many bytes
+// the client actually streamed, regardless of what it claimed. Capping the
+// read at bodyLimit (the endpoint's real ceiling, not the claimed length)
+// closes that gap: a body that actually exceeds the limit is rejected
+// instead of being fully read into memory first.
+func readBodyLimited(r *http.Request, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("request body exceeds limit of %d bytes", limit)
+	}
+	return data, nil
 }
