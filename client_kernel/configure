@@ -326,6 +326,7 @@ check_flags "KERNEL_HAS_FOLIO_AOPS"
 # 化但写侧的 write_cache_pages 仍然要 page 版回调,不能共用同一个判断。
 cat > $TEST_C <<EOF
 #include <linux/pagemap.h>
+#include <linux/writeback.h>
 #include "test.h"
 
 static int cb (struct folio *folio, struct writeback_control *wbc, void *data)
